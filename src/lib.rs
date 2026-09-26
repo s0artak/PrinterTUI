@@ -36,6 +36,32 @@ pub fn printers() -> Vec<String> {
     list
 }
 
+/// Display name for a queue from its `lpoptions -p` output: the description if the user set one
+/// (`lpadmin -p QUEUE -D "Name"`), else the model, plus the network address.
+const NETWORK: [&str; 6] = ["ipp", "ipps", "socket", "lpd", "http", "https"];
+
+pub fn printer_label(queue: &str, lpoptions: &str) -> String {
+    let opt = |key: &str| {
+        let v = lpoptions.split(&format!("{key}=")).nth(1)?;
+        let v = match v.strip_prefix('\'') {
+            Some(q) => q.split('\'').next()?,
+            None => v.split(' ').next()?,
+        };
+        Some(v.replace("\\ ", " "))
+    };
+    let info = opt("printer-info").filter(|i| !i.is_empty() && i != queue);
+    let model = opt("printer-make-and-model").map(|m| m.trim_end_matches(" - IPP Everywhere").to_string());
+    let name = info.or(model).unwrap_or_else(|| queue.to_string());
+    match opt("device-uri").as_deref().and_then(uri_host) {
+        Some((scheme, host)) if NETWORK.contains(&scheme) => format!("{name} ({host})"),
+        _ => name,
+    }
+}
+
+pub fn printer_labels(queues: &[String]) -> Vec<String> {
+    queues.iter().map(|q| printer_label(q, &run("lpoptions", &["-p", q]).unwrap_or_default())).collect()
+}
+
 /// Page count of a PDF (qpdf ships with cups-filters).
 pub fn page_count(file: &str) -> Option<u32> {
     run("qpdf", &["--show-npages", file]).ok()?.parse().ok()
@@ -50,7 +76,9 @@ pub fn to_pdf(file: &str) -> Result<String, String> {
     let _ = std::fs::remove_file(&pdf);
     // own profile, so a running LibreOffice window does not swallow the conversion
     let profile = format!("-env:UserInstallation=file://{d}/profile");
-    run("libreoffice", &[&profile, "--headless", "--convert-to", "pdf", "--outdir", d, file])
+    // macOS does not put LibreOffice on the PATH
+    let lo = if cfg!(target_os = "macos") { "/Applications/LibreOffice.app/Contents/MacOS/soffice" } else { "libreoffice" };
+    run(lo, &[&profile, "--headless", "--convert-to", "pdf", "--outdir", d, file])
         .map_err(|e| format!("Could not convert {file} to PDF (is libreoffice installed?): {e}"))?;
     page_count(&pdf).map(|_| pdf).ok_or(format!("LibreOffice could not convert {file} to PDF"))
 }
@@ -252,11 +280,11 @@ pub fn scanners(full: bool) -> Vec<(String, String)> {
         .unwrap_or_default()
         .lines()
         .filter_map(|l| uri_host(l.rsplit(' ').next()?))
-        .filter(|(scheme, _)| ["ipp", "ipps", "socket", "lpd", "http", "https"].contains(scheme))
+        .filter(|(scheme, _)| NETWORK.contains(scheme))
         .filter_map(|(_, host)| {
             let caps = run("curl", &["-sf", "-m", "2", &format!("http://{host}/eSCL/ScannerCapabilities")]).ok()?;
             let model = caps.split("<pwg:MakeAndModel>").nth(1)?.split('<').next()?.to_string();
-            Some((format!("airscan:escl:{model}:http://{host}/eSCL"), model))
+            Some((format!("escl:http://{host}/eSCL"), model))
         })
         .collect();
     if full || found.is_empty() {
@@ -271,10 +299,47 @@ pub fn scanners(full: bool) -> Vec<(String, String)> {
     found
 }
 
-/// Scans one page from the flatbed into a PNG.
+/// Scans one page from the flatbed into an image file (PNG or JPEG). `escl:<url>` devices are
+/// driven directly over HTTP with curl, which also works on macOS where there is no SANE
+/// AirScan backend; any other device goes through SANE's `scanimage`.
 pub fn scan(device: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
+    if let Some(url) = device.strip_prefix("escl:") {
+        return escl_scan(url, mode, dpi, out);
+    }
     let dpi = dpi.to_string();
     run("scanimage", &["-d", device, "--mode", mode, "--resolution", &dpi, "--format=png", "-o", out]).map(drop)
+}
+
+/// eSCL (AirScan): POST the settings to ScanJobs, then download the page from the job's NextDocument.
+fn escl_scan(url: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
+    let color = if mode == "Gray" { "Grayscale8" } else { "RGB24" };
+    // A4 in 1/300 inch
+    let settings = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
+<pwg:Version>2.0</pwg:Version>
+<scan:Intent>Document</scan:Intent>
+<pwg:ScanRegions><pwg:ScanRegion><pwg:Height>3508</pwg:Height><pwg:Width>2480</pwg:Width><pwg:XOffset>0</pwg:XOffset><pwg:YOffset>0</pwg:YOffset><pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits></pwg:ScanRegion></pwg:ScanRegions>
+<pwg:InputSource>Platen</pwg:InputSource>
+<scan:ColorMode>{color}</scan:ColorMode>
+<scan:XResolution>{dpi}</scan:XResolution>
+<scan:YResolution>{dpi}</scan:YResolution>
+<pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>
+</scan:ScanSettings>"#
+    );
+    let jobs = format!("{url}/ScanJobs");
+    let headers = run("curl", &["-sf", "-m", "30", "-D", "-", "-o", "/dev/null", "-H", "Content-Type: text/xml", "--data-binary", &settings, &jobs])
+        .map_err(|e| format!("The scanner refused the scan job (busy?) {e}"))?;
+    let job = headers
+        .lines()
+        .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("location")).map(|(_, v)| v.trim()))
+        .ok_or("The scanner did not return a scan job")?;
+    // Location may be relative to the scanner ("/eSCL/ScanJobs/..."), keep scheme://host from the url
+    let job = if job.starts_with('/') { format!("{}{job}", url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/")) } else { job.to_string() };
+    // the scanner answers 503 until the page is ready, --retry covers that
+    run("curl", &["-sf", "--retry", "30", "--retry-delay", "2", "-m", "600", "-o", out, &format!("{job}/NextDocument")])
+        .map(drop)
+        .map_err(|e| format!("Could not download the scanned page: {e}"))
 }
 
 /// Grayscale thumbnail of an image as (width, height, pixels), via ImageMagick.
@@ -335,7 +400,8 @@ pub fn save_scans(pages: &[String], out: &str, pdf: bool, dpi: u32) -> Result<Ve
     let mut written = Vec::new();
     for (i, p) in pages.iter().enumerate() {
         let path = if pages.len() == 1 { format!("{out}.png") } else { format!("{out}-{}.png", i + 1) };
-        std::fs::copy(p, &path).map_err(|e| format!("{path}: {e}"))?;
+        // pages can be PNG (SANE) or JPEG (eSCL), so convert instead of copying
+        run("magick", &[p, &path])?;
         written.push(path);
     }
     Ok(written)

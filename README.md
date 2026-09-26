@@ -1,16 +1,25 @@
 # PrinterTUI
 
-Terminal UI for printing through CUPS and scanning through SANE, with manual double-sided printing for printers without a duplexer.
+Terminal UI for Linux and macOS to print through CUPS and scan over AirScan or SANE, with manual double-sided printing for printers without a duplexer.
 
 ## Install
 
+Arch Linux:
+
 ```sh
-sudo pacman -S cups cups-filters libreoffice-fresh sane sane-airscan imagemagick
+sudo pacman -S cups cups-filters imagemagick
 sudo systemctl enable --now cups.socket
-cargo install --path .
 ```
 
-LibreOffice is only needed for non-PDF files, SANE and ImageMagick only for scanning.
+macOS (CUPS is built in):
+
+```sh
+brew install qpdf imagemagick
+```
+
+Then `cargo install --path .`
+
+Optional: LibreOffice for non-PDF files (`libreoffice-fresh` / `brew install --cask libreoffice`), and SANE for scanners that are not part of a network printer (`sane sane-airscan` / `brew install sane-backends`). Network printers that can scan are used directly over AirScan (eSCL).
 
 ## Use
 

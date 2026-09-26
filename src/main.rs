@@ -41,6 +41,7 @@ enum Mode {
 
 struct App {
     printers: Vec<String>,
+    labels: Vec<String>,
     printer: usize,
     file: String,
     color: bool,
@@ -72,7 +73,8 @@ struct App {
 
 fn main() -> std::io::Result<()> {
     let mut app = App {
-        printers: printers(),
+        printers: Vec::new(),
+        labels: Vec::new(),
         printer: 0,
         file: std::env::args().nth(1).unwrap_or_default(),
         color: false,
@@ -99,6 +101,7 @@ fn main() -> std::io::Result<()> {
         status: String::new(),
         mode: Mode::Main,
     };
+    app.set_printers(printers());
     if let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         for (k, v) in parse_config(&text) {
             app.apply(k, v);
@@ -228,7 +231,7 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                         Ok(()) => format!("Added printer {name}."),
                         Err(e) => e,
                     };
-                    app.printers = printers();
+                    app.set_printers(printers());
                     app.printer = app.printers.iter().position(|p| *p == name).unwrap_or(0);
                     app.mode = Mode::Main;
                 }
@@ -280,6 +283,11 @@ impl App {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || tx.send(work()));
         self.busy = Some((msg.into(), rx));
+    }
+
+    fn set_printers(&mut self, printers: Vec<String>) {
+        self.labels = printer_labels(&printers);
+        self.printers = printers;
     }
 
     fn last(&self) -> usize {
@@ -336,7 +344,7 @@ impl App {
             };
         }
         match row {
-            0 => pick(self.printers.get(self.printer).map_or("none", String::as_str)),
+            0 => pick(self.labels.get(self.printer).map_or("none", String::as_str)),
             FILE if matches!(self.mode, Mode::Insert) => self.file.clone(),
             FILE => match split_files(&self.file)[..] {
                 [] => String::new(),
@@ -525,7 +533,7 @@ impl App {
             Box::new(move |app: &mut App| {
                 app.scanner = list.iter().position(|(d, _)| *d == app.scanner_pref).unwrap_or(0);
                 app.status = if list.is_empty() {
-                    "No scanners found. Install sane and sane-airscan (network scanners),\nthen press Enter on Scanner to search again.".into()
+                    "No scanners found. Network printers that can scan show up on their own;\nfor other scanners install SANE, then press Enter on Scanner to search again.".into()
                 } else {
                     String::new()
                 };
@@ -554,7 +562,7 @@ impl App {
         };
         let dir = std::env::temp_dir().join("printertui-scan");
         let n = self.scans.len() + 1;
-        let path = dir.join(format!("page-{n}.png")).to_string_lossy().into_owned();
+        let path = dir.join(format!("page-{n}")).to_string_lossy().into_owned();
         let (mode, dpi) = (SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi]);
         self.spawn(format!("Scanning page {n}"), move || {
             let res = std::fs::create_dir_all(&dir)
