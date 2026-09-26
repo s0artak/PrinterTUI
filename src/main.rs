@@ -75,6 +75,7 @@ fn main() -> std::io::Result<()> {
 }
 
 fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
+    let mut pending_g = false;
     loop {
         if let Mode::Flip { job, steps, .. } = &mut app.mode
             && job.as_deref().is_some_and(|id| !job_active(id))
@@ -93,11 +94,16 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(());
         }
+        // vim `gg`: a second `g` right after the first
+        let gg = pending_g && k.code == KeyCode::Char('g');
+        pending_g = !gg && k.code == KeyCode::Char('g') && !matches!(app.mode, Mode::Insert);
         match &mut app.mode {
             Mode::Main => match k.code {
                 KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
                 KeyCode::Up | KeyCode::Char('k') => app.sel = app.sel.checked_sub(1).unwrap_or(ADD),
                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => app.sel = (app.sel + 1) % (ADD + 1),
+                KeyCode::Char('g') if gg => app.sel = 0,
+                KeyCode::Char('G') => app.sel = ADD,
                 KeyCode::Left | KeyCode::Char('h') => app.cycle(false),
                 KeyCode::Right | KeyCode::Char('l') => app.cycle(true),
                 KeyCode::Char('i') | KeyCode::Char('a') if app.text().is_some() => app.mode = Mode::Insert,
@@ -149,6 +155,8 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                 KeyCode::Esc => app.mode = Mode::Main,
                 KeyCode::Up | KeyCode::Char('k') => state.select_previous(),
                 KeyCode::Down | KeyCode::Char('j') => state.select_next(),
+                KeyCode::Char('g') if gg => state.select_first(),
+                KeyCode::Char('G') => state.select_last(),
                 KeyCode::Enter => {
                     let (name, uri) = found[state.selected().unwrap_or(0)].clone();
                     ratatui::restore();
@@ -171,6 +179,8 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     KeyCode::Esc => app.mode = Mode::Main,
                     KeyCode::Up | KeyCode::Char('k') => state.select_previous(),
                     KeyCode::Down | KeyCode::Char('j') => state.select_next(),
+                    KeyCode::Char('g') if gg => state.select_first(),
+                    KeyCode::Char('G') => state.select_last(),
                     KeyCode::Char(' ') | KeyCode::Char('x') => on[i] = !on[i],
                     KeyCode::Char('a') => {
                         let all = on.iter().all(|b| *b);
