@@ -347,6 +347,8 @@ pub fn thumbnail(image: &str) -> Result<(usize, usize, Vec<u8>), String> {
     let pgm = format!("{image}.pgm");
     // thicken text before shrinking, or it fades to near-white at terminal resolution
     run("magick", &[image, "-colorspace", "Gray", "-morphology", "Erode", "Disk:2", "-resize", "400x", &pgm])?;
+    // full quality PNG for terminals with the kitty graphics protocol
+    run("magick", &[image, "-resize", "1200x", &format!("{image}.preview.png")])?;
     let bytes = std::fs::read(&pgm).map_err(|e| e.to_string())?;
     parse_pgm(&bytes).ok_or_else(|| "Could not read the scan preview".into())
 }
@@ -405,4 +407,22 @@ pub fn save_scans(pages: &[String], out: &str, pdf: bool, dpi: u32) -> Result<Ve
         written.push(path);
     }
     Ok(written)
+}
+
+pub fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            out.push(if i <= c.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// A kitty graphics protocol command; inside tmux it is wrapped for passthrough.
+pub fn kitty(control: &str, payload: &str, tmux: bool) -> String {
+    let cmd = format!("\x1b_G{control};{payload}\x1b\\");
+    if tmux { format!("\x1bPtmux;{}\x1b\\", cmd.replace('\x1b', "\x1b\x1b")) } else { cmd }
 }
