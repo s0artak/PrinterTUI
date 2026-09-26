@@ -93,9 +93,19 @@ pub fn split_duplex<T: Clone>(sides: &[T]) -> (Vec<T>, Vec<T>) {
     (front, back)
 }
 
+/// Sorted pages back to a range string: [1, 2, 3, 7] -> "1-3,7".
 pub fn join(pages: &[u32]) -> String {
-    // ponytail: no run compression ("1,2,3" not "1-3"); only matters for huge contiguous single-sided lists
-    pages.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < pages.len() {
+        let start = i;
+        while i + 1 < pages.len() && pages[i + 1] == pages[i] + 1 {
+            i += 1;
+        }
+        out.push(if i > start { format!("{}-{}", pages[start], pages[i]) } else { pages[i].to_string() });
+        i += 1;
+    }
+    out.join(",")
 }
 
 pub struct Job<'a> {

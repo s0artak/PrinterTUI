@@ -48,6 +48,7 @@ cargo run --release -- ~/document.pdf
 | Left / Right, `h` / `l` | Change option (Copies: decrease / increase) |
 | `i` / `a` | Edit the file paths (separated by `;`) or page range (insert mode, Esc or Enter to finish) |
 | Enter | On File: open a file picker (yazi, lf, ranger, nnn or fzf, first one installed; multiple selection works). Elsewhere: print, or open the selected button |
+| Enter on Pages | Open the page selector: `j`/`k` move, Space toggles a page, `a` selects all / none, Enter confirms. Uses the first file's pages |
 | `q` / Esc / Ctrl+C | Quit |
 
 File names containing `;` are not supported.

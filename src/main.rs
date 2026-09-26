@@ -21,6 +21,8 @@ enum Mode {
     /// Editing the selected text field (vim-style, entered with `i`).
     Insert,
     Pick(Vec<(String, String)>, ListState),
+    /// Page selector: one checkbox per page of the first file.
+    Pages(Vec<bool>, ListState),
     /// Manual duplex: `job` is the front job while it is still printing, `steps` the flip
     /// instructions shown after it, `back` the back-side job, `files[next..]` the files still to print.
     Flip { job: Option<String>, steps: String, back: Vec<String>, files: Vec<String>, next: usize },
@@ -119,6 +121,12 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                         app.file = picked.join("; ");
                     }
                 }
+                KeyCode::Enter if app.sel == PAGES => {
+                    let res = app.open_pages(term);
+                    if let Err(e) = res {
+                        app.status = format!("Error: {e}");
+                    }
+                }
                 KeyCode::Enter => {
                     let res = app.try_print(term);
                     app.show(res);
@@ -157,6 +165,29 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                 }
                 _ => {}
             },
+            Mode::Pages(on, state) => {
+                let i = state.selected().unwrap_or(0);
+                match k.code {
+                    KeyCode::Esc => app.mode = Mode::Main,
+                    KeyCode::Up | KeyCode::Char('k') => state.select_previous(),
+                    KeyCode::Down | KeyCode::Char('j') => state.select_next(),
+                    KeyCode::Char(' ') | KeyCode::Char('x') => on[i] = !on[i],
+                    KeyCode::Char('a') => {
+                        let all = on.iter().all(|b| *b);
+                        on.iter_mut().for_each(|b| *b = !all);
+                    }
+                    KeyCode::Enter => {
+                        let picked: Vec<u32> = (1..).zip(on.iter()).filter(|(_, b)| **b).map(|(n, _)| n).collect();
+                        if picked.is_empty() {
+                            app.status = "Select at least one page.".into();
+                        } else {
+                            app.pages = if picked.len() == on.len() { String::new() } else { join(&picked) };
+                            app.mode = Mode::Main;
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Mode::Flip { job, .. } => match k.code {
                 KeyCode::Char('v') => {
                     if let Err(e) = play_tutorial() {
@@ -224,6 +255,18 @@ impl App {
             PRINT => "[ Print ]".into(),
             _ => "[ Add printer ]".into(),
         }
+    }
+
+    /// Opens the page selector for the first file, pre-checking the current range.
+    fn open_pages(&mut self, term: &mut DefaultTerminal) -> Result<(), String> {
+        let file = split_files(&self.file).first().map(|f| expand_home(f)).ok_or("Pick a file first")?;
+        let pdf = self.pdf(term, &file)?;
+        let total = page_count(&pdf).ok_or("Could not read the PDF")?;
+        let current = parse_ranges(&self.pages, total).unwrap_or_default();
+        let on = (1..=total).map(|n| current.contains(&n)).collect();
+        self.status = String::new();
+        self.mode = Mode::Pages(on, ListState::default().with_selected(Some(0)));
+        Ok(())
     }
 
     fn show(&mut self, res: Result<String, String>) {
@@ -406,6 +449,7 @@ fn draw(f: &mut Frame, app: &App) {
     f.render_widget(
         Line::from(match app.mode {
             Mode::Insert => " -- INSERT --   Esc/Enter done",
+            _ if app.sel == PAGES => " j/k move   Enter pick pages   i type a range (1-3,7)   q quit",
             _ => " j/k move   h/l change   i edit text   Enter select   q quit",
         })
             .style(Style::new().add_modifier(Modifier::DIM)),
@@ -419,6 +463,16 @@ fn draw(f: &mut Frame, app: &App) {
             let items: Vec<ListItem> = found.iter().map(|(n, u)| ListItem::new(format!("{n}  {u}"))).collect();
             let list = List::new(items)
                 .block(Block::bordered().title(" Add printer (Enter add, Esc back) "))
+                .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+            f.render_stateful_widget(list, area, &mut state.clone());
+        }
+        Mode::Pages(on, state) => {
+            let area = popup(f, on.len() as u16 + 2);
+            let items: Vec<ListItem> =
+                on.iter().enumerate().map(|(i, b)| ListItem::new(format!(" [{}] Page {}", if *b { "x" } else { " " }, i + 1))).collect();
+            let n = on.iter().filter(|b| **b).count();
+            let list = List::new(items)
+                .block(Block::bordered().title(format!(" Pages {n}/{} (Space toggle, a all, Enter ok, Esc back) ", on.len())))
                 .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
             f.render_stateful_widget(list, area, &mut state.clone());
         }
