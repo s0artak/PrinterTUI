@@ -21,8 +21,9 @@ enum Mode {
     /// Editing the selected text field (vim-style, entered with `i`).
     Insert,
     Pick(Vec<(String, String)>, ListState),
-    /// Front side sent; holds the back-side job waiting for the user to flip the paper.
-    Flip(Vec<String>),
+    /// Manual duplex: `job` is the front job while it is still printing, `steps` the flip
+    /// instructions shown after it, `back` the back-side job, `files[next..]` the files still to print.
+    Flip { job: Option<String>, steps: String, back: Vec<String>, files: Vec<String>, next: usize },
 }
 
 struct App {
@@ -73,7 +74,16 @@ fn main() -> std::io::Result<()> {
 
 fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     loop {
+        if let Mode::Flip { job, steps, .. } = &mut app.mode
+            && job.as_deref().is_some_and(|id| !job_active(id))
+        {
+            *job = None;
+            app.status = std::mem::take(steps);
+        }
         term.draw(|f| draw(f, app))?;
+        if !event::poll(std::time::Duration::from_millis(500))? {
+            continue;
+        }
         let Event::Key(k) = event::read()? else { continue };
         if k.kind != KeyEventKind::Press {
             continue;
@@ -101,14 +111,18 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                 }
                 KeyCode::Enter if app.sel == FILE => {
                     ratatui::restore();
-                    let picked = pick_file();
+                    let picked = pick_files();
                     *term = ratatui::init();
-                    match picked {
-                        Some(p) => app.file = p,
-                        None => app.status = "No file picked (install yazi, lf, ranger, nnn or fzf).".into(),
+                    if picked.is_empty() {
+                        app.status = "No file picked (install yazi, lf, ranger, nnn or fzf).".into();
+                    } else {
+                        app.file = picked.join("; ");
                     }
                 }
-                KeyCode::Enter => app.print(),
+                KeyCode::Enter => {
+                    let res = app.try_print(term);
+                    app.show(res);
+                }
                 _ => {}
             },
             Mode::Insert => match k.code {
@@ -143,7 +157,7 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                 }
                 _ => {}
             },
-            Mode::Flip(back) => match k.code {
+            Mode::Flip { job, .. } => match k.code {
                 KeyCode::Char('v') => {
                     if let Err(e) = play_tutorial() {
                         app.status = format!("Could not open the video: {e}\n\n{}", app.status);
@@ -153,12 +167,9 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     app.status = "Back side cancelled.".into();
                     app.mode = Mode::Main;
                 }
-                KeyCode::Enter => {
-                    app.status = match submit(back) {
-                        Ok(id) => format!("Back side sent: {id}"),
-                        Err(e) => e,
-                    };
-                    app.mode = Mode::Main;
+                KeyCode::Enter if job.is_none() => {
+                    let res = app.back_side(term);
+                    app.show(res);
                 }
                 _ => {}
             },
@@ -193,7 +204,15 @@ impl App {
         let pick = |s: &str| format!("< {s} >");
         match row {
             0 => pick(self.printers.get(self.printer).map_or("none", String::as_str)),
-            FILE => self.file.clone(),
+            FILE if matches!(self.mode, Mode::Insert) => self.file.clone(),
+            FILE => match split_files(&self.file)[..] {
+                [] => String::new(),
+                [ref one] => one.clone(),
+                ref many => {
+                    let names: Vec<&str> = many.iter().map(|f| name(f)).collect();
+                    format!("{} files: {}", many.len(), names.join(", "))
+                }
+            },
             2 => pick(if self.color { "Color" } else { "Grayscale" }),
             3 => pick(if self.duplex { "Double-sided (manual)" } else { "Single-sided" }),
             4 => pick(if self.reverse_back { "Reversed" } else { "Normal" }),
@@ -207,8 +226,8 @@ impl App {
         }
     }
 
-    fn print(&mut self) {
-        self.status = match self.try_print() {
+    fn show(&mut self, res: Result<String, String>) {
+        self.status = match res {
             Ok(s) => match self.save() {
                 Ok(()) => s,
                 Err(e) => format!("{s}\n\nCould not save settings: {e}"),
@@ -243,53 +262,100 @@ impl App {
         }
     }
 
-    fn try_print(&mut self) -> Result<String, String> {
-        let printer = self.printers.get(self.printer).ok_or("No printer selected")?;
-        let file = expand_home(self.file.trim());
-        if !std::path::Path::new(&file).is_file() {
-            return Err(format!("File not found: {file}"));
+
+    fn job(&self, file: &str, pages: Option<String>, reverse: bool, collate: bool) -> Vec<String> {
+        lp_args(&Job {
+            printer: &self.printers[self.printer], file, color: self.color, paper: PAPERS[self.paper], pages, reverse,
+            copies: self.copies, collate, per_sheet: PER_SHEET[self.per_sheet],
+        })
+    }
+
+    /// The file itself if it is a PDF, otherwise a PDF converted by LibreOffice.
+    fn pdf(&mut self, term: &mut DefaultTerminal, file: &str) -> Result<String, String> {
+        if page_count(file).is_some() {
+            return Ok(file.into());
+        }
+        self.status = format!("Converting {} to PDF...", name(file));
+        let _ = term.draw(|f| draw(f, self));
+        to_pdf(file)
+    }
+
+    fn try_print(&mut self, term: &mut DefaultTerminal) -> Result<String, String> {
+        self.printers.get(self.printer).ok_or("No printer selected")?;
+        let files: Vec<String> = split_files(&self.file).iter().map(|f| expand_home(f)).collect();
+        if files.is_empty() {
+            return Err("No file selected".into());
+        }
+        if let Some(f) = files.iter().find(|f| !std::path::Path::new(f).is_file()) {
+            return Err(format!("File not found: {f}"));
+        }
+        if self.duplex {
+            return self.duplex(term, files, 0, String::new());
         }
         let pages = self.pages.trim();
-        let per_sheet = PER_SHEET[self.per_sheet];
-        let job = |pages: Option<String>, reverse, collate| {
-            lp_args(&Job {
-                printer, file: &file, color: self.color, paper: PAPERS[self.paper], pages, reverse,
-                copies: self.copies, collate, per_sheet,
-            })
-        };
-        if !self.duplex {
-            let range = (!pages.is_empty() && pages != "all").then(|| pages.to_string());
-            return submit(&job(range, false, true));
+        let range = (!pages.is_empty() && pages != "all").then(|| pages.to_string());
+        let mut sent = Vec::new();
+        for f in &files {
+            let pdf = self.pdf(term, f)?;
+            sent.push(submit(&self.job(&pdf, range.clone(), false, true))?);
         }
-        let total = page_count(&file).ok_or("Double-sided needs a PDF file")?;
-        // page-ranges picks pages before number-up groups them, so split whole sheet sides
-        let pages = parse_ranges(pages, total)?;
-        let sides: Vec<&[u32]> = pages.chunks(per_sheet as usize).collect();
-        let (front, back) = split_duplex(&sides);
-        let odd = front.len() > back.len();
-        // Collated copies would leave a sheet without back side inside every copy when odd.
-        let (front, back) = (front.concat(), back.concat());
-        let front_job = job(Some(join(&front)), false, !odd);
-        let back_job = job(Some(join(&back)), self.reverse_back, !odd);
-        let id = submit(&front_job)?;
-        if back.is_empty() {
-            return Ok(format!("Only one page, nothing to flip: {id}"));
-        }
-        self.mode = Mode::Flip(back_job);
-        Ok(format!(
-            "Front side sent: {id}\n\n\
-             1. Wait until the printer stops.\n\
-             2. Take the whole stack out. Do not change the order.{}\n\
-             3. Flip it: printed side facing the BACK of the printer,\n   top of the page going in first (pointing down).\n\
-             4. Put it in the input tray.\n\n\
-             Enter = print back side    v = watch how (video)    Esc = cancel",
-            match (odd, self.copies) {
-                (false, _) => String::new(),
-                (true, 1) => "\n   Put the top sheet aside, it has no back side.".into(),
-                (true, n) => format!("\n   Put the top {n} sheets aside (no back side, copies are uncollated)."),
-            }
-        ))
+        Ok(sent.join("\n"))
     }
+
+    /// Prints the front of files[i..] until one needs flipping, then waits in Mode::Flip.
+    fn duplex(&mut self, term: &mut DefaultTerminal, files: Vec<String>, mut i: usize, mut done: String) -> Result<String, String> {
+        self.mode = Mode::Main;
+        while let Some(file) = files.get(i) {
+            i += 1;
+            let head = if files.len() > 1 { format!("File {i} of {}: {}\n", files.len(), name(file)) } else { String::new() };
+            let pdf = self.pdf(term, file)?;
+            let total = page_count(&pdf).ok_or("Could not read the PDF")?;
+            // page-ranges picks pages before number-up groups them, so split whole sheet sides
+            let pages = parse_ranges(&self.pages, total)?;
+            let sides: Vec<&[u32]> = pages.chunks(PER_SHEET[self.per_sheet] as usize).collect();
+            let (front, back) = split_duplex(&sides);
+            // Collated copies would leave a sheet without back side inside every copy when odd.
+            let odd = front.len() > back.len();
+            let (front, back) = (front.concat(), back.concat());
+            let id = submit(&self.job(&pdf, Some(join(&front)), false, !odd))?;
+            if back.is_empty() {
+                done += &format!("{head}Only one page, nothing to flip: {id}\n\n");
+                continue;
+            }
+            let steps = format!(
+                "{done}{head}Front side sent: {id}\n\n\
+                 1. Wait until the printer stops.\n\
+                 2. Take the whole stack out. Do not change the order.{}\n\
+                 3. Flip it: printed side facing the BACK of the printer,\n   top of the page going in first (pointing down).\n\
+                 4. Put it in the input tray.\n\n\
+                 Enter = print back side    v = watch how (video)    Esc = cancel",
+                match (odd, self.copies) {
+                    (false, _) => String::new(),
+                    (true, 1) => "\n   Put the top sheet aside, it has no back side.".into(),
+                    (true, n) => format!("\n   Put the top {n} sheets aside (no back side, copies are uncollated)."),
+                }
+            );
+            let wait = format!("{done}{head}Front side sent: {id}\n\nPrinting front side, please wait...\n\nEsc = cancel");
+            // unparsable lp output: "" is never listed as active, so the steps show right away
+            let job = Some(job_id(&id).unwrap_or_default().to_string());
+            let back = self.job(&pdf, Some(join(&back)), self.reverse_back, !odd);
+            self.mode = Mode::Flip { job, steps, back, files, next: i };
+            return Ok(wait);
+        }
+        Ok(done.trim_end().to_string())
+    }
+
+    fn back_side(&mut self, term: &mut DefaultTerminal) -> Result<String, String> {
+        let Mode::Flip { back, files, next, .. } = std::mem::replace(&mut self.mode, Mode::Main) else {
+            return Ok(String::new());
+        };
+        let id = submit(&back)?;
+        self.duplex(term, files, next, format!("Back side sent: {id}\n\n"))
+    }
+}
+
+fn name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// Writes the embedded duplex tutorial to a temp file and opens it with the default video player.
@@ -356,8 +422,8 @@ fn draw(f: &mut Frame, app: &App) {
                 .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
             f.render_stateful_widget(list, area, &mut state.clone());
         }
-        Mode::Flip(_) => {
-            let area = popup(f, 14);
+        Mode::Flip { .. } => {
+            let area = popup(f, 18);
             f.render_widget(
                 Paragraph::new(app.status.as_str())
                     .wrap(Wrap { trim: false })
