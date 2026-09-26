@@ -23,11 +23,23 @@ const PAGES: usize = 5;
 const PRINT: usize = 9;
 const ADD: usize = 10;
 
-const SCAN_LABELS: [&str; 8] = ["Scanner", "Mode", "Resolution", "Format", "Save as", "", "", ""];
+const SCAN_LABELS: [&str; 9] = ["Scanner", "Mode", "Resolution", "Format", "Save as", "", "Page", "", ""];
 const SAVE_AS: usize = 4;
 const SCAN: usize = 5;
-const SAVE: usize = 6;
-const DISCARD: usize = 7;
+const PAGE: usize = 6;
+const SAVE: usize = 7;
+const DISCARD: usize = 8;
+
+/// A scanned page: edits are always applied to the original scan.
+struct ScannedPage {
+    orig: String,
+    /// The original, or the edited copy once `rot` / `filter` are applied.
+    file: String,
+    rot: u16,
+    filter: usize,
+    keep: bool,
+    thumb: (usize, usize, Vec<u8>),
+}
 
 enum Mode {
     Main,
@@ -62,8 +74,9 @@ struct App {
     scan_dpi: usize,
     scan_pdf: bool,
     save_as: String,
-    scans: Vec<String>,
-    thumb: Option<(usize, usize, Vec<u8>)>,
+    scans: Vec<ScannedPage>,
+    /// Page shown in the preview and edited by the Page row.
+    cur: usize,
     /// Slow work (scanning, converting, discovery) runs in a thread so the UI keeps drawing.
     busy: Option<(String, mpsc::Receiver<Done>)>,
     /// Some(inside tmux) when the terminal speaks the kitty graphics protocol (kitty, Ghostty).
@@ -100,7 +113,7 @@ fn main() -> std::io::Result<()> {
         scan_pdf: true,
         save_as: default_scan_name(),
         scans: Vec::new(),
-        thumb: None,
+        cur: 0,
         busy: None,
         graphics: kitty_graphics(),
         preview_area: Cell::default(),
@@ -130,7 +143,8 @@ fn main() -> std::io::Result<()> {
 }
 
 fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
-    let mut pending_g = false;
+    // first key of vim `gg` / `dd`
+    let mut pending: Option<char> = None;
     loop {
         if let Some((_, rx)) = &app.busy {
             match rx.try_recv() {
@@ -171,10 +185,17 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
         if app.busy.is_some() && k.code == KeyCode::Enter {
             continue;
         }
-        let gg = pending_g && k.code == KeyCode::Char('g');
-        pending_g = !gg && k.code == KeyCode::Char('g') && !matches!(app.mode, Mode::Insert);
+        let prev = pending.take();
+        let (gg, dd) = (prev == Some('g') && k.code == KeyCode::Char('g'), prev == Some('d') && k.code == KeyCode::Char('d'));
+        if let KeyCode::Char(c @ ('g' | 'd')) = k.code
+            && prev != Some(c)
+            && !matches!(app.mode, Mode::Insert)
+        {
+            pending = Some(c);
+        }
         match &mut app.mode {
             Mode::Main => match k.code {
+                KeyCode::Char(c) if app.scan_tab && app.sel == PAGE && !app.scans.is_empty() && app.page_key(c, dd) => {}
                 KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
                 KeyCode::Up | KeyCode::Char('k') => app.sel = app.sel.checked_sub(1).unwrap_or(app.last()),
                 KeyCode::Down | KeyCode::Char('j') => app.sel = (app.sel + 1) % (app.last() + 1),
@@ -327,6 +348,7 @@ impl App {
                 1 => self.scan_mode = step(self.scan_mode, SCAN_MODES.len()),
                 2 => self.scan_dpi = step(self.scan_dpi, SCAN_DPI.len()),
                 3 => self.scan_pdf = !self.scan_pdf,
+                PAGE => self.cur = step(self.cur, self.scans.len()),
                 _ => {}
             }
             return;
@@ -353,8 +375,25 @@ impl App {
                 3 => pick(if self.scan_pdf { "PDF (all pages in one file)" } else { "PNG (one file per page)" }),
                 SAVE_AS => self.save_as.clone(),
                 SCAN => "[ Scan page ]".into(),
-                SAVE => format!("[ Save {} page{} ]", self.scans.len(), if self.scans.len() == 1 { "" } else { "s" }),
-                _ => "[ Discard ]".into(),
+                PAGE => match self.scans.get(self.cur) {
+                    None => "none yet".into(),
+                    Some(p) => {
+                        let mut v = format!("< {} / {} >  [{}] keep", self.cur + 1, self.scans.len(), if p.keep { "x" } else { " " });
+                        if p.rot != 0 {
+                            v += &format!(" · rotated {}°", p.rot);
+                        }
+                        if p.filter != 0 {
+                            v += &format!(" · {}", FILTERS[p.filter]);
+                        }
+                        v
+                    }
+                },
+                SAVE => {
+                    let (kept, all) = (self.scans.iter().filter(|p| p.keep).count(), self.scans.len());
+                    let of = if kept == all { String::new() } else { format!(" of {all}") };
+                    format!("[ Save {kept}{of} page{} ]", if all == 1 { "" } else { "s" })
+                }
+                _ => "[ Discard all ]".into(),
             };
         }
         match row {
@@ -546,12 +585,71 @@ impl App {
     fn sync_image(&mut self) {
         let Some(tmux) = self.graphics else { return };
         let area = self.preview_area.get();
-        let want = self.scans.last().map(|p| (format!("{p}.preview.png"), area.width, area.height));
+        let want = self.preview_png().map(|p| (p, area.width, area.height));
         if want.is_some() && want != self.sent && area.width > 0 {
             let (png, c, r) = want.clone().unwrap_or_default();
             emit(&kitty(&format!("a=T,U=1,f=100,t=f,i={},q=2,c={c},r={r}", image_id()), &base64(png.as_bytes()), tmux));
             self.sent = want;
         }
+    }
+
+    fn preview_png(&self) -> Option<String> {
+        self.scans.get(self.cur).map(|p| format!("{}.preview.png", p.file))
+    }
+
+    /// Page row keys; returns false for keys it does not use.
+    fn page_key(&mut self, c: char, dd: bool) -> bool {
+        let i = self.cur;
+        // a newer edit may replace a running one, but never a scan or a save
+        if matches!(c, 'r' | 'R' | 'f') && self.busy.as_ref().is_some_and(|(msg, _)| msg != "Editing page") {
+            return true;
+        }
+        match c {
+            'r' => self.scans[i].rot = (self.scans[i].rot + 90) % 360,
+            'R' => self.scans[i].rot = (self.scans[i].rot + 270) % 360,
+            'f' => self.scans[i].filter = (self.scans[i].filter + 1) % FILTERS.len(),
+            'x' | ' ' => {
+                self.scans[i].keep = !self.scans[i].keep;
+                return true;
+            }
+            'H' | 'L' => {
+                let j = if c == 'H' { i.checked_sub(1) } else { Some(i + 1).filter(|j| *j < self.scans.len()) };
+                if let Some(j) = j {
+                    self.scans.swap(i, j);
+                    self.cur = j;
+                }
+                return true;
+            }
+            'd' if dd => {
+                self.scans.remove(i);
+                self.cur = i.min(self.scans.len().saturating_sub(1));
+                self.status = format!("Page {} deleted.", i + 1);
+                return true;
+            }
+            'd' => return true, // wait for the second d
+            _ => return false,
+        }
+        self.edit_page();
+        true
+    }
+
+    /// Re-renders the current page from its original with its rotation and filter.
+    fn edit_page(&mut self) {
+        let p = &self.scans[self.cur];
+        let (orig, rot, filter) = (p.orig.clone(), p.rot, p.filter);
+        self.spawn("Editing page", move || {
+            let res = edit_page(&orig, rot, filter);
+            Box::new(move |app: &mut App| match res {
+                // the page may have moved meanwhile, and only the latest edit counts
+                Ok((file, thumb)) => {
+                    if let Some(p) = app.scans.iter_mut().find(|p| p.orig == orig && (p.rot, p.filter) == (rot, filter)) {
+                        p.file = file;
+                        p.thumb = thumb;
+                    }
+                }
+                Err(e) => app.status = format!("Error: {e}"),
+            })
+        });
     }
 
     fn find_scanners(&mut self, full: bool) {
@@ -576,7 +674,7 @@ impl App {
             SAVE => self.save_scans(),
             DISCARD => {
                 self.scans.clear();
-                self.thumb = None;
+                self.cur = 0;
                 self.status = "Scanned pages discarded.".into();
             }
             _ => {}
@@ -589,7 +687,9 @@ impl App {
         };
         let dir = std::env::temp_dir().join("printertui-scan");
         let n = self.scans.len() + 1;
-        let path = dir.join(format!("page-{n}")).to_string_lossy().into_owned();
+        // unique name: pages can be deleted and reordered, and old edits must not be reused
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let path = dir.join(format!("page-{stamp}")).to_string_lossy().into_owned();
         let (mode, dpi) = (SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi]);
         self.spawn(format!("Scanning page {n}"), move || {
             let res = std::fs::create_dir_all(&dir)
@@ -599,9 +699,9 @@ impl App {
             Box::new(move |app: &mut App| {
                 app.status = match res {
                     Ok(thumb) => {
-                        app.thumb = Some(thumb);
-                        app.scans.push(path);
-                        format!("Scanned page {n}. Put the next page on the glass and scan again, or save.")
+                        app.scans.push(ScannedPage { orig: path.clone(), file: path, rot: 0, filter: 0, keep: true, thumb });
+                        app.cur = app.scans.len() - 1;
+                        format!("Scanned page {n}. Put the next page on the glass and scan again, or save.\nOn the Page row: r rotate, f filter, x keep, H/L move, dd delete.")
                     }
                     Err(e) => format!("Error: {e}"),
                 }
@@ -610,19 +710,20 @@ impl App {
     }
 
     fn save_scans(&mut self) {
-        if self.scans.is_empty() {
-            return self.status = "Error: Nothing scanned yet".into();
+        let files: Vec<String> = self.scans.iter().filter(|p| p.keep).map(|p| p.file.clone()).collect();
+        if files.is_empty() {
+            return self.status = "Error: No pages to save".into();
         }
         let out = expand_home(self.save_as.trim());
         let out = out.trim_end_matches(".pdf").trim_end_matches(".png").to_string();
-        let (scans, pdf, dpi) = (self.scans.clone(), self.scan_pdf, SCAN_DPI[self.scan_dpi]);
+        let (pdf, dpi) = (self.scan_pdf, SCAN_DPI[self.scan_dpi]);
         self.spawn("Saving", move || {
-            let res = save_scans(&scans, &out, pdf, dpi);
+            let res = save_scans(&files, &out, pdf, dpi);
             Box::new(move |app: &mut App| {
                 app.status = match res {
                     Ok(written) => {
                         app.scans.clear();
-                        app.thumb = None;
+                        app.cur = 0;
                         app.save_as = default_scan_name();
                         let _ = app.save();
                         let written: Vec<String> = written.iter().map(|p| tilde(p)).collect();
@@ -737,6 +838,7 @@ fn draw(f: &mut Frame, app: &App) {
     f.render_widget(
         Line::from(match app.mode {
             Mode::Insert => " -- INSERT --   Esc/Enter done",
+            _ if app.sel == PAGE && app.scan_tab => " h/l page   H/L move   r/R rotate   f filter   x keep   dd delete",
             _ if app.sel == PAGES && !app.scan_tab => " j/k move   Enter pick pages   i type a range (1-3,7)   q quit",
             _ => " j/k move   h/l change   i edit text   Enter select   Tab print/scan   q quit",
         })
@@ -821,9 +923,9 @@ fn duplex_frame(tick: usize) -> Vec<String> {
 
 /// Grayscale half-block rendering of the last scanned page, two pixels per cell.
 fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let block = Block::bordered().title(match app.scans.len() {
-        0 => " Preview ".to_string(),
-        n => format!(" Preview: page {n} "),
+    let block = Block::bordered().title(match app.scans.get(app.cur) {
+        None => " Preview ".to_string(),
+        Some(p) => format!(" Preview: page {} of {}{} ", app.cur + 1, app.scans.len(), if p.keep { "" } else { " (not saved)" }),
     });
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -831,7 +933,7 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     if app.graphics.is_some() {
         // placeholder cells: U+10EEEE, the row as a diacritic on the first cell (the terminal infers
         // the columns), and the image id as the foreground color
-        let want = app.scans.last().map(|p| (format!("{p}.preview.png"), inner.width, inner.height));
+        let want = app.preview_png().map(|p| (p, inner.width, inner.height));
         if want.is_some() && want == app.sent {
             let id = image_id();
             let color = Color::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8);
@@ -844,7 +946,7 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         }
         return;
     }
-    let Some((w, h, px)) = &app.thumb else { return };
+    let Some((w, h, px)) = app.scans.get(app.cur).map(|p| &p.thumb) else { return };
     let (cols, rows) = (inner.width as usize, inner.height as usize * 2);
     let scale = (cols as f32 / *w as f32).min(rows as f32 / *h as f32);
     let (ow, oh) = (((*w as f32 * scale) as usize).max(1), ((*h as f32 * scale) as usize).max(2) & !1);

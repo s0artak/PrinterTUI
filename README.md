@@ -37,6 +37,6 @@ printertui [file]
 
 Double-sided: the front pages print, then flip the stack and press Enter. An animation shows how to flip it. If the back pages come out in the wrong order, set **Back order** to *Reversed*.
 
-Scan: put a page on the glass, press Enter on **Scan page**, repeat for more pages, then **Save** them as one PDF or as PNG files. The last scanned page is previewed on the right: as the real image in kitty and Ghostty (also inside tmux with `set -g allow-passthrough on`), in grayscale blocks elsewhere.
+Scan: put a page on the glass, press Enter on **Scan page**, repeat for more pages, then **Save** them as one PDF or as PNG files. On the **Page** row: `h`/`l` browse pages, `r`/`R` rotate, `f` filter (gray, black & white), `x` keep or leave out, `H`/`L` reorder, `dd` delete. The last scanned page is previewed on the right: as the real image in kitty and Ghostty (also inside tmux with `set -g allow-passthrough on`), in grayscale blocks elsewhere.
 
 Settings are remembered in `~/.config/printertui/config`.

@@ -426,3 +426,28 @@ pub fn kitty(control: &str, payload: &str, tmux: bool) -> String {
     let cmd = format!("\x1b_G{control};{payload}\x1b\\");
     if tmux { format!("\x1bPtmux;{}\x1b\\", cmd.replace('\x1b', "\x1b\x1b")) } else { cmd }
 }
+
+pub const FILTERS: [&str; 3] = ["Original", "Gray", "B&W"];
+
+/// Rotates (degrees clockwise) and filters a scanned page, always starting from the original scan.
+/// Returns the edited file (the original itself when there is nothing to do) and its thumbnail.
+pub fn edit_page(orig: &str, rot: u16, filter: usize) -> Result<(String, (usize, usize, Vec<u8>)), String> {
+    let out = if rot == 0 && filter == 0 {
+        orig.to_string()
+    } else {
+        let out = format!("{orig}-r{rot}-f{filter}.png");
+        let rot = rot.to_string();
+        let mut args = vec![orig, "-rotate", &rot];
+        match filter {
+            1 => args.extend(["-colorspace", "Gray"]),
+            // normalize first so the threshold works on pale or uneven scans
+            2 => args.extend(["-colorspace", "Gray", "-normalize", "-threshold", "60%"]),
+            _ => {}
+        }
+        args.push(&out);
+        run("magick", &args)?;
+        out
+    };
+    let thumb = thumbnail(&out)?;
+    Ok((out, thumb))
+}
