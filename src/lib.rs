@@ -3,6 +3,8 @@
 use std::process::Command;
 
 pub const PAPERS: [&str; 5] = ["A4", "Letter", "Legal", "A5", "A3"];
+/// Pages per sheet side (`number-up`).
+pub const PER_SHEET: [u32; 6] = [1, 2, 4, 6, 9, 16];
 
 fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
     let out = Command::new(cmd)
@@ -65,10 +67,10 @@ pub fn parse_ranges(spec: &str, total: u32) -> Result<Vec<u32>, String> {
     Ok(pages)
 }
 
-/// Splits pages into (front, back) for manual duplex: 1st, 3rd, 5th... on the front.
-pub fn split_duplex(pages: &[u32]) -> (Vec<u32>, Vec<u32>) {
-    let front = pages.iter().step_by(2).copied().collect();
-    let back = pages.iter().skip(1).step_by(2).copied().collect();
+/// Splits sheet sides into (front, back) for manual duplex: 1st, 3rd, 5th... on the front.
+pub fn split_duplex<T: Clone>(sides: &[T]) -> (Vec<T>, Vec<T>) {
+    let front = sides.iter().step_by(2).cloned().collect();
+    let back = sides.iter().skip(1).step_by(2).cloned().collect();
     (front, back)
 }
 
@@ -84,6 +86,9 @@ pub struct Job<'a> {
     pub paper: &'a str,
     pub pages: Option<String>,
     pub reverse: bool,
+    pub copies: u32,
+    pub collate: bool,
+    pub per_sheet: u32,
 }
 
 pub fn lp_args(job: &Job) -> Vec<String> {
@@ -98,8 +103,28 @@ pub fn lp_args(job: &Job) -> Vec<String> {
     if job.reverse {
         a.extend(["-o".into(), "outputorder=reverse".into()]);
     }
+    if job.copies > 1 {
+        a.extend(["-n".into(), job.copies.to_string(), "-o".into(), format!("collate={}", job.collate)]);
+    }
+    if job.per_sheet > 1 {
+        a.extend(["-o".into(), format!("number-up={}", job.per_sheet)]);
+    }
     a.extend(["--".into(), job.file.into()]);
     a
+}
+
+/// Settings file: $XDG_CONFIG_HOME/printertui/config, else ~/.config/printertui/config.
+pub fn config_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config")))?;
+    Some(base.join("printertui/config"))
+}
+
+/// `key=value` lines as trimmed pairs; other lines are skipped.
+pub fn parse_config(text: &str) -> Vec<(&str, &str)> {
+    text.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect()
 }
 
 /// Sends a job with `lp`, returns its "request id is ..." line.
