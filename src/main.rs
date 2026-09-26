@@ -51,7 +51,7 @@ enum Mode {
     Pages(Vec<bool>, ListState),
     /// Manual duplex: `job` is the front job while it is still printing, `steps` the flip
     /// instructions shown after it, `back` the back-side job, `files[next..]` the files still to print.
-    Flip { job: Option<String>, steps: String, back: Vec<String>, files: Vec<String>, next: usize },
+    Flip { job: Option<String>, steps: String, back: Job, files: Vec<String>, next: usize },
     /// Print queue popup: (job number, description), refreshed every second.
     Queue(Vec<(String, String)>, ListState),
 }
@@ -239,7 +239,7 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     let picked = pick_files();
                     *term = ratatui::init();
                     if picked.is_empty() {
-                        app.status = "No file picked (install yazi, lf, ranger, nnn or fzf).".into();
+                        app.status = format!("No file picked ({PICK_HINT}).");
                     } else {
                         app.file = picked.join("; ");
                     }
@@ -273,7 +273,7 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                 KeyCode::Enter => {
                     let (name, uri) = found[state.selected().unwrap_or(0)].clone();
                     ratatui::restore();
-                    println!("Adding {name} ({uri}), sudo may ask for your password...");
+                    println!("Adding {name} ({uri}), {ADD_PRINTER_NOTE}...");
                     let res = add_printer(&name, &uri);
                     *term = ratatui::init();
                     app.status = match res {
@@ -532,11 +532,11 @@ impl App {
     }
 
 
-    fn job(&self, file: &str, pages: Option<String>, reverse: bool, collate: bool) -> Vec<String> {
-        lp_args(&Job {
-            printer: &self.printers[self.printer], file, color: self.color, paper: PAPERS[self.paper], pages, reverse,
+    fn job(&self, file: &str, pages: Option<String>, reverse: bool, collate: bool) -> Job {
+        Job {
+            printer: self.printers[self.printer].clone(), file: file.into(), color: self.color, paper: PAPERS[self.paper], pages, reverse,
             copies: self.copies, collate, per_sheet: PER_SHEET[self.per_sheet],
-        })
+        }
     }
 
     fn files(&self) -> Result<Vec<String>, String> {
@@ -704,7 +704,7 @@ impl App {
             Box::new(move |app: &mut App| {
                 app.scanner = list.iter().position(|(d, _)| *d == app.scanner_pref).unwrap_or(0);
                 app.status = if list.is_empty() {
-                    "No scanners found. Network printers that can scan show up on their own;\nfor other scanners install SANE, then press Enter on Scanner to search again.".into()
+                    format!("No scanners found. Network printers that can scan show up on their own;\n{SCANNER_HINT}, then press Enter on Scanner to search again.")
                 } else {
                     String::new()
                 };
@@ -814,10 +814,8 @@ fn kitty_graphics() -> Option<bool> {
 
 /// `~/Documents/scan-2026-09-26_154200` (or in `~` when there is no Documents folder).
 fn default_scan_name() -> String {
-    let date = std::process::Command::new("date").arg("+%Y-%m-%d_%H%M%S").output();
-    let date = date.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-    let docs = std::env::var("HOME").is_ok_and(|h| std::path::Path::new(&h).join("Documents").is_dir());
-    format!("~/{}scan-{date}", if docs { "Documents/" } else { "" })
+    let docs = std::env::home_dir().is_some_and(|h| h.join("Documents").is_dir());
+    format!("~/{}scan-{}", if docs { "Documents/" } else { "" }, timestamp())
 }
 
 /// The file itself if it is a PDF, otherwise a PDF converted by LibreOffice.
@@ -826,20 +824,22 @@ fn pdf(file: &str) -> Result<String, String> {
 }
 
 fn name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 /// Inverse of expand_home, for showing paths.
 fn tilde(p: &str) -> String {
-    match std::env::var("HOME").ok().and_then(|h| p.strip_prefix(&h).map(str::to_string)) {
-        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+    let home = std::env::home_dir().map(|h| h.to_string_lossy().into_owned());
+    match home.and_then(|h| p.strip_prefix(&h).map(str::to_string)) {
+        Some(rest) if rest.starts_with(['/', '\\']) => format!("~{rest}"),
         _ => p.to_string(),
     }
 }
 
+/// `~/x` (or `~\x`) to the full path in the home folder.
 fn expand_home(p: &str) -> String {
-    match (p.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
+    match (p.strip_prefix("~/").or(p.strip_prefix("~\\")), std::env::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest).to_string_lossy().into_owned(),
         _ => p.to_string(),
     }
 }

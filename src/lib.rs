@@ -1,5 +1,20 @@
-//! Thin wrappers around the CUPS command line tools (lp, lpstat, lpinfo, lpadmin).
+//! Printing, scanning and scan editing. What differs per system (CUPS/SANE, or the Windows
+//! print spooler and scanner API) lives in `unix` and `win`, with the same functions.
 
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+pub use unix::*;
+#[cfg(windows)]
+mod win;
+#[cfg(windows)]
+pub use win::*;
+
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::{ColorType, DynamicImage, GrayImage, ImageFormat, Luma};
+use pdf_writer::types::TextRenderingMode;
+use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref, Str};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
@@ -31,53 +46,10 @@ fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Configured printers, default printer first.
-pub fn printers() -> Vec<String> {
-    let mut list: Vec<String> = run("lpstat", &["-e"])
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_string)
-        .collect();
-    if let Some(def) = run("lpstat", &["-d"])
-        .ok()
-        .and_then(|s| s.rsplit(": ").next().map(str::to_string))
-    {
-        if let Some(i) = list.iter().position(|p| *p == def) {
-            list.swap(0, i);
-        }
-    }
-    list
-}
-
-/// Display name for a queue from its `lpoptions -p` output: the description if the user set one
-/// (`lpadmin -p QUEUE -D "Name"`), else the model, plus the network address.
-const NETWORK: [&str; 6] = ["ipp", "ipps", "socket", "lpd", "http", "https"];
-
-pub fn printer_label(queue: &str, lpoptions: &str) -> String {
-    let opt = |key: &str| {
-        let v = lpoptions.split(&format!("{key}=")).nth(1)?;
-        let v = match v.strip_prefix('\'') {
-            Some(q) => q.split('\'').next()?,
-            None => v.split(' ').next()?,
-        };
-        Some(v.replace("\\ ", " "))
-    };
-    let info = opt("printer-info").filter(|i| !i.is_empty() && i != queue);
-    let model = opt("printer-make-and-model").map(|m| m.trim_end_matches(" - IPP Everywhere").to_string());
-    let name = info.or(model).unwrap_or_else(|| queue.to_string());
-    match opt("device-uri").as_deref().and_then(uri_host) {
-        Some((scheme, host)) if NETWORK.contains(&scheme) => format!("{name} ({host})"),
-        _ => name,
-    }
-}
-
-pub fn printer_labels(queues: &[String]) -> Vec<String> {
-    queues.iter().map(|q| printer_label(q, &run("lpoptions", &["-p", q]).unwrap_or_default())).collect()
-}
-
-/// Page count of a PDF (qpdf ships with cups-filters).
+/// Page count of a PDF, None for anything that is not one.
 pub fn page_count(file: &str) -> Option<u32> {
-    run("qpdf", &["--show-npages", file]).ok()?.parse().ok()
+    let n = lopdf::Document::load(file).ok()?.get_pages().len() as u32;
+    (n > 0).then_some(n)
 }
 
 /// Converts a document, text or image to PDF with LibreOffice, returns the PDF path.
@@ -85,13 +57,12 @@ pub fn to_pdf(file: &str) -> Result<String, String> {
     let dir = std::env::temp_dir().join("printertui");
     let d = dir.to_str().ok_or("Bad temp dir")?;
     let stem = std::path::Path::new(file).file_stem().ok_or("Bad file name")?;
-    let pdf = format!("{d}/{}.pdf", stem.to_string_lossy());
+    let pdf = dir.join(stem).with_extension("pdf").to_string_lossy().into_owned();
     let _ = std::fs::remove_file(&pdf);
     // own profile, so a running LibreOffice window does not swallow the conversion
-    let profile = format!("-env:UserInstallation=file://{d}/profile");
-    // macOS does not put LibreOffice on the PATH
-    let lo = if cfg!(target_os = "macos") { "/Applications/LibreOffice.app/Contents/MacOS/soffice" } else { "libreoffice" };
-    run(lo, &[&profile, "--headless", "--convert-to", "pdf", "--outdir", d, file])
+    // (a file URL: file:///tmp/... or file:///C:/Users/...)
+    let profile = format!("-env:UserInstallation=file:///{}/profile", d.replace('\\', "/").trim_start_matches('/'));
+    run(&soffice(), &[&profile, "--headless", "--convert-to", "pdf", "--outdir", d, file])
         .map_err(|e| format!("Could not convert {file} to PDF (is libreoffice installed?): {e}"))?;
     page_count(&pdf).map(|_| pdf).ok_or(format!("LibreOffice could not convert {file} to PDF"))
 }
@@ -149,11 +120,12 @@ pub fn join(pages: &[u32]) -> String {
     out.join(",")
 }
 
-pub struct Job<'a> {
-    pub printer: &'a str,
-    pub file: &'a str,
+#[derive(Clone)]
+pub struct Job {
+    pub printer: String,
+    pub file: String,
     pub color: bool,
-    pub paper: &'a str,
+    pub paper: &'static str,
     pub pages: Option<String>,
     pub reverse: bool,
     pub copies: u32,
@@ -161,35 +133,12 @@ pub struct Job<'a> {
     pub per_sheet: u32,
 }
 
-pub fn lp_args(job: &Job) -> Vec<String> {
-    let mut a = vec![
-        "-d".into(), job.printer.into(),
-        "-o".into(), format!("media={}", job.paper),
-        "-o".into(), format!("print-color-mode={}", if job.color { "color" } else { "monochrome" }),
-    ];
-    if let Some(p) = &job.pages {
-        a.extend(["-o".into(), format!("page-ranges={p}")]);
-    }
-    if job.reverse {
-        a.extend(["-o".into(), "outputorder=reverse".into()]);
-    }
-    if job.copies > 1 {
-        a.extend(["-n".into(), job.copies.to_string(), "-o".into(), format!("collate={}", job.collate)]);
-    }
-    if job.per_sheet > 1 {
-        a.extend(["-o".into(), format!("number-up={}", job.per_sheet)]);
-    }
-    a.extend(["--".into(), job.file.into()]);
-    a
-}
-
-/// Settings file: $XDG_CONFIG_HOME/printertui/config, else ~/.config/printertui/config.
+/// Settings file: $XDG_CONFIG_HOME/printertui/config, else ~/.config/printertui/config;
+/// %APPDATA%\printertui\config on Windows.
 pub fn config_path() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config")))?;
-    Some(base.join("printertui/config"))
+    let var = |k| std::env::var_os(k).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    let base = if cfg!(windows) { var("APPDATA")? } else { var("XDG_CONFIG_HOME").or_else(|| Some(std::env::home_dir()?.join(".config")))? };
+    Some(base.join("printertui").join("config"))
 }
 
 /// `key=value` lines as trimmed pairs; other lines are skipped.
@@ -197,32 +146,20 @@ pub fn parse_config(text: &str) -> Vec<(&str, &str)> {
     text.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect()
 }
 
-/// Sends a job with `lp`, returns its "request id is ..." line.
-pub fn submit(args: &[String]) -> Result<String, String> {
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = run("lp", &args)?;
-    if let Some(id) = job_id(&out) {
-        JOBS.lock().unwrap().push(id.to_string());
-    }
-    Ok(out)
-}
-
 /// On quit: cancels this session's unfinished print and scan jobs and kills running tools
 /// (their children first, e.g. LibreOffice's soffice.bin, so none are left orphaned).
 pub fn stop_all() {
-    let pids: Vec<String> = CHILDREN.lock().unwrap().iter().map(u32::to_string).collect();
+    let pids = CHILDREN.lock().unwrap().clone();
     if !pids.is_empty() {
-        let _ = Command::new("pkill").args(["-TERM", "-P", &pids.join(",")]).status();
-        let _ = Command::new("kill").arg("-TERM").args(&pids).status();
+        kill_tree(&pids);
     }
     let jobs = std::mem::take(&mut *JOBS.lock().unwrap());
     let (scans, prints): (Vec<String>, Vec<String>) = jobs.into_iter().partition(|j| j.starts_with("http"));
-    let prints: Vec<String> = prints.into_iter().filter(|id| job_active(id)).collect();
-    if !prints.is_empty() {
-        let _ = Command::new("cancel").args(&prints).stderr(Stdio::null()).status();
+    for id in prints.iter().filter(|id| job_active(id)) {
+        let _ = cancel_job(id);
     }
     for job in scans {
-        let _ = Command::new("curl").args(["-sf", "-m", "2", "-X", "DELETE", &job]).stdout(Stdio::null()).status();
+        let _ = minreq::delete(job).with_timeout(2).send();
     }
 }
 
@@ -231,127 +168,35 @@ pub fn job_id(lp_out: &str) -> Option<&str> {
     lp_out.strip_prefix("request id is ")?.split_whitespace().next()
 }
 
-/// True while the job is still pending, held or printing.
-pub fn job_active(id: &str) -> bool {
-    run("lpstat", &["-W", "not-completed", "-o"])
-        .is_ok_and(|s| s.lines().any(|l| l.split_whitespace().next() == Some(id)))
-}
-
-/// Unfinished jobs on all printers as (job number, "file  size  position") for the queue popup.
-pub fn queue() -> Vec<(String, String)> {
-    parse_lpq(&run("lpq", &["-a"]).unwrap_or_default())
-}
-
-/// `lpq -a` rows: "1st  spartak  8  my file.txt  1024 bytes" (the header and "no entries" are skipped).
-pub fn parse_lpq(text: &str) -> Vec<(String, String)> {
-    text.lines()
-        .filter_map(|l| {
-            let w: Vec<&str> = l.split_whitespace().collect();
-            let [rank, owner, job, ref file @ .., size, "bytes"] = w[..] else { return None };
-            job.parse::<u32>().ok()?;
-            Some((job.to_string(), format!("{}  ({owner}, {} KB, {rank})", file.join(" "), size.parse::<u64>().unwrap_or(0).div_ceil(1024))))
-        })
-        .collect()
-}
-
-pub fn cancel_job(id: &str) -> Result<(), String> {
-    run("cancel", &[id]).map(drop)
-}
-
-/// Network printers found by `lpinfo -v`, as (queue name, IPP uri) ready for `lpadmin -m everywhere`.
-pub fn discover() -> Vec<(String, String)> {
-    let mut found: Vec<(String, String)> = run("lpinfo", &["-v"])
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.split_whitespace().nth(1))
-        .filter_map(to_ipp)
-        .collect();
-    found.sort();
-    found.dedup_by(|a, b| a.0 == b.0);
-    found
-}
-
 /// ("ipp", "192.168.1.46") from "ipp://192.168.1.46/ipp/print".
 pub fn uri_host(uri: &str) -> Option<(&str, &str)> {
     let (scheme, rest) = uri.split_once("://")?;
     Some((scheme, rest.split(['/', ':', '?']).next().filter(|h| !h.is_empty())?))
 }
 
-fn to_ipp(uri: &str) -> Option<(String, String)> {
-    let (scheme, host) = uri_host(uri)?;
-    let name = format!("printer_{}", host.replace(|c: char| !c.is_ascii_alphanumeric(), "_"));
-    match scheme {
-        "ipp" | "ipps" | "dnssd" => Some((name, uri.to_string())),
-        // ponytail: assumes the standard IPP Everywhere path; edit the queue with lpadmin if a printer differs
-        "socket" | "lpd" => Some((name, format!("ipp://{host}/ipp/print"))),
-        _ => None,
-    }
-}
-
-/// Interactive: sudo may ask for a password, so the terminal must be in normal mode.
-pub fn add_printer(name: &str, uri: &str) -> Result<(), String> {
-    let ok = Command::new("sudo")
-        .args(["lpadmin", "-p", name, "-E", "-v", uri, "-m", "everywhere"])
-        .status()
-        .map_err(|e| e.to_string())?
-        .success();
-    if ok { Ok(()) } else { Err(format!("lpadmin failed for {uri}")) }
-}
-
-/// Opens the first installed terminal file manager as a picker, returns the selected files.
-/// Needs the terminal in normal mode.
-pub fn pick_files() -> Vec<String> {
-    let out = std::env::temp_dir().join(format!("printertui-pick-{}", std::process::id()));
-    let o = out.to_str().unwrap_or_default();
-    let pickers: [(&str, Vec<String>); 4] = [
-        ("yazi", vec![format!("--chooser-file={o}")]),
-        ("lf", vec!["-selection-path".into(), o.into()]),
-        ("ranger", vec![format!("--choosefiles={o}")]),
-        ("nnn", vec!["-p".into(), o.into()]),
-    ];
-    for (cmd, args) in pickers {
-        if Command::new(cmd).args(&args).status().is_ok() {
-            let picked = std::fs::read_to_string(&out).unwrap_or_default();
-            let _ = std::fs::remove_file(&out);
-            return lines(&picked);
-        }
-    }
-    // fzf draws on the tty and prints the choices on stdout
-    Command::new("fzf").arg("-m").stdout(std::process::Stdio::piped()).output()
-        .map_or(Vec::new(), |out| lines(&String::from_utf8_lossy(&out.stdout)))
-}
-
-/// One path per line (nnn may separate them with NUL).
-fn lines(s: &str) -> Vec<String> {
-    s.split(['\n', '\0']).filter(|l| !l.is_empty()).map(String::from).collect()
-}
-
 pub const SCAN_MODES: [&str; 2] = ["Color", "Gray"];
 pub const SCAN_DPI: [u32; 3] = [150, 300, 600];
-/// Save formats: one PDF, one PDF with a text layer (tesseract OCR), or one PNG per page.
+/// Save formats: one PDF, one PDF with a text layer (OCR), or one PNG per page.
 pub const SCAN_FORMATS: [&str; 3] = ["PDF", "OCR", "PNG"];
 
-/// Scanners as (SANE device, description). Network printers already in CUPS are tried first
-/// as eSCL scanners by address, which is instant and reliable; SANE's own discovery (slow,
-/// finds USB scanners too) runs when `full` is set or nothing was found that way.
+/// Scanners as (device, description). Network printers already installed are tried first
+/// as eSCL scanners by address, which is instant and reliable; the system's own discovery
+/// (SANE or Windows, slow, finds USB scanners too) runs when `full` is set or nothing was found that way.
 pub fn scanners(full: bool) -> Vec<(String, String)> {
-    let mut found: Vec<(String, String)> = run("lpstat", &["-v"])
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| uri_host(l.rsplit(' ').next()?))
-        .filter(|(scheme, _)| NETWORK.contains(scheme))
-        .filter_map(|(_, host)| {
-            let caps = run("curl", &["-sf", "-m", "2", &format!("http://{host}/eSCL/ScannerCapabilities")]).ok()?;
+    let mut found: Vec<(String, String)> = printer_hosts()
+        .iter()
+        .filter_map(|host| {
+            let caps = minreq::get(format!("http://{host}/eSCL/ScannerCapabilities")).with_timeout(2).send().ok()?;
+            let caps = caps.as_str().ok().filter(|_| caps.status_code == 200)?;
             let model = caps.split("<pwg:MakeAndModel>").nth(1)?.split('<').next()?.to_string();
             Some((format!("escl:http://{host}/eSCL"), model))
         })
         .collect();
     if full || found.is_empty() {
-        let sane = run("scanimage", &["-f", "%d\t%v %m%n"]).unwrap_or_default();
-        for (d, v) in sane.lines().filter_map(|l| l.split_once('\t')) {
+        for (d, v) in local_scanners() {
             // the same device found by address already is the reliable entry
             if !found.iter().any(|(_, model)| v.contains(model.as_str())) {
-                found.push((d.to_string(), v.to_string()));
+                found.push((d, v));
             }
         }
     }
@@ -359,14 +204,13 @@ pub fn scanners(full: bool) -> Vec<(String, String)> {
 }
 
 /// Scans one page from the flatbed into an image file (PNG or JPEG). `escl:<url>` devices are
-/// driven directly over HTTP with curl, which also works on macOS where there is no SANE
-/// AirScan backend; any other device goes through SANE's `scanimage`.
+/// driven directly over HTTP, which also works on macOS where there is no SANE AirScan backend;
+/// any other device goes through the system (SANE's `scanimage`, or Windows' scanner API).
 pub fn scan(device: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
-    if let Some(url) = device.strip_prefix("escl:") {
-        return escl_scan(url, mode, dpi, out);
+    match device.strip_prefix("escl:") {
+        Some(url) => escl_scan(url, mode, dpi, out),
+        None => scan_local(device, mode, dpi, out),
     }
-    let dpi = dpi.to_string();
-    run("scanimage", &["-d", device, "--mode", mode, "--resolution", &dpi, "--format=png", "-o", out]).map(drop)
 }
 
 /// eSCL (AirScan): POST the settings to ScanJobs, then download the page from the job's NextDocument.
@@ -386,51 +230,176 @@ fn escl_scan(url: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
 <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>
 </scan:ScanSettings>"#
     );
-    let jobs = format!("{url}/ScanJobs");
     // right after a page the scanner answers 503 for a few seconds while the head returns
-    let headers = run("curl", &["-sf", "--retry", "15", "--retry-delay", "2", "-m", "30", "-D", "-", "-o", "/dev/null", "-H", "Content-Type: text/xml", "--data-binary", &settings, &jobs])
+    let res = retry_busy(15, || minreq::post(format!("{url}/ScanJobs")).with_header("Content-Type", "text/xml").with_body(settings.as_str()).with_timeout(30).send())
         .map_err(|e| format!("The scanner refused the scan job (busy?) {e}"))?;
-    let job = headers
-        .lines()
-        .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("location")).map(|(_, v)| v.trim()))
-        .ok_or("The scanner did not return a scan job")?;
+    let job = res.header("location").map(str::trim).ok_or("The scanner did not return a scan job")?;
     // Location may be relative to the scanner ("/eSCL/ScanJobs/..."), keep scheme://host from the url
     let job = if job.starts_with('/') { format!("{}{job}", url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/")) } else { job.to_string() };
     JOBS.lock().unwrap().push(job.clone());
-    // the scanner answers 503 until the page is ready, --retry covers that
-    let res = run("curl", &["-sf", "--retry", "30", "--retry-delay", "2", "-m", "600", "-o", out, &format!("{job}/NextDocument")]);
+    // the scanner answers 503 until the page is ready
+    let res = retry_busy(30, || minreq::get(format!("{job}/NextDocument")).with_timeout(600).send())
+        .and_then(|page| std::fs::write(out, page.as_bytes()).map_err(|e| e.to_string()));
     JOBS.lock().unwrap().retain(|j| *j != job);
-    res.map(drop).map_err(|e| format!("Could not download the scanned page: {e}"))
+    res.map_err(|e| format!("Could not download the scanned page: {e}"))
 }
 
-/// Grayscale thumbnail of an image as (width, height, pixels), via ImageMagick.
-pub fn thumbnail(image: &str) -> Result<(usize, usize, Vec<u8>), String> {
-    let pgm = format!("{image}.pgm");
-    // thicken text before shrinking, or it fades to near-white at terminal resolution
-    run("magick", &[image, "-colorspace", "Gray", "-morphology", "Erode", "Disk:2", "-resize", "400x", &pgm])?;
-    // full quality PNG for terminals with the kitty graphics protocol
-    run("magick", &[image, "-resize", "1200x", &format!("{image}.preview.png")])?;
-    let bytes = std::fs::read(&pgm).map_err(|e| e.to_string())?;
-    parse_pgm(&bytes).ok_or_else(|| "Could not read the scan preview".into())
-}
-
-/// Parses a binary 8-bit PGM (P5) as written by ImageMagick.
-pub fn parse_pgm(b: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
-    let mut fields = Vec::new();
-    let mut i = 0;
-    while fields.len() < 4 {
-        while b.get(i)?.is_ascii_whitespace() {
-            i += 1;
+/// Sends a request until it gets a 2xx answer, waiting 2 s after each 503 (busy), `tries` times at most.
+fn retry_busy(tries: u32, send: impl Fn() -> Result<minreq::Response, minreq::Error>) -> Result<minreq::Response, String> {
+    for _ in 1..tries {
+        match send() {
+            Ok(r) if r.status_code == 503 => std::thread::sleep(std::time::Duration::from_secs(2)),
+            res => return answer(res),
         }
-        let start = i;
-        while !b.get(i)?.is_ascii_whitespace() {
-            i += 1;
-        }
-        fields.push(std::str::from_utf8(&b[start..i]).ok()?);
     }
-    let (w, h): (usize, usize) = (fields[1].parse().ok()?, fields[2].parse().ok()?);
-    let px = b.get(i + 1..i + 1 + w * h)?;
-    (fields[0] == "P5" && fields[3] == "255").then(|| (w, h, px.to_vec()))
+    answer(send())
+}
+
+fn answer(res: Result<minreq::Response, minreq::Error>) -> Result<minreq::Response, String> {
+    match res {
+        Ok(r) if (200..300).contains(&r.status_code) => Ok(r),
+        Ok(r) => Err(format!("HTTP {} {}", r.status_code, r.reason_phrase)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Decodes a PNG or JPEG whatever its file name (scans have no extension).
+fn open(path: &str) -> Result<DynamicImage, String> {
+    image::ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| format!("{path}: {e}"))?
+        .decode()
+        .map_err(|e| format!("{path}: {e}"))
+}
+
+fn save_png(img: &DynamicImage, path: &str) -> Result<(), String> {
+    img.save_with_format(path, ImageFormat::Png).map_err(|e| format!("{path}: {e}"))
+}
+
+/// Grayscale thumbnail of an image as (width, height, pixels), plus `<image>.preview.png`
+/// in full quality for terminals with the kitty graphics protocol.
+pub fn thumbnail(image: &str) -> Result<(usize, usize, Vec<u8>), String> {
+    let img = open(image)?;
+    save_png(&img.resize(1200, u32::MAX, FilterType::Triangle), &format!("{image}.preview.png"))?;
+    // thicken text before shrinking, or it fades to near-white at terminal resolution
+    let gray = erode(&erode(&img.to_luma8()));
+    let h = (gray.height() * 400 / gray.width().max(1)).max(1);
+    let small = image::imageops::resize(&gray, 400, h, FilterType::Triangle);
+    Ok((400, h as usize, small.into_raw()))
+}
+
+/// 3x3 minimum filter: dark strokes grow by one pixel.
+fn erode(img: &GrayImage) -> GrayImage {
+    let (w, h) = img.dimensions();
+    GrayImage::from_fn(w, h, |x, y| {
+        let mut min = 255;
+        for yy in y.saturating_sub(1)..=(y + 1).min(h - 1) {
+            for xx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
+                min = min.min(img.get_pixel(xx, yy)[0]);
+            }
+        }
+        Luma([min])
+    })
+}
+
+/// Black and white: stretches the gray levels (2% darkest to black, 1% lightest to white) so the
+/// threshold works on pale or uneven scans, then cuts at 60%.
+fn black_and_white(mut g: GrayImage) -> GrayImage {
+    let mut hist = [0u64; 256];
+    for p in g.pixels() {
+        hist[p[0] as usize] += 1;
+    }
+    let total = (g.width() as u64 * g.height() as u64) as f64;
+    let level = |share: f64| {
+        let mut seen = 0;
+        (0..256).find(|&v| {
+            seen += hist[v];
+            seen as f64 >= share * total
+        }).unwrap_or(255) as f64
+    };
+    let (lo, hi) = (level(0.02), level(0.99));
+    let cut = lo + 0.6 * (hi - lo).max(1.0);
+    for p in g.pixels_mut() {
+        p[0] = if p[0] as f64 > cut { 255 } else { 0 };
+    }
+    g
+}
+
+/// The page as JPEG for a PDF: (width, height, grayscale, bytes). JPEG scans go in as they are.
+fn jpeg(path: &str) -> Result<(u32, u32, bool, Vec<u8>), String> {
+    let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let img = image::load_from_memory(&data).map_err(|e| format!("{path}: {e}"))?;
+    let (w, h) = (img.width(), img.height());
+    let gray = matches!(img.color(), ColorType::L8 | ColorType::La8 | ColorType::L16 | ColorType::La16);
+    if data.starts_with(&[0xFF, 0xD8]) && matches!(img.color(), ColorType::L8 | ColorType::Rgb8) {
+        return Ok((w, h, gray, data));
+    }
+    let img = if gray { DynamicImage::ImageLuma8(img.to_luma8()) } else { DynamicImage::ImageRgb8(img.to_rgb8()) };
+    let mut out = Vec::new();
+    JpegEncoder::new_with_quality(&mut out, 85).encode_image(&img).map_err(|e| e.to_string())?;
+    Ok((w, h, gray, out))
+}
+
+/// A recognised word and its box in image pixels, for the invisible text layer of a searchable PDF.
+pub struct Word {
+    pub text: String,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// Text in the PDF's WinAnsi encoding (Latin-1 letters and accents); other characters become '?'.
+fn win_ansi(text: &str) -> Vec<u8> {
+    text.chars().map(|c| if (c as u32) < 256 { c as u8 } else { b'?' }).collect()
+}
+
+/// One PDF page per image; `dpi` sets the page size (pixels / dpi). `words[i]`, when given, is laid
+/// invisibly over page i so the PDF can be searched and copied from.
+pub fn images_to_pdf(pages: &[String], dpi: u32, words: &[Vec<Word>]) -> Result<Vec<u8>, String> {
+    let mut pdf = Pdf::new();
+    let (catalog, tree, font) = (Ref::new(1), Ref::new(2), Ref::new(3));
+    let mut kids = Vec::new();
+    let pt = 72.0 / dpi as f32;
+    for (i, path) in pages.iter().enumerate() {
+        let (page_id, image_id, content_id) = (Ref::new(3 * i as i32 + 4), Ref::new(3 * i as i32 + 5), Ref::new(3 * i as i32 + 6));
+        let (w, h, gray, data) = jpeg(path)?;
+        let (pw, ph) = (w as f32 * pt, h as f32 * pt);
+        let mut page = pdf.page(page_id);
+        page.media_box(Rect::new(0.0, 0.0, pw, ph)).parent(tree).contents(content_id);
+        let mut res = page.resources();
+        res.x_objects().pair(Name(b"Im0"), image_id);
+        res.fonts().pair(Name(b"F0"), font);
+        res.finish();
+        page.finish();
+        let mut image = pdf.image_xobject(image_id, &data);
+        image.filter(Filter::DctDecode);
+        image.width(w as i32).height(h as i32).bits_per_component(8);
+        if gray { image.color_space().device_gray() } else { image.color_space().device_rgb() };
+        image.finish();
+        let mut content = Content::new();
+        content.save_state().transform([pw, 0.0, 0.0, ph, 0.0, 0.0]).x_object(Name(b"Im0")).restore_state();
+        if let Some(words) = words.get(i).filter(|w| !w.is_empty()) {
+            content.begin_text().set_text_rendering_mode(TextRenderingMode::Invisible);
+            for word in words {
+                // Helvetica's average glyph is about half the font size wide; stretch it to the box
+                let size = word.h * pt;
+                let text = win_ansi(&word.text);
+                let natural = 0.5 * size * text.len() as f32;
+                content.set_font(Name(b"F0"), size).set_horizontal_scaling(100.0 * word.w * pt / natural.max(0.01));
+                // baseline a fifth of the box above its bottom edge
+                content.set_text_matrix([1.0, 0.0, 0.0, 1.0, word.x * pt, ph - (word.y + 0.8 * word.h) * pt]);
+                content.show(Str(&text));
+            }
+            content.end_text();
+        }
+        pdf.stream(content_id, &content.finish());
+        kids.push(page_id);
+    }
+    pdf.type1_font(font).base_font(Name(b"Helvetica")).encoding_predefined(Name(b"WinAnsiEncoding"));
+    pdf.catalog(catalog).pages(tree);
+    pdf.pages(tree).count(kids.len() as i32).kids(kids);
+    Ok(pdf.finish())
 }
 
 /// Box-average downscale of a grayscale image to `ow` x `oh`.
@@ -454,49 +423,17 @@ pub fn save_scans(pages: &[String], out: &str, format: &str, dpi: u32) -> Result
     }
     if format == "PDF" {
         let path = format!("{out}.pdf");
-        // the density sets the PDF page size (pixels / dpi), otherwise ImageMagick assumes 72 dpi
-        let dpi = dpi.to_string();
-        let mut args = vec!["-units", "PixelsPerInch", "-density", &dpi];
-        args.extend(pages.iter().map(String::as_str));
-        args.extend(["-compress", "jpeg", "-quality", "85"]);
-        args.push(&path);
-        run("magick", &args)?;
+        std::fs::write(&path, images_to_pdf(pages, dpi, &[])?).map_err(|e| format!("{path}: {e}"))?;
         return Ok(vec![path]);
     }
     let mut written = Vec::new();
     for (i, p) in pages.iter().enumerate() {
         let path = if pages.len() == 1 { format!("{out}.png") } else { format!("{out}-{}.png", i + 1) };
         // pages can be PNG (SANE) or JPEG (eSCL), so convert instead of copying
-        run("magick", &[p, &path])?;
+        save_png(&open(p)?, &path)?;
         written.push(path);
     }
     Ok(written)
-}
-
-/// Searchable PDF: tesseract lays the recognised text invisibly over each page image.
-fn ocr_pdf(pages: &[String], out: &str, dpi: u32) -> Result<Vec<String>, String> {
-    let langs = run("tesseract", &["--list-langs"]).map_err(|_| "Searchable PDF needs tesseract (and tesseract-data-<language>)")?;
-    // ponytail: every installed language except osd; slower with many installed, add a picker then
-    let langs: Vec<&str> = langs.lines().skip(1).filter(|l| *l != "osd").collect();
-    let tmp = std::env::temp_dir().join(format!("printertui-ocr-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
-    // JPEG copies keep the PDF small (tesseract embeds the images as they are), and a list file
-    // with one image per line makes tesseract write all pages into one PDF
-    let res = pages
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let jpg = tmp.join(format!("{i}.jpg")).to_string_lossy().into_owned();
-            run("magick", &[p, "-quality", "85", &jpg]).map(|_| jpg)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .and_then(|jpgs| {
-            let list = tmp.join("pages.txt");
-            std::fs::write(&list, jpgs.join("\n")).map_err(|e| e.to_string())?;
-            run("tesseract", &[&list.to_string_lossy(), out, "--dpi", &dpi.to_string(), "-l", &langs.join("+"), "pdf"])
-        });
-    let _ = std::fs::remove_dir_all(&tmp);
-    res.map(|_| vec![format!("{out}.pdf")])
 }
 
 pub fn base64(data: &[u8]) -> String {
@@ -526,16 +463,19 @@ pub fn edit_page(orig: &str, rot: u16, filter: usize) -> Result<(String, (usize,
         orig.to_string()
     } else {
         let out = format!("{orig}-r{rot}-f{filter}.png");
-        let rot = rot.to_string();
-        let mut args = vec![orig, "-rotate", &rot];
-        match filter {
-            1 => args.extend(["-colorspace", "Gray"]),
-            // normalize first so the threshold works on pale or uneven scans
-            2 => args.extend(["-colorspace", "Gray", "-normalize", "-threshold", "60%"]),
-            _ => {}
-        }
-        args.push(&out);
-        run("magick", &args)?;
+        let img = open(orig)?;
+        let img = match rot {
+            90 => img.rotate90(),
+            180 => img.rotate180(),
+            270 => img.rotate270(),
+            _ => img,
+        };
+        let img = match filter {
+            1 => DynamicImage::ImageLuma8(img.to_luma8()),
+            2 => DynamicImage::ImageLuma8(black_and_white(img.to_luma8())),
+            _ => img,
+        };
+        save_png(&img, &out)?;
         out
     };
     let thumb = thumbnail(&out)?;
@@ -543,41 +483,47 @@ pub fn edit_page(orig: &str, rot: u16, filter: usize) -> Result<(String, (usize,
 }
 
 #[test]
-fn lpq_rows() {
-    let out = "Rank    Owner   Job     File(s)                         Total Size\n\
-               active  ana     12      my report.pdf                   20480 bytes\n\
-               no entries";
-    assert_eq!(parse_lpq(out), [("12".to_string(), "my report.pdf  (ana, 20 KB, active)".to_string())]);
-}
-
-/// Tests that spawn tools run one at a time, since `stop_all` kills every running tool.
-#[cfg(test)]
-static SPAWNS: Mutex<()> = Mutex::new(());
-
-#[test]
-fn stop_all_kills_tools_and_their_children() {
-    let _one = SPAWNS.lock().unwrap_or_else(|e| e.into_inner());
-    let t = std::thread::spawn(|| run("sh", &["-c", "sleep 30 & wait"]));
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let start = std::time::Instant::now();
-    stop_all();
-    let _ = t.join();
-    assert!(start.elapsed().as_secs() < 5);
-    assert!(Command::new("pgrep").args(["-f", "^sleep 30$"]).output().unwrap().stdout.is_empty());
-}
-
-#[test]
-fn ocr_pdf_has_text() {
-    let _one = SPAWNS.lock().unwrap_or_else(|e| e.into_inner());
-    if run("tesseract", &["--version"]).is_err() {
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!("printertui-ocr-test-{}", std::process::id()));
+fn pages_to_pdf_and_back() {
+    let dir = std::env::temp_dir().join(format!("printertui-pdf-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let (img, out) = (dir.join("p.png").to_string_lossy().into_owned(), dir.join("out").to_string_lossy().into_owned());
-    run("magick", &["-size", "1200x300", "xc:white", "-pointsize", "72", "-annotate", "+50+180", "Hello printer", &img]).unwrap();
-    let pdf = save_scans(&[img], &out, "OCR", 150).unwrap().remove(0);
-    let text = run("pdftotext", &[&pdf, "-"]).unwrap();
+    let p = |n: &str| dir.join(n).to_string_lossy().into_owned();
+    // a color PNG and a gray JPEG, like SANE and eSCL scans (no file extension)
+    DynamicImage::ImageRgb8(image::RgbImage::from_pixel(300, 150, image::Rgb([200, 30, 30]))).save_with_format(p("a"), ImageFormat::Png).unwrap();
+    DynamicImage::ImageLuma8(GrayImage::from_pixel(150, 300, Luma([90]))).save_with_format(p("b"), ImageFormat::Jpeg).unwrap();
+    let pdf = save_scans(&[p("a"), p("b")], &p("out"), "PDF", 150).unwrap().remove(0);
+    assert_eq!(page_count(&pdf), Some(2));
+    assert_eq!(page_count(&p("a")), None);
+
+    let (edited, (w, h, px)) = edit_page(&p("a"), 90, 2).unwrap();
+    let img = open(&edited).unwrap();
+    assert_eq!((img.width(), img.height()), (150, 300));
+    assert!(img.to_luma8().pixels().all(|v| v[0] == 0 || v[0] == 255));
+    assert_eq!((w, px.len()), (400, w * h));
     std::fs::remove_dir_all(&dir).unwrap();
-    assert!(text.contains("Hello printer"), "{text}");
+}
+
+#[test]
+fn black_and_white_keeps_text_on_pale_paper() {
+    // pale gray paper (200) with darker gray text (150): a fixed 60% cut would blacken the paper
+    let img = GrayImage::from_fn(100, 100, |x, _| Luma([if x < 10 { 150 } else { 200 }]));
+    let bw = black_and_white(img);
+    assert_eq!(bw.get_pixel(5, 5)[0], 0);
+    assert_eq!(bw.get_pixel(50, 5)[0], 255);
+}
+
+#[test]
+fn searchable_pdf_text_layer() {
+    let dir = std::env::temp_dir().join(format!("printertui-text-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("p").to_string_lossy().into_owned();
+    DynamicImage::ImageLuma8(GrayImage::from_pixel(1200, 300, Luma([255]))).save_with_format(&img, ImageFormat::Png).unwrap();
+    let words = vec![Word { text: "Hola".into(), x: 50.0, y: 100.0, w: 200.0, h: 60.0 }, Word { text: "cañón".into(), x: 300.0, y: 100.0, w: 250.0, h: 60.0 }];
+    let pdf = dir.join("out.pdf");
+    std::fs::write(&pdf, images_to_pdf(&[img], 150, &[words]).unwrap()).unwrap();
+    assert_eq!(page_count(&pdf.to_string_lossy()), Some(1));
+    // pdftotext (poppler) reads the text back, when installed
+    if let Ok(text) = run("pdftotext", &[&pdf.to_string_lossy(), "-"]) {
+        assert!(text.contains("Hola") && text.contains("cañón"), "{text}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }

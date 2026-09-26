@@ -4,7 +4,7 @@
 #   from scratch:     curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/test/dev-setup-arch.sh | bash
 #
 # What it does and where things go:
-#   1. pacman: git, gcc, rust (unless cargo exists), cups, cups-filters, imagemagick
+#   1. pacman: git, gcc, rust (unless cargo exists), cups, cups-filters
 #   2. starts CUPS (cups.socket) so printers work
 #   3. source code  -> the checkout this script is in, else cloned into ~/Development/PrinterTUI
 #   4. build        -> <source>/target/release/printertui
@@ -18,7 +18,7 @@ command -v pacman >/dev/null || {
 	exit 1
 }
 
-pkgs=(git gcc cups cups-filters imagemagick)
+pkgs=(git gcc cups cups-filters)
 # rust conflicts with rustup, only add it when there is no cargo yet
 command -v cargo >/dev/null || pkgs+=(rust)
 sudo pacman -S --needed --noconfirm "${pkgs[@]}"

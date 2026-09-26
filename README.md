@@ -1,6 +1,6 @@
 # PrinterTUI
 
-Terminal UI for Linux and macOS to print through CUPS and scan over AirScan or SANE, with manual double-sided printing for printers without a duplexer.
+Terminal UI for Linux, macOS and Windows to print and scan (CUPS and AirScan or SANE; the print spooler and the Windows scanner API on Windows), with manual double-sided printing for printers without a duplexer.
 
 ![PrinterTUI demo](docs/demo.gif)
 
@@ -17,6 +17,14 @@ It asks for a language, offers the optional extras (LibreOffice, SANE, Tesseract
 ```sh
 curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.sh | sh -s uninstall
 ```
+
+Windows 10/11, in PowerShell (no administrator needed; puts `printertui` on your PATH and in the Start menu, run it again to update or uninstall):
+
+```powershell
+irm https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.ps1 | iex
+```
+
+On Windows everything is built in: PDFs are drawn for the printer by an embedded pdfium, and searchable PDFs use Windows' own text recognition (add a language with "Optical character recognition" in Settings if it says none is installed). LibreOffice is optional, for non-PDF files.
 
 Development setup on Arch (dependencies, CUPS, build, link the build as `printertui-dev` so an installed `printertui` is left alone):
 
