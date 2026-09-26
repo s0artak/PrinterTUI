@@ -18,7 +18,7 @@ Uninstall:
 curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.sh | sh -s uninstall
 ```
 
-Development setup on Arch (dependencies, clone into `~/Development`, build):
+Development setup on Arch (dependencies, CUPS, clone into `~/Development`, build):
 
 ```sh
 git clone https://github.com/s0artak/PrinterTUI ~/Development/PrinterTUI && bash ~/Development/PrinterTUI/setup.sh
