@@ -142,3 +142,25 @@ pub fn add_printer(name: &str, uri: &str) -> Result<(), String> {
         .success();
     if ok { Ok(()) } else { Err(format!("lpadmin failed for {uri}")) }
 }
+
+/// Opens the first installed terminal file manager as a picker. Needs the terminal in normal mode.
+pub fn pick_file() -> Option<String> {
+    let out = std::env::temp_dir().join(format!("printertui-pick-{}", std::process::id()));
+    let o = out.to_str()?;
+    let pickers: [(&str, Vec<String>); 4] = [
+        ("yazi", vec![format!("--chooser-file={o}")]),
+        ("lf", vec!["-selection-path".into(), o.into()]),
+        ("ranger", vec![format!("--choosefile={o}")]),
+        ("nnn", vec!["-p".into(), o.into()]),
+    ];
+    for (cmd, args) in pickers {
+        if Command::new(cmd).args(&args).status().is_ok() {
+            let picked = std::fs::read_to_string(&out).ok();
+            let _ = std::fs::remove_file(&out);
+            return picked?.lines().next().map(str::to_string).filter(|s| !s.is_empty());
+        }
+    }
+    // fzf draws on the tty and prints the choice on stdout
+    let out = Command::new("fzf").stdout(std::process::Stdio::piped()).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty())
+}

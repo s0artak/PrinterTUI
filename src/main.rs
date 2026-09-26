@@ -87,6 +87,15 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                         app.mode = Mode::Pick(found, ListState::default().with_selected(Some(0)));
                     }
                 }
+                KeyCode::Enter if app.sel == FILE => {
+                    ratatui::restore();
+                    let picked = pick_file();
+                    *term = ratatui::init();
+                    match picked {
+                        Some(p) => app.file = p,
+                        None => app.status = "No file picked (install yazi, lf, ranger, nnn or fzf).".into(),
+                    }
+                }
                 KeyCode::Enter => app.print(),
                 KeyCode::Backspace => {
                     app.text().map(String::pop);
