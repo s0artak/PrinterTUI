@@ -18,6 +18,8 @@ const ADD: usize = 8;
 
 enum Mode {
     Main,
+    /// Editing the selected text field (vim-style, entered with `i`).
+    Insert,
     Pick(Vec<(String, String)>, ListState),
     /// Front side sent; holds the back-side job waiting for the user to flip the paper.
     Flip(Vec<String>),
@@ -72,11 +74,12 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
         }
         match &mut app.mode {
             Mode::Main => match k.code {
-                KeyCode::Esc => return Ok(()),
-                KeyCode::Up => app.sel = app.sel.checked_sub(1).unwrap_or(ADD),
-                KeyCode::Down | KeyCode::Tab => app.sel = (app.sel + 1) % (ADD + 1),
-                KeyCode::Left => app.cycle(false),
-                KeyCode::Right => app.cycle(true),
+                KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+                KeyCode::Up | KeyCode::Char('k') => app.sel = app.sel.checked_sub(1).unwrap_or(ADD),
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => app.sel = (app.sel + 1) % (ADD + 1),
+                KeyCode::Left | KeyCode::Char('h') => app.cycle(false),
+                KeyCode::Right | KeyCode::Char('l') => app.cycle(true),
+                KeyCode::Char('i') | KeyCode::Char('a') if app.text().is_some() => app.mode = Mode::Insert,
                 KeyCode::Enter if app.sel == ADD => {
                     app.status = "Searching for network printers...".into();
                     term.draw(|f| draw(f, app))?;
@@ -97,6 +100,10 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     }
                 }
                 KeyCode::Enter => app.print(),
+                _ => {}
+            },
+            Mode::Insert => match k.code {
+                KeyCode::Esc | KeyCode::Enter => app.mode = Mode::Main,
                 KeyCode::Backspace => {
                     app.text().map(String::pop);
                 }
@@ -109,8 +116,8 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
             },
             Mode::Pick(found, state) => match k.code {
                 KeyCode::Esc => app.mode = Mode::Main,
-                KeyCode::Up => state.select_previous(),
-                KeyCode::Down => state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => state.select_previous(),
+                KeyCode::Down | KeyCode::Char('j') => state.select_next(),
                 KeyCode::Enter => {
                     let (name, uri) = found[state.selected().unwrap_or(0)].clone();
                     ratatui::restore();
@@ -174,7 +181,7 @@ impl App {
             2 => pick(if self.color { "Color" } else { "Grayscale" }),
             3 => pick(if self.duplex { "Double-sided (manual)" } else { "Single-sided" }),
             4 => pick(if self.reverse_back { "Reversed" } else { "Normal" }),
-            PAGES if self.pages.is_empty() && self.sel != PAGES => "all".into(),
+            PAGES if self.pages.is_empty() && !matches!(self.mode, Mode::Insert) => "all".into(),
             PAGES => self.pages.clone(),
             6 => pick(PAPERS[self.paper]),
             PRINT => "[ Print ]".into(),
@@ -236,7 +243,7 @@ fn draw(f: &mut Frame, app: &App) {
 
     let lines: Vec<Line> = (0..LABELS.len())
         .map(|i| {
-            let cursor = if i == app.sel && (i == FILE || i == PAGES) { "_" } else { "" };
+            let cursor = if i == app.sel && matches!(app.mode, Mode::Insert) { "_" } else { "" };
             let line = Line::from(format!(" {:<12}{}{}", LABELS[i], app.value(i), cursor));
             if i == app.sel {
                 line.style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD))
@@ -252,13 +259,16 @@ fn draw(f: &mut Frame, app: &App) {
         status,
     );
     f.render_widget(
-        Line::from(" Up/Down move   Left/Right change   type to edit   Enter select   Esc quit")
+        Line::from(match app.mode {
+            Mode::Insert => " -- INSERT --   Esc/Enter done",
+            _ => " j/k move   h/l change   i edit text   Enter select   q quit",
+        })
             .style(Style::new().add_modifier(Modifier::DIM)),
         help,
     );
 
     match &app.mode {
-        Mode::Main => {}
+        Mode::Main | Mode::Insert => {}
         Mode::Pick(found, state) => {
             let area = popup(f, found.len() as u16 + 2);
             let items: Vec<ListItem> = found.iter().map(|(n, u)| ListItem::new(format!("{n}  {u}"))).collect();

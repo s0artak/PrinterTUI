@@ -27,10 +27,10 @@ cargo run --release -- ~/document.pdf
 
 | Key | Action |
 | --- | --- |
-| Up / Down / Tab | Move between fields |
-| Left / Right | Change option |
-| Typing / Backspace | Edit file path and page range |
+| Up / Down / Tab, `j` / `k` | Move between fields |
+| Left / Right, `h` / `l` | Change option |
+| `i` / `a` | Edit the file path or page range (insert mode, Esc or Enter to finish) |
 | Enter | On File: open a file picker (yazi, lf, ranger, nnn or fzf, first one installed). Elsewhere: print, or open the selected button |
-| Esc / Ctrl+C | Quit |
+| `q` / Esc / Ctrl+C | Quit |
 
 Double-sided printing requires a PDF file.
