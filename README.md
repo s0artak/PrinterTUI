@@ -6,20 +6,17 @@ Terminal UI for Linux and macOS to print through CUPS and scan over AirScan or S
 
 ## Install
 
-Arch Linux:
+Arch Linux or macOS (with [Homebrew](https://brew.sh)):
 
 ```sh
-sudo pacman -S cups cups-filters imagemagick
-sudo systemctl enable --now cups.socket
+curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.sh | sh
 ```
 
-macOS (CUPS is built in):
+Uninstall:
 
 ```sh
-brew install qpdf imagemagick
+curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.sh | sh -s uninstall
 ```
-
-Then `cargo install --path .`
 
 Optional: LibreOffice for non-PDF files (`libreoffice-fresh` / `brew install --cask libreoffice`), and SANE for scanners that are not part of a network printer (`sane sane-airscan` / `brew install sane-backends`). Network printers that can scan are used directly over AirScan (eSCL).
 
