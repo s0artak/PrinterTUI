@@ -598,6 +598,7 @@ impl App {
                         app.thumb = None;
                         app.save_as = default_scan_name();
                         let _ = app.save();
+                        let written: Vec<String> = written.iter().map(|p| tilde(p)).collect();
                         format!("Saved {}", written.join(", "))
                     }
                     Err(e) => format!("Error: {e}"),
@@ -622,6 +623,14 @@ fn pdf(file: &str) -> Result<String, String> {
 
 fn name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Inverse of expand_home, for showing paths.
+fn tilde(p: &str) -> String {
+    match std::env::var("HOME").ok().and_then(|h| p.strip_prefix(&h).map(str::to_string)) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => p.to_string(),
+    }
 }
 
 fn expand_home(p: &str) -> String {
@@ -666,6 +675,8 @@ fn draw(f: &mut Frame, app: &App) {
     let tick = app.started.elapsed().as_millis() as usize;
     let text = match &app.busy {
         Some((msg, _)) => format!("{msg}... {}", ['|', '/', '-', '\\'][tick / 150 % 4]),
+        // the duplex popup already shows the status
+        None if matches!(app.mode, Mode::Flip { .. }) => String::new(),
         None => app.status.clone(),
     };
     f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }).block(Block::bordered()), status);

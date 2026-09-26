@@ -2,6 +2,8 @@
 
 Terminal UI for Linux and macOS to print through CUPS and scan over AirScan or SANE, with manual double-sided printing for printers without a duplexer.
 
+![PrinterTUI demo](docs/demo.gif)
+
 ## Install
 
 Arch Linux:
