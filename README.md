@@ -8,6 +8,8 @@ A minimal, monochrome terminal UI for printing on Linux through CUPS.
 - Manual double-sided printing for printers without a duplexer: the front pages
   are sent first, then you flip the stack and press Enter to print the back pages.
   If the back side comes out in the wrong order, set **Back order** to *Reversed*.
+  Press `v` in the duplex prompt to watch a short video showing how to flip the paper
+  (rendered with Blender from `assets/duplex.py`).
 - Add network printers (driverless IPP Everywhere) from inside the app.
 
 ## Requirements

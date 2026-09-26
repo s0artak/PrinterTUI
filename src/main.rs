@@ -135,6 +135,11 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                 _ => {}
             },
             Mode::Flip(back) => match k.code {
+                KeyCode::Char('v') => {
+                    if let Err(e) = play_tutorial() {
+                        app.status = format!("Could not open the video: {e}\n\n{}", app.status);
+                    }
+                }
                 KeyCode::Esc => {
                     app.status = "Back side cancelled.".into();
                     app.mode = Mode::Main;
@@ -220,10 +225,28 @@ impl App {
         }
         self.mode = Mode::Flip(back_job);
         Ok(format!(
-            "Front side sent: {id}\n\nWhen printing finishes, flip the stack and put it back in the tray.{}\n\nEnter = print back side    Esc = cancel",
-            if front.len() > back.len() { "\nRemove the last printed sheet first, it has no back side." } else { "" }
+            "Front side sent: {id}\n\n\
+             1. Wait until the printer stops.\n\
+             2. Take the whole stack out. Do not change the order.{}\n\
+             3. Flip it: printed side facing the BACK of the printer,\n   top of the page going in first (pointing down).\n\
+             4. Put it in the input tray.\n\n\
+             Enter = print back side    v = watch how (video)    Esc = cancel",
+            if front.len() > back.len() { "\n   Put the top sheet aside, it has no back side." } else { "" }
         ))
     }
+}
+
+/// Writes the embedded duplex tutorial to a temp file and opens it with the default video player.
+fn play_tutorial() -> std::io::Result<()> {
+    let path = std::env::temp_dir().join("printertui-duplex.mp4");
+    std::fs::write(&path, include_bytes!("../assets/duplex.mp4"))?;
+    std::process::Command::new("xdg-open")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(drop)
 }
 
 fn expand_home(p: &str) -> String {
@@ -278,7 +301,7 @@ fn draw(f: &mut Frame, app: &App) {
             f.render_stateful_widget(list, area, &mut state.clone());
         }
         Mode::Flip(_) => {
-            let area = popup(f, 9);
+            let area = popup(f, 14);
             f.render_widget(
                 Paragraph::new(app.status.as_str())
                     .wrap(Wrap { trim: false })
