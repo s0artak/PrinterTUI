@@ -1,77 +1,613 @@
 # PrinterTUI installer for Windows 10/11.
 #   irm https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.ps1 | iex
-# Installs printertui.exe for this user (no administrator needed), puts it on the PATH and in the
-# Start menu. Run it again to update or uninstall.
+# Asks for a language, then Install the first time, Update or Uninstall afterwards, and offers
+# LibreOffice. Installs for this user only (no administrator), on the PATH and in the Start menu.
+# $env:PRINTERTUI_PREVIEW = 'fresh' | 'installed' | 'jam' | 'smudge' plays the menus and animations
+# without changing anything (see test/installer-preview.ps1).
+# Runs through `iex` in the user's own PowerShell: never `exit`, it would close their window.
+
 $ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue' # the progress bar makes Invoke-WebRequest very slow
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
 
 $repo = 's0artak/PrinterTUI'
-$dir = Join-Path $env:LOCALAPPDATA 'Programs\PrinterTUI'
+$preview = $env:PRINTERTUI_PREVIEW
+$E = [char]27
+$base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [IO.Path]::GetTempPath() }
+$dir = Join-Path $base 'Programs\PrinterTUI'
 $exe = Join-Path $dir 'printertui.exe'
-$shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'PrinterTUI.lnk'
+$startMenu = [Environment]::GetFolderPath('Programs')
+$shortcut = if ($startMenu) { Join-Path $startMenu 'PrinterTUI.lnk' } else { 'PrinterTUI.lnk' }
+# menus and animations only when a person is watching
+$tty = -not [Console]::IsOutputRedirected -and -not [Console]::IsInputRedirected
 
-function Say($text) { Write-Host "  > $text" -ForegroundColor Cyan }
-
-function Set-UserPath([string[]]$parts) {
-    [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')
+# Windows PowerShell 5.1 in the old console needs escape sequences switched on
+if ($tty -and $PSVersionTable.PSVersion.Major -lt 6 -and -not $Host.UI.SupportsVirtualTerminal) {
+    Add-Type -Namespace PrinterTUI -Name Console -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int h);
+[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr h, out int m);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr h, int m);
+'@
+    $h = [PrinterTUI.Console]::GetStdHandle(-11)
+    $m = 0
+    [void][PrinterTUI.Console]::GetConsoleMode($h, [ref]$m)
+    [void][PrinterTUI.Console]::SetConsoleMode($h, $m -bor 4)
 }
 
-function Install-PrinterTUI {
+function W([string]$s) { [Console]::Write($s) }
+function Say([string]$t) { W "  $E[38;5;69m▸$E[0m $t`n" }
+function Talk([string]$t) { W "`n  $E[1;38;5;69m$t$E[0m`n`n" }
+function Fail([string]$t) { W "  $E[31m✗ $t$E[0m`n" }
+# every step that changes the system goes through Step, so the preview can skip it
+function Step([string]$what, [scriptblock]$do) {
+    if ($preview) {
+        W "    $E[2m$($T.skip) $what$E[0m`n"
+        Start-Sleep -Milliseconds 300
+    } else {
+        & $do
+    }
+}
+
+# --- languages: the 10 most spoken (Ethnologue), texts shared with install.sh --------------------
+$Langs = [ordered]@{
+    en = @{
+        name = '🇬🇧 English'
+        hint = '↑↓ move · enter pick · q quit'
+        prev = '(preview: nothing is installed or removed)'
+        skip = 'preview, skipped:'
+        hi_new = 'Hi! Looks like we haven''t met. Warm up the printer?'
+        hi_old = 'Oh, you already have me. Fresh copy, or shall I pack up?'
+        install = 'Install'
+        update = 'Update'
+        uninstall = 'Uninstall'
+        download = 'Downloading PrinterTUI'
+        jam = 'Paper jam! The download didn''t come through.'
+        smudge = 'Smudged page! Something''s off with that download.'
+        e_net = 'check your internet connection and run the installer again'
+        e_sum = 'the download doesn''t match its checksum, so nothing was installed'
+        put = 'Putting printertui in'
+        done = 'Page printed, ink dry, ready to go. Run: printertui'
+        rm_cmd = 'Removing the printertui command'
+        rm_cfg = 'Removing settings and temporary files'
+        bye = 'Paper''s back in the tray. Bye for now!'
+        quit = 'No worries, nothing was touched.'
+        extras = 'Want some extras? All optional.'
+        check_hint = '↑↓ move · space mark · enter continue · q quit'
+        lo = 'LibreOffice: print Word, Excel and other non-PDF files'
+        extras_inst = 'Installing the extras'
+        left_win = 'Your printers were left as they are.'
+        start = 'Also in the Start menu: PrinterTUI'
+    }
+    zh = @{
+        name = '🇨🇳 中文'
+        hint = '↑↓ 移动 · 回车 选择 · q 退出'
+        prev = '（预览：不会安装或删除任何东西）'
+        skip = '预览，已跳过：'
+        hi_new = '你好！我们好像还没见过面。要预热打印机吗？'
+        hi_old = '哦，我已经在这儿了。重新装一份，还是我收拾东西走人？'
+        install = '安装'
+        update = '更新'
+        uninstall = '卸载'
+        download = '正在下载 PrinterTUI'
+        jam = '卡纸了！下载没有成功。'
+        smudge = '页面印花了！这次下载有问题。'
+        e_net = '请检查网络连接后重新运行安装程序'
+        e_sum = '下载的文件与校验和不符，什么都没有安装'
+        put = '正在把 printertui 放到'
+        done = '页面已打印，墨迹已干，一切就绪。运行：printertui'
+        rm_cmd = '正在删除 printertui 命令'
+        rm_cfg = '正在删除设置和临时文件'
+        bye = '纸已放回纸盒。再见！'
+        quit = '没关系，什么都没改动。'
+        extras = '要来点附加组件吗？全部可选。'
+        check_hint = '↑↓ 移动 · 空格 勾选 · 回车 继续 · q 退出'
+        lo = 'LibreOffice：打印 Word、Excel 等非 PDF 文件'
+        extras_inst = '正在安装附加组件'
+        left_win = '你的打印机保持原样。'
+        start = '开始菜单里也有：PrinterTUI'
+    }
+    hi = @{
+        name = '🇮🇳 हिन्दी'
+        hint = '↑↓ चुनें · enter पक्का करें · q बाहर'
+        prev = '(पूर्वावलोकन: कुछ भी इंस्टॉल या हटाया नहीं जाता)'
+        skip = 'पूर्वावलोकन, छोड़ा गया:'
+        hi_new = 'नमस्ते! लगता है हम पहली बार मिल रहे हैं। प्रिंटर गरम करें?'
+        hi_old = 'अरे, मैं तो पहले से यहाँ हूँ। नई कॉपी, या मैं अपना सामान बाँधूँ?'
+        install = 'इंस्टॉल करें'
+        update = 'अपडेट करें'
+        uninstall = 'अनइंस्टॉल करें'
+        download = 'PrinterTUI डाउनलोड हो रहा है'
+        jam = 'पेपर जाम! डाउनलोड नहीं हो पाया।'
+        smudge = 'पेज पर धब्बा! इस डाउनलोड में कुछ गड़बड़ है।'
+        e_net = 'इंटरनेट कनेक्शन जाँचें और इंस्टॉलर फिर से चलाएँ'
+        e_sum = 'डाउनलोड चेकसम से मेल नहीं खाता, इसलिए कुछ भी इंस्टॉल नहीं हुआ'
+        put = 'printertui को यहाँ रखा जा रहा है:'
+        done = 'पेज छप गया, स्याही सूख गई, सब तैयार। चलाएँ: printertui'
+        rm_cmd = 'printertui कमांड हटाई जा रही है'
+        rm_cfg = 'सेटिंग्स और अस्थायी फ़ाइलें हटाई जा रही हैं'
+        bye = 'कागज़ वापस ट्रे में। फिर मिलेंगे!'
+        quit = 'कोई बात नहीं, कुछ भी नहीं बदला।'
+        extras = 'कुछ अतिरिक्त चाहिए? सब वैकल्पिक हैं।'
+        check_hint = '↑↓ चुनें · space निशान · enter आगे · q बाहर'
+        lo = 'LibreOffice: Word, Excel और दूसरी गैर-PDF फ़ाइलें छापें'
+        extras_inst = 'अतिरिक्त चीज़ें इंस्टॉल हो रही हैं'
+        left_win = 'आपके प्रिंटर जैसे थे वैसे ही हैं।'
+        start = 'स्टार्ट मेनू में भी: PrinterTUI'
+    }
+    es = @{
+        name = '🇪🇸 Español'
+        hint = '↑↓ mover · enter elegir · q salir'
+        prev = '(vista previa: no se instala ni se borra nada)'
+        skip = 'vista previa, omitido:'
+        hi_new = '¡Hola! Parece que no nos conocemos. ¿Calentamos la impresora?'
+        hi_old = 'Anda, ya me tienes instalada. ¿Copia nueva o recojo mis cosas?'
+        install = 'Instalar'
+        update = 'Actualizar'
+        uninstall = 'Desinstalar'
+        download = 'Descargando PrinterTUI'
+        jam = '¡Atasco de papel! La descarga no ha llegado.'
+        smudge = '¡Página emborronada! Algo raro pasa con esa descarga.'
+        e_net = 'revisa tu conexión a internet y vuelve a ejecutar el instalador'
+        e_sum = 'la descarga no coincide con su checksum, así que no he instalado nada'
+        put = 'Poniendo printertui en'
+        done = 'Página impresa, tinta seca, todo listo. Ejecuta: printertui'
+        rm_cmd = 'Quitando el comando printertui'
+        rm_cfg = 'Borrando ajustes y archivos temporales'
+        bye = 'El papel ha vuelto a la bandeja. ¡Hasta pronto!'
+        quit = 'Tranquilo, no he tocado nada.'
+        extras = '¿Unos extras? Todos son opcionales.'
+        check_hint = '↑↓ mover · espacio marcar · enter seguir · q salir'
+        lo = 'LibreOffice: imprimir Word, Excel y otros archivos que no son PDF'
+        extras_inst = 'Instalando los extras'
+        left_win = 'Tus impresoras se quedan como estaban.'
+        start = 'También en el menú Inicio: PrinterTUI'
+    }
+    ar = @{
+        name = '🇸🇦 العربية'
+        hint = '↑↓ تنقّل · enter اختيار · q خروج'
+        prev = '(معاينة: لا يُثبَّت ولا يُحذف شيء)'
+        skip = 'معاينة، تم التخطي:'
+        hi_new = 'أهلاً! يبدو أننا لم نلتقِ من قبل. نسخّن الطابعة؟'
+        hi_old = 'أوه، أنا مثبّت بالفعل. نسخة جديدة، أم أحزم أغراضي؟'
+        install = 'تثبيت'
+        update = 'تحديث'
+        uninstall = 'إزالة'
+        download = 'جارٍ تنزيل PrinterTUI'
+        jam = 'انحشار الورق! لم يكتمل التنزيل.'
+        smudge = 'صفحة ملطّخة! هناك خطب ما في هذا التنزيل.'
+        e_net = 'تحقّق من اتصالك بالإنترنت ثم أعد تشغيل المثبّت'
+        e_sum = 'الملف المنزّل لا يطابق المجموع الاختباري، لذلك لم يُثبَّت شيء'
+        put = 'جارٍ وضع printertui في'
+        done = 'طُبعت الصفحة وجفّ الحبر، كل شيء جاهز. شغّل: printertui'
+        rm_cmd = 'جارٍ حذف أمر printertui'
+        rm_cfg = 'جارٍ حذف الإعدادات والملفات المؤقتة'
+        bye = 'عاد الورق إلى الدرج. إلى اللقاء!'
+        quit = 'لا بأس، لم يتغير شيء.'
+        extras = 'هل تريد بعض الإضافات؟ كلها اختيارية.'
+        check_hint = '↑↓ تنقّل · space تحديد · enter متابعة · q خروج'
+        lo = 'LibreOffice: طباعة ملفات Word و Excel وغيرها من غير PDF'
+        extras_inst = 'جارٍ تثبيت الإضافات'
+        left_win = 'بقيت طابعاتك كما هي.'
+        start = 'موجود أيضاً في قائمة ابدأ: PrinterTUI'
+    }
+    fr = @{
+        name = '🇫🇷 Français'
+        hint = '↑↓ bouger · entrée choisir · q quitter'
+        prev = '(aperçu : rien n''est installé ni supprimé)'
+        skip = 'aperçu, ignoré :'
+        hi_new = 'Salut ! On ne se connaît pas encore. On fait chauffer l''imprimante ?'
+        hi_old = 'Oh, je suis déjà là. Une copie toute neuve, ou je fais mes valises ?'
+        install = 'Installer'
+        update = 'Mettre à jour'
+        uninstall = 'Désinstaller'
+        download = 'Téléchargement de PrinterTUI'
+        jam = 'Bourrage papier ! Le téléchargement n''a pas abouti.'
+        smudge = 'Page tachée ! Ce téléchargement a un souci.'
+        e_net = 'vérifiez votre connexion internet puis relancez l''installateur'
+        e_sum = 'le téléchargement ne correspond pas à sa somme de contrôle, rien n''a été installé'
+        put = 'Installation de printertui dans'
+        done = 'Page imprimée, encre sèche, tout est prêt. Lancez : printertui'
+        rm_cmd = 'Suppression de la commande printertui'
+        rm_cfg = 'Suppression des réglages et fichiers temporaires'
+        bye = 'Le papier est retourné dans le bac. À bientôt !'
+        quit = 'Pas de souci, rien n''a été modifié.'
+        extras = 'Quelques extras ? Tous optionnels.'
+        check_hint = '↑↓ bouger · espace cocher · entrée continuer · q quitter'
+        lo = 'LibreOffice : imprimer Word, Excel et autres fichiers non PDF'
+        extras_inst = 'Installation des extras'
+        left_win = 'Vos imprimantes restent telles quelles.'
+        start = 'Aussi dans le menu Démarrer : PrinterTUI'
+    }
+    bn = @{
+        name = '🇧🇩 বাংলা'
+        hint = '↑↓ সরান · enter বাছুন · q বের হন'
+        prev = '(প্রিভিউ: কিছুই ইনস্টল বা মোছা হয় না)'
+        skip = 'প্রিভিউ, বাদ দেওয়া হয়েছে:'
+        hi_new = 'হ্যালো! মনে হচ্ছে আমাদের আগে দেখা হয়নি। প্রিন্টারটা গরম করব?'
+        hi_old = 'আরে, আমি তো আগেই আছি। নতুন কপি, নাকি আমি গুছিয়ে চলে যাব?'
+        install = 'ইনস্টল'
+        update = 'আপডেট'
+        uninstall = 'আনইনস্টল'
+        download = 'PrinterTUI ডাউনলোড হচ্ছে'
+        jam = 'কাগজ আটকে গেছে! ডাউনলোড হয়নি।'
+        smudge = 'পাতায় দাগ! এই ডাউনলোডে কিছু গোলমাল আছে।'
+        e_net = 'ইন্টারনেট সংযোগ দেখে নিন, তারপর ইনস্টলার আবার চালান'
+        e_sum = 'ডাউনলোড চেকসামের সাথে মেলেনি, তাই কিছুই ইনস্টল হয়নি'
+        put = 'printertui রাখা হচ্ছে:'
+        done = 'পাতা ছাপা হয়েছে, কালি শুকিয়েছে, সব তৈরি। চালান: printertui'
+        rm_cmd = 'printertui কমান্ড সরানো হচ্ছে'
+        rm_cfg = 'সেটিংস আর অস্থায়ী ফাইল মোছা হচ্ছে'
+        bye = 'কাগজ আবার ট্রেতে। আবার দেখা হবে!'
+        quit = 'চিন্তা নেই, কিছুই বদলানো হয়নি।'
+        extras = 'কিছু বাড়তি জিনিস চান? সবই ঐচ্ছিক।'
+        check_hint = '↑↓ সরান · space চিহ্ন · enter এগোন · q বের হন'
+        lo = 'LibreOffice: Word, Excel আর অন্য PDF-নয় এমন ফাইল ছাপুন'
+        extras_inst = 'বাড়তি জিনিস ইনস্টল হচ্ছে'
+        left_win = 'আপনার প্রিন্টার যেমন ছিল তেমনই আছে।'
+        start = 'স্টার্ট মেনুতেও আছে: PrinterTUI'
+    }
+    pt = @{
+        name = '🇧🇷 Português'
+        hint = '↑↓ mover · enter escolher · q sair'
+        prev = '(prévia: nada é instalado nem removido)'
+        skip = 'prévia, ignorado:'
+        hi_new = 'Oi! Parece que ainda não nos conhecemos. Vamos esquentar a impressora?'
+        hi_old = 'Ah, eu já estou aqui. Cópia nova, ou arrumo as malas?'
+        install = 'Instalar'
+        update = 'Atualizar'
+        uninstall = 'Desinstalar'
+        download = 'Baixando o PrinterTUI'
+        jam = 'Papel atolado! O download não chegou.'
+        smudge = 'Página borrada! Tem algo errado com esse download.'
+        e_net = 'verifique sua conexão com a internet e rode o instalador de novo'
+        e_sum = 'o download não bate com o checksum, então nada foi instalado'
+        put = 'Colocando o printertui em'
+        done = 'Página impressa, tinta seca, tudo pronto. Execute: printertui'
+        rm_cmd = 'Removendo o comando printertui'
+        rm_cfg = 'Removendo configurações e arquivos temporários'
+        bye = 'O papel voltou para a bandeja. Até mais!'
+        quit = 'Tudo bem, nada foi alterado.'
+        extras = 'Quer uns extras? Todos opcionais.'
+        check_hint = '↑↓ mover · espaço marcar · enter continuar · q sair'
+        lo = 'LibreOffice: imprimir Word, Excel e outros arquivos que não são PDF'
+        extras_inst = 'Instalando os extras'
+        left_win = 'Suas impressoras ficaram como estavam.'
+        start = 'Também no menu Iniciar: PrinterTUI'
+    }
+    ru = @{
+        name = '🇷🇺 Русский'
+        hint = '↑↓ выбор · enter ок · q выход'
+        prev = '(предпросмотр: ничего не устанавливается и не удаляется)'
+        skip = 'предпросмотр, пропущено:'
+        hi_new = 'Привет! Кажется, мы ещё не знакомы. Разогреть принтер?'
+        hi_old = 'О, я уже установлен. Свежая копия или мне собирать вещи?'
+        install = 'Установить'
+        update = 'Обновить'
+        uninstall = 'Удалить'
+        download = 'Скачиваю PrinterTUI'
+        jam = 'Бумагу зажевало! Загрузка не удалась.'
+        smudge = 'Страница смазана! С этой загрузкой что-то не так.'
+        e_net = 'проверьте подключение к интернету и запустите установщик снова'
+        e_sum = 'загрузка не совпадает с контрольной суммой, поэтому ничего не установлено'
+        put = 'Кладу printertui в'
+        done = 'Страница напечатана, чернила высохли, всё готово. Запуск: printertui'
+        rm_cmd = 'Удаляю команду printertui'
+        rm_cfg = 'Удаляю настройки и временные файлы'
+        bye = 'Бумага вернулась в лоток. Пока!'
+        quit = 'Ничего страшного, ничего не изменено.'
+        extras = 'Немного дополнений? Всё по желанию.'
+        check_hint = '↑↓ выбор · пробел отметить · enter дальше · q выход'
+        lo = 'LibreOffice: печать Word, Excel и других файлов не в PDF'
+        extras_inst = 'Устанавливаю дополнения'
+        left_win = 'Ваши принтеры остались как были.'
+        start = 'Также в меню «Пуск»: PrinterTUI'
+    }
+    id = @{
+        name = '🇮🇩 Bahasa Indonesia'
+        hint = '↑↓ pindah · enter pilih · q keluar'
+        prev = '(pratinjau: tidak ada yang dipasang atau dihapus)'
+        skip = 'pratinjau, dilewati:'
+        hi_new = 'Halo! Sepertinya kita belum kenal. Panaskan printernya?'
+        hi_old = 'Oh, aku sudah terpasang. Salinan baru, atau aku berkemas?'
+        install = 'Pasang'
+        update = 'Perbarui'
+        uninstall = 'Copot'
+        download = 'Mengunduh PrinterTUI'
+        jam = 'Kertas macet! Unduhannya gagal.'
+        smudge = 'Halamannya belepotan! Ada yang aneh dengan unduhan itu.'
+        e_net = 'periksa koneksi internet lalu jalankan installer lagi'
+        e_sum = 'unduhan tidak cocok dengan checksum-nya, jadi tidak ada yang dipasang'
+        put = 'Menaruh printertui di'
+        done = 'Halaman tercetak, tinta kering, siap dipakai. Jalankan: printertui'
+        rm_cmd = 'Menghapus perintah printertui'
+        rm_cfg = 'Menghapus pengaturan dan file sementara'
+        bye = 'Kertas sudah kembali ke baki. Sampai jumpa!'
+        quit = 'Tenang, tidak ada yang diubah.'
+        extras = 'Mau tambahan? Semuanya opsional.'
+        check_hint = '↑↓ pindah · spasi tandai · enter lanjut · q keluar'
+        lo = 'LibreOffice: cetak Word, Excel, dan file non-PDF lainnya'
+        extras_inst = 'Memasang tambahan'
+        left_win = 'Printermu tetap seperti semula.'
+        start = 'Juga ada di menu Start: PrinterTUI'
+    }
+}
+
+# --- pixel art: two pixels per character with half blocks --------------------------------------
+# . empty  w paper  k ink  b blue  d dark body  g light body  s slot  G green  r red
+$Colors = New-Object Collections.Hashtable ([StringComparer]::Ordinal)
+$pairs = 'w 231 k 246 b 69 d 240 g 252 s 234 G 114 r 203' -split ' '
+for ($i = 0; $i -lt $pairs.Count; $i += 2) { $Colors[$pairs[$i]] = $pairs[$i + 1] }
+$Printer = @(
+    '......wwwwwwww......'
+    '......wwwwwwww......'
+    '..bbbbbbbbbbbbbbbb..'
+    '.bbbbbbbbbbbbbbbbbb.'
+    '.dggggggggggggggggd.'
+    '.dggggggggggggLgMgd.'
+    '.dggggggggggggggggd.'
+    '.dddddddddddddddddd.'
+    '..dssssssssssssssd..'
+    '...dddddddddddddd...'
+)
+$Page = @(
+    '...wwwwwwwwwwwwww...'
+    '...wbbbbbbbbwwwww...'
+    '...wwwwwwwwwwwwww...'
+    '...wkkkkkkkkkkkkw...'
+    '...wkkkkkkkkwwwww...'
+    '...wwwwwwwwwwwwww...'
+    '...wkkkkkkkkkkkww...'
+    '...wkkkkkkwwwwwww...'
+    '...wwwwwwGGwwwwww...'
+    '...wwwwwwwwwwwwww...'
+)
+# crumpled page stuck in the slot, with a red smudge
+$Jam = @(
+    '...wwkwwwwwkwwww....'
+    '..w.wwwrrwwww.ww....'
+    '...ww.wwwkww.w.w....'
+    '....w.wwkw..w.......'
+    '......w..w..........'
+)
+
+function Render([string[]]$rows, [int]$pad) {
+    $sb = New-Object Text.StringBuilder
+    for ($r = 0; $r -lt $rows.Count; $r += 2) {
+        [void]$sb.Append(' ' * $pad)
+        $top = $rows[$r]
+        $bottom = $rows[$r + 1]
+        for ($i = 0; $i -lt $top.Length; $i++) {
+            $t = [string]$top[$i]
+            $u = [string]$bottom[$i]
+            if ($t -ceq '.' -and $u -ceq '.') { [void]$sb.Append("$E[0m ") }
+            elseif ($t -ceq '.') { [void]$sb.Append("$E[0;38;5;$($Colors[$u])m▄") }
+            elseif ($u -ceq '.') { [void]$sb.Append("$E[0;38;5;$($Colors[$t])m▀") }
+            else { [void]$sb.Append("$E[38;5;$($Colors[$t]);48;5;$($Colors[$u])m▀") }
+        }
+        [void]$sb.Append("$E[0m$E[K`n")
+    }
+    W $sb.ToString()
+}
+
+# $n rows of paper out of the slot, two lights, and the indent (2, the printer shakes with 1 and 3);
+# drawn over the previous frame, so the art grows and shrinks with the paper
+$script:drawn = 0
+$script:paper = $Page
+function Show([int]$n, [string]$l1, [string]$l2, [int]$pad = 2) {
+    if ($script:drawn) { W "$E[$($script:drawn)A" }
+    $rows = @($Printer | ForEach-Object { $_.Replace('L', $l1).Replace('M', $l2) })
+    if ($n -gt 0) { $rows += $script:paper[($script:paper.Count - $n)..($script:paper.Count - 1)] }
+    if ($n % 2) { $rows += '....................' }
+    Render $rows $pad
+    W "$E[J"
+    $script:drawn = [int][math]::Floor((11 + $n) / 2)
+    Start-Sleep -Milliseconds 90
+}
+
+function Blink([int]$n) {
+    if ($n % 2) { Show $n 'g' 'G' } else { Show $n 'G' 'g' }
+}
+
+function Animate([string]$what, $task) {
+    if (-not $tty) { return }
+    [Console]::CursorVisible = $false
+    # finish and jam carry on from where print stopped
+    if ($what -ne 'finish' -and $what -ne 'jam') { $script:drawn = 0 }
+    switch ($what) {
+        'boot' { foreach ($l in 'gg', 'Gg', 'gg', 'Gg', 'GG') { Show 0 $l[0] $l[1] } }
+        'print' {
+            $script:n = 0
+            while (-not $task.IsCompleted) { Blink $script:n; $script:n = ($script:n + 1) % 11 }
+        }
+        'finish' {
+            for (; $script:n -le 10; $script:n++) { Blink $script:n }
+            Show 10 'G' 'G'
+        }
+        'jam' {
+            $script:paper = $Jam
+            $i = 0
+            foreach ($x in 1, 3, 1, 3, 1, 3, 2, 2, 2, 2) {
+                if ($i % 2) { Show 5 'g' 'g' $x } else { Show 5 'r' 'r' $x }
+                $i++
+            }
+            Show 5 'r' 'r'
+            $script:paper = $Page
+        }
+        'unprint' {
+            for ($n = 10; $n -ge 0; $n--) { if ($n % 2) { Show $n 'g' 'r' } else { Show $n 'r' 'g' } }
+            Show 0 'r' 'r'
+        }
+    }
+    [Console]::CursorVisible = $true
+}
+
+# --- menu: arrows or j/k, enter, q; with $marks a checklist where space marks --------------------
+# Returns the picked index, or -1 for quit, and leaves only the pick on screen.
+function Menu([string[]]$items, [int]$sel = 0, [bool[]]$marks = $null) {
+    # ($null -ne $marks, not just $marks: an array holding one $false counts as false)
+    $n = $items.Count
+    $hint = if ($null -ne $marks) { $T.check_hint } else { $T.hint }
+    $done = $false
+    while (-not $done) {
+        for ($i = 0; $i -lt $n; $i++) {
+            $box = ''
+            if ($null -ne $marks) { $box = if ($marks[$i]) { '[x] ' } else { '[ ] ' } }
+            if ($i -eq $sel) { W "  $E[1;38;5;69m▶ $box$($items[$i])$E[0m$E[K`n" }
+            else { W "    $E[2m$box$($items[$i])$E[0m$E[K`n" }
+        }
+        W "`n  $E[2m$hint$E[0m$E[K`n"
+        $key = [Console]::ReadKey($true)
+        switch ($key.Key) {
+            { $_ -eq 'UpArrow' -or $_ -eq 'K' } { if ($sel -gt 0) { $sel-- } }
+            { $_ -eq 'DownArrow' -or $_ -eq 'J' } { if ($sel -lt $n - 1) { $sel++ } }
+            'Spacebar' { if ($null -ne $marks) { $marks[$sel] = -not $marks[$sel] } }
+            'Enter' { $done = $true }
+            { $_ -eq 'Q' -or $_ -eq 'Escape' } { $sel = -1; $done = $true }
+        }
+        W "$E[$($n + 2)A"
+    }
+    W "$E[J"
+    if ($sel -ge 0) {
+        if ($null -ne $marks) {
+            for ($i = 0; $i -lt $n; $i++) { if ($marks[$i]) { W "  $E[1;38;5;114m✓ $($items[$i])$E[0m`n" } }
+        } else {
+            W "  $E[1;38;5;69m▶ $($items[$sel])$E[0m`n"
+        }
+    }
+    return $sel
+}
+
+# --- the actual work ------------------------------------------------------------------------
+function Get-Soffice {
+    foreach ($p in $env:ProgramFiles, ${env:ProgramFiles(x86)}) {
+        if ($p -and (Test-Path (Join-Path $p 'LibreOffice\program\soffice.exe'))) { return $true }
+    }
+    return $false
+}
+
+# Downloads the exe and its checksum while the printer prints: $true when installed
+function Install-PrinterTUI([bool]$libreoffice) {
+    if ($libreoffice) {
+        Say $T.extras_inst
+        Step 'winget install TheDocumentFoundation.LibreOffice' {
+            winget install -e --id TheDocumentFoundation.LibreOffice --accept-package-agreements --accept-source-agreements
+        }
+    }
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
     $url = "https://github.com/$repo/releases/latest/download/printertui-windows-$arch.exe"
     $tmp = Join-Path ([IO.Path]::GetTempPath()) "printertui-$PID.exe"
-    Say "Downloading PrinterTUI (windows $arch)"
-    try {
-        Invoke-WebRequest $url -OutFile $tmp -UseBasicParsing
-        $want = ((Invoke-WebRequest "$url.sha256" -UseBasicParsing).Content -split '\s+')[0]
-    } catch {
+    Say "$($T.download) (windows $arch)"
+    if ($preview) {
+        W "    $E[2m$($T.skip) $url$E[0m`n"
+        $task = [Threading.Tasks.Task]::Delay(3000)
+    } else {
+        $sum = (New-Object Net.WebClient).DownloadStringTaskAsync("$url.sha256")
+        $file = (New-Object Net.WebClient).DownloadFileTaskAsync($url, $tmp)
+        $task = [Threading.Tasks.Task]::WhenAll([Threading.Tasks.Task[]]@($sum, $file))
+    }
+    W "`n"
+    Animate 'print' $task
+    while (-not $task.IsCompleted) { Start-Sleep -Milliseconds 100 }
+    # 0 ok, 1 download failed, 2 checksum mismatch
+    $status = 0
+    if ($preview -eq 'jam') { $status = 1 }
+    elseif ($preview -eq 'smudge') { $status = 2 }
+    elseif (-not $preview) {
+        if ($task.IsFaulted) { $status = 1 }
+        elseif ((Get-FileHash $tmp -Algorithm SHA256).Hash -ne ($sum.Result -split '\s+')[0].ToUpper()) { $status = 2 }
+    }
+    if ($status -eq 0) { Animate 'finish' } else { Animate 'jam' }
+    if ($status -ne 0) {
         Remove-Item $tmp -ErrorAction SilentlyContinue
-        Write-Host "`n  Paper jam! The download didn't come through. Check your connection and try again." -ForegroundColor Red
-        return
+        if ($status -eq 1) { Talk $T.jam; Fail $T.e_net } else { Talk $T.smudge; Fail $T.e_sum }
+        return $false
     }
-    if ((Get-FileHash $tmp -Algorithm SHA256).Hash -ne $want.ToUpper()) {
-        Remove-Item $tmp
-        Write-Host "`n  Smudged page! The download doesn't match its checksum, nothing was installed." -ForegroundColor Red
-        return
+    W "`n"
+    Say "$($T.put) $dir"
+    Step "move $tmp $exe" {
+        New-Item -ItemType Directory -Force $dir | Out-Null
+        Move-Item -Force $tmp $exe
     }
-    New-Item -ItemType Directory -Force $dir | Out-Null
-    Move-Item -Force $tmp $exe
-
     # on the PATH for new terminals, and for this one right away
-    $path = [Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ }
-    if ($path -notcontains $dir) { Set-UserPath ($path + $dir) }
-    if (($env:Path -split ';') -notcontains $dir) { $env:Path += ";$dir" }
-
-    $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
-    $link.TargetPath = $exe
-    $link.WorkingDirectory = [Environment]::GetFolderPath('MyDocuments')
-    $link.Save()
-
-    Write-Host "`n  Page printed, ink dry, ready to go. Run: printertui (or PrinterTUI in the Start menu)`n" -ForegroundColor Green
-    Say 'Optional: LibreOffice (libreoffice.org) to print Word, Excel and other non-PDF files'
+    Step "PATH += $dir" {
+        $path = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ })
+        if ($path -notcontains $dir) { [Environment]::SetEnvironmentVariable('Path', (($path + $dir) -join ';'), 'User') }
+        if (($env:Path -split ';') -notcontains $dir) { $env:Path += ";$dir" }
+    }
+    Step $shortcut {
+        $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
+        $link.TargetPath = $exe
+        $link.WorkingDirectory = [Environment]::GetFolderPath('MyDocuments')
+        $link.Save()
+    }
+    return $true
 }
 
 function Uninstall-PrinterTUI {
-    Say 'Removing PrinterTUI, its settings and its copy of pdfium'
-    Get-Process printertui -ErrorAction SilentlyContinue | Stop-Process -Force
-    Remove-Item -Recurse -Force $dir, (Join-Path $env:APPDATA 'printertui'), (Join-Path $env:LOCALAPPDATA 'printertui') -ErrorAction SilentlyContinue
-    Remove-Item $shortcut -ErrorAction SilentlyContinue
-    Set-UserPath ([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ -and $_ -ne $dir })
-    Write-Host "`n  Paper's back in the tray. Bye for now! Your printers were left as they are.`n" -ForegroundColor Green
+    Say $T.rm_cmd
+    Step "remove $dir, $shortcut, PATH" {
+        Get-Process printertui -ErrorAction SilentlyContinue | Stop-Process -Force
+        Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+        Remove-Item $shortcut -ErrorAction SilentlyContinue
+        $path = [Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ -and $_ -ne $dir }
+        [Environment]::SetEnvironmentVariable('Path', ($path -join ';'), 'User')
+    }
+    Say $T.rm_cfg
+    # settings, and the copy of pdfium the app unpacks
+    $roaming = if ($env:APPDATA) { $env:APPDATA } else { $base }
+    $data = @((Join-Path $roaming 'printertui'), (Join-Path $base 'printertui'))
+    Step "remove $($data -join ', ')" { Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue }
+    W "`n"
+    Animate 'unprint'
 }
 
-Write-Host "`n  PrinterTUI`n" -ForegroundColor White
-if (Test-Path $exe) {
-    Write-Host "  Oh, you already have me. Fresh copy, or shall I pack up?`n" -ForegroundColor Cyan
-    Write-Host '    1  Update'
-    Write-Host '    2  Uninstall'
-    Write-Host "    q  Quit`n"
-    switch (Read-Host '  Pick') {
-        '1' { Install-PrinterTUI }
-        '2' { Uninstall-PrinterTUI }
-        default { Write-Host "`n  No worries, nothing was touched.`n" }
+# --- main -----------------------------------------------------------------------------------
+$installed = if ($preview) { $preview -eq 'installed' } else { Test-Path $exe }
+$codes = @($Langs.Keys)
+$lang = $codes.IndexOf([Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName)
+if ($lang -lt 0) { $lang = 0 }
+$T = $Langs[$codes[$lang]]
+
+try {
+    $action = if ($installed) { 'update' } else { 'install' }
+    $libreoffice = $false
+    if ($tty) {
+        W "`n  $E[1mPrinterTUI$E[0m`n`n"
+        $lang = Menu @($codes | ForEach-Object { $Langs[$_].name }) $lang
+        if ($lang -lt 0) { Talk $Langs[$codes[0]].quit; return }
+        $T = $Langs[$codes[$lang]]
+        if ($preview) { W "`n  $E[33m$($T.prev)$E[0m`n" }
+        W "`n"
+        Animate 'boot'
+        if ($installed) {
+            Talk $T.hi_old
+            $action = @('quit', 'update', 'uninstall')[(Menu @($T.update, $T.uninstall)) + 1]
+        } else {
+            Talk $T.hi_new
+            $action = @('quit', 'install')[(Menu @($T.install)) + 1]
+        }
+        if ($action -eq 'install' -or $action -eq 'update') {
+            Talk $T.extras
+            $marks = [bool[]]@(Get-Soffice)
+            if ((Menu @($T.lo) 0 $marks) -lt 0) { $action = 'quit' } else { $libreoffice = $marks[0] -and -not (Get-Soffice) }
+        }
+        W "`n"
     }
-} else {
-    Write-Host "  Hi! Looks like we haven't met. Warm up the printer?`n" -ForegroundColor Cyan
-    Install-PrinterTUI
+    switch ($action) {
+        'quit' { Talk $T.quit }
+        'uninstall' {
+            Uninstall-PrinterTUI
+            Talk $T.bye
+            Say $T.left_win
+        }
+        default {
+            if (Install-PrinterTUI $libreoffice) {
+                Talk $T.done
+                Say $T.start
+            }
+        }
+    }
+} finally {
+    if ($tty) { [Console]::CursorVisible = $true }
 }

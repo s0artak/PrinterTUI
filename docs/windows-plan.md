@@ -40,6 +40,22 @@ one code path to test, and ImageMagick, qpdf and curl stop being dependencies th
    the tests, `.exe` + `.sha256` in releases, `install.ps1` for `irm ... | iex` with the same checksum check.
 6. **Try it on real Windows** with a printer and a scanner (needs the owner): checklist below.
 
+## Status
+
+Phases 1–5 are done. CI builds Windows x86_64 and ARM and runs the tests there, including a real
+print through pdfium to "Microsoft Print to PDF". `install.ps1` has the same menus, languages and
+pixel-art printer as `install.sh`; `pwsh test/installer-preview.ps1 [fresh|jam|smudge]` plays it.
+
+Known limits:
+- Untested on real hardware: printing to a physical printer, scanning (WinRT), OCR, Add-Printer, the file dialog.
+- Wine can start the exe but its console garbles full-screen apps, and it cannot run PowerShell,
+  so neither is a stand-in for Windows.
+- Flags in the language menu show as letters on Windows (no flag emoji in Windows' fonts).
+- Pages per sheet are laid out in a grid without rotating them the way CUPS does.
+- OCR uses the Windows user's language only, not several at once like tesseract.
+- The exe is unsigned: SmartScreen warns on first run until it is signed or well known.
+- The installer needs a release that has the Windows exe (a new tag after merging).
+
 Later, only if asked for: code signing (SignPath, free for open source), winget/Scoop, a GUI (egui).
 
 ## Checklist on a real Windows machine
