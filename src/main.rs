@@ -8,13 +8,13 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 
-const LABELS: [&str; 9] = [
-    "Printer", "File", "Color", "Sides", "Back order", "Pages", "Paper", "", "",
+const LABELS: [&str; 11] = [
+    "Printer", "File", "Color", "Sides", "Back order", "Pages", "Paper", "Copies", "Per sheet", "", "",
 ];
 const FILE: usize = 1;
 const PAGES: usize = 5;
-const PRINT: usize = 7;
-const ADD: usize = 8;
+const PRINT: usize = 9;
+const ADD: usize = 10;
 
 enum Mode {
     Main,
@@ -34,6 +34,8 @@ struct App {
     reverse_back: bool,
     pages: String,
     paper: usize,
+    copies: u32,
+    per_sheet: usize,
     sel: usize,
     status: String,
     mode: Mode,
@@ -49,10 +51,17 @@ fn main() -> std::io::Result<()> {
         reverse_back: false,
         pages: String::new(),
         paper: 0,
+        copies: 1,
+        per_sheet: 0,
         sel: 0,
         status: String::new(),
         mode: Mode::Main,
     };
+    if let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        for (k, v) in parse_config(&text) {
+            app.apply(k, v);
+        }
+    }
     if app.printers.is_empty() {
         app.status = "No printers configured. Select [ Add printer ].".into();
     }
@@ -174,6 +183,8 @@ impl App {
             3 => self.duplex = !self.duplex,
             4 => self.reverse_back = !self.reverse_back,
             6 => self.paper = step(self.paper, PAPERS.len()),
+            7 => self.copies = if fwd { self.copies + 1 } else { (self.copies - 1).max(1) },
+            8 => self.per_sheet = step(self.per_sheet, PER_SHEET.len()),
             _ => {}
         }
     }
@@ -189,6 +200,8 @@ impl App {
             PAGES if self.pages.is_empty() && !matches!(self.mode, Mode::Insert) => "all".into(),
             PAGES => self.pages.clone(),
             6 => pick(PAPERS[self.paper]),
+            7 => pick(&self.copies.to_string()),
+            8 => pick(&PER_SHEET[self.per_sheet].to_string()),
             PRINT => "[ Print ]".into(),
             _ => "[ Add printer ]".into(),
         }
@@ -196,8 +209,37 @@ impl App {
 
     fn print(&mut self) {
         self.status = match self.try_print() {
-            Ok(s) => s,
+            Ok(s) => match self.save() {
+                Ok(()) => s,
+                Err(e) => format!("{s}\n\nCould not save settings: {e}"),
+            },
             Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// Remembers the settings of the last successful print (not the file or page range).
+    fn save(&self) -> std::io::Result<()> {
+        let path = config_path().ok_or(std::io::Error::other("HOME is not set"))?;
+        std::fs::create_dir_all(path.parent().unwrap_or(&path))?;
+        std::fs::write(path, format!(
+            "printer={}\ncolor={}\nduplex={}\nreverse_back={}\npaper={}\ncopies={}\nper_sheet={}\n",
+            self.printers.get(self.printer).map_or("", String::as_str),
+            self.color, self.duplex, self.reverse_back, PAPERS[self.paper], self.copies, PER_SHEET[self.per_sheet],
+        ))
+    }
+
+    /// Applies one saved setting; unknown keys and invalid values are ignored.
+    fn apply(&mut self, key: &str, v: &str) {
+        let b = v.parse().ok();
+        match key {
+            "printer" => self.printer = self.printers.iter().position(|p| p == v).unwrap_or(self.printer),
+            "color" => self.color = b.unwrap_or(self.color),
+            "duplex" => self.duplex = b.unwrap_or(self.duplex),
+            "reverse_back" => self.reverse_back = b.unwrap_or(self.reverse_back),
+            "paper" => self.paper = PAPERS.iter().position(|p| *p == v).unwrap_or(self.paper),
+            "copies" => self.copies = v.parse().ok().filter(|n| *n > 0).unwrap_or(self.copies),
+            "per_sheet" => self.per_sheet = PER_SHEET.iter().position(|n| n.to_string() == v).unwrap_or(self.per_sheet),
+            _ => {}
         }
     }
 
@@ -208,17 +250,27 @@ impl App {
             return Err(format!("File not found: {file}"));
         }
         let pages = self.pages.trim();
-        let job = |pages: Option<String>, reverse| {
-            lp_args(&Job { printer, file: &file, color: self.color, paper: PAPERS[self.paper], pages, reverse })
+        let per_sheet = PER_SHEET[self.per_sheet];
+        let job = |pages: Option<String>, reverse, collate| {
+            lp_args(&Job {
+                printer, file: &file, color: self.color, paper: PAPERS[self.paper], pages, reverse,
+                copies: self.copies, collate, per_sheet,
+            })
         };
         if !self.duplex {
             let range = (!pages.is_empty() && pages != "all").then(|| pages.to_string());
-            return submit(&job(range, false));
+            return submit(&job(range, false, true));
         }
         let total = page_count(&file).ok_or("Double-sided needs a PDF file")?;
-        let (front, back) = split_duplex(&parse_ranges(pages, total)?);
-        let front_job = job(Some(join(&front)), false);
-        let back_job = job(Some(join(&back)), self.reverse_back);
+        // page-ranges picks pages before number-up groups them, so split whole sheet sides
+        let pages = parse_ranges(pages, total)?;
+        let sides: Vec<&[u32]> = pages.chunks(per_sheet as usize).collect();
+        let (front, back) = split_duplex(&sides);
+        let odd = front.len() > back.len();
+        // Collated copies would leave a sheet without back side inside every copy when odd.
+        let (front, back) = (front.concat(), back.concat());
+        let front_job = job(Some(join(&front)), false, !odd);
+        let back_job = job(Some(join(&back)), self.reverse_back, !odd);
         let id = submit(&front_job)?;
         if back.is_empty() {
             return Ok(format!("Only one page, nothing to flip: {id}"));
@@ -231,7 +283,11 @@ impl App {
              3. Flip it: printed side facing the BACK of the printer,\n   top of the page going in first (pointing down).\n\
              4. Put it in the input tray.\n\n\
              Enter = print back side    v = watch how (video)    Esc = cancel",
-            if front.len() > back.len() { "\n   Put the top sheet aside, it has no back side." } else { "" }
+            match (odd, self.copies) {
+                (false, _) => String::new(),
+                (true, 1) => "\n   Put the top sheet aside, it has no back side.".into(),
+                (true, n) => format!("\n   Put the top {n} sheets aside (no back side, copies are uncollated)."),
+            }
         ))
     }
 }
