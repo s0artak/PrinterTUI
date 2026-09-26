@@ -27,7 +27,7 @@ printertui [file]
 | Enter | Pick files, pick pages, print, scan, save |
 | `q` | Quit |
 
-Double-sided: the front pages print, then flip the stack and press Enter. Press `v` for a video of how to flip it. If the back pages come out in the wrong order, set **Back order** to *Reversed*.
+Double-sided: the front pages print, then flip the stack and press Enter. An animation shows how to flip it. If the back pages come out in the wrong order, set **Back order** to *Reversed*.
 
 Scan: put a page on the glass, press Enter on **Scan page**, repeat for more pages, then **Save** them as one PDF or as PNG files. The last scanned page is previewed on the right.
 

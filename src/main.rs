@@ -7,6 +7,11 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
     DefaultTerminal, Frame,
 };
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// Result of a background task, applied to the app on the UI thread.
+type Done = Box<dyn FnOnce(&mut App) + Send>;
 
 const LABELS: [&str; 11] = [
     "Printer", "File", "Color", "Sides", "Back order", "Pages", "Paper", "Copies", "Per sheet", "", "",
@@ -56,6 +61,10 @@ struct App {
     save_as: String,
     scans: Vec<String>,
     thumb: Option<(usize, usize, Vec<u8>)>,
+    /// Slow work (scanning, converting, discovery) runs in a thread so the UI keeps drawing.
+    busy: Option<(String, mpsc::Receiver<Done>)>,
+    started: Instant,
+    last_poll: Instant,
     sel: usize,
     status: String,
     mode: Mode,
@@ -83,6 +92,9 @@ fn main() -> std::io::Result<()> {
         save_as: default_scan_name(),
         scans: Vec::new(),
         thumb: None,
+        busy: None,
+        started: Instant::now(),
+        last_poll: Instant::now(),
         sel: 0,
         status: String::new(),
         mode: Mode::Main,
@@ -104,14 +116,31 @@ fn main() -> std::io::Result<()> {
 fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     let mut pending_g = false;
     loop {
-        if let Mode::Flip { job, steps, .. } = &mut app.mode
-            && job.as_deref().is_some_and(|id| !job_active(id))
-        {
-            *job = None;
-            app.status = std::mem::take(steps);
+        if let Some((_, rx)) = &app.busy {
+            match rx.try_recv() {
+                Ok(done) => {
+                    app.busy = None;
+                    done(app);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    app.busy = None;
+                    app.status = "Error: the background task crashed".into();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if app.last_poll.elapsed() >= Duration::from_secs(1) {
+            app.last_poll = Instant::now();
+            if let Mode::Flip { job, steps, .. } = &mut app.mode
+                && job.as_deref().is_some_and(|id| !job_active(id))
+            {
+                *job = None;
+                app.status = std::mem::take(steps);
+            }
         }
         term.draw(|f| draw(f, app))?;
-        if !event::poll(std::time::Duration::from_millis(500))? {
+        // short timeout keeps the spinner and the duplex animation moving
+        if !event::poll(Duration::from_millis(100))? {
             continue;
         }
         let Event::Key(k) = event::read()? else { continue };
@@ -122,6 +151,9 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
             return Ok(());
         }
         // vim `gg`: a second `g` right after the first
+        if app.busy.is_some() && k.code == KeyCode::Enter {
+            continue;
+        }
         let gg = pending_g && k.code == KeyCode::Char('g');
         pending_g = !gg && k.code == KeyCode::Char('g') && !matches!(app.mode, Mode::Insert);
         match &mut app.mode {
@@ -136,23 +168,24 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     app.sel = 0;
                     app.status = String::new();
                     if app.scan_tab && app.scanners.is_none() {
-                        app.find_scanners(term);
+                        app.find_scanners(false);
                     }
                 }
                 KeyCode::Left | KeyCode::Char('h') => app.cycle(false),
                 KeyCode::Right | KeyCode::Char('l') => app.cycle(true),
                 KeyCode::Char('i') | KeyCode::Char('a') if app.text().is_some() => app.mode = Mode::Insert,
-                KeyCode::Enter if app.scan_tab => app.scan_enter(term),
-                KeyCode::Enter if app.sel == ADD => {
-                    app.status = "Searching for network printers...".into();
-                    term.draw(|f| draw(f, app))?;
+                KeyCode::Enter if app.scan_tab => app.scan_enter(),
+                KeyCode::Enter if app.sel == ADD => app.spawn("Searching for network printers", || {
                     let found = discover();
-                    if found.is_empty() {
-                        app.status = "No network printers found.".into();
-                    } else {
-                        app.mode = Mode::Pick(found, ListState::default().with_selected(Some(0)));
-                    }
-                }
+                    Box::new(move |app: &mut App| {
+                        if found.is_empty() {
+                            app.status = "No network printers found.".into();
+                        } else {
+                            app.status = String::new();
+                            app.mode = Mode::Pick(found, ListState::default().with_selected(Some(0)));
+                        }
+                    })
+                }),
                 KeyCode::Enter if app.sel == FILE => {
                     ratatui::restore();
                     let picked = pick_files();
@@ -163,16 +196,8 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                         app.file = picked.join("; ");
                     }
                 }
-                KeyCode::Enter if app.sel == PAGES => {
-                    let res = app.open_pages(term);
-                    if let Err(e) = res {
-                        app.status = format!("Error: {e}");
-                    }
-                }
-                KeyCode::Enter => {
-                    let res = app.try_print(term);
-                    app.show(res);
-                }
+                KeyCode::Enter if app.sel == PAGES => app.open_pages(),
+                KeyCode::Enter => app.try_print(),
                 _ => {}
             },
             Mode::Insert => match k.code {
@@ -235,17 +260,12 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                 }
             }
             Mode::Flip { job, .. } => match k.code {
-                KeyCode::Char('v') => {
-                    if let Err(e) = play_tutorial() {
-                        app.status = format!("Could not open the video: {e}\n\n{}", app.status);
-                    }
-                }
                 KeyCode::Esc => {
                     app.status = "Back side cancelled.".into();
                     app.mode = Mode::Main;
                 }
                 KeyCode::Enter if job.is_none() => {
-                    let res = app.back_side(term);
+                    let res = app.back_side();
                     app.show(res);
                 }
                 _ => {}
@@ -255,6 +275,13 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
 }
 
 impl App {
+    /// Runs `work` in a thread; its returned closure updates the app when it finishes.
+    fn spawn(&mut self, msg: impl Into<String>, work: impl FnOnce() -> Done + Send + 'static) {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || tx.send(work()));
+        self.busy = Some((msg.into(), rx));
+    }
+
     fn last(&self) -> usize {
         if self.scan_tab { DISCARD } else { ADD }
     }
@@ -333,15 +360,22 @@ impl App {
     }
 
     /// Opens the page selector for the first file, pre-checking the current range.
-    fn open_pages(&mut self, term: &mut DefaultTerminal) -> Result<(), String> {
-        let file = split_files(&self.file).first().map(|f| expand_home(f)).ok_or("Pick a file first")?;
-        let pdf = self.pdf(term, &file)?;
-        let total = page_count(&pdf).ok_or("Could not read the PDF")?;
-        let current = parse_ranges(&self.pages, total).unwrap_or_default();
-        let on = (1..=total).map(|n| current.contains(&n)).collect();
-        self.status = String::new();
-        self.mode = Mode::Pages(on, ListState::default().with_selected(Some(0)));
-        Ok(())
+    fn open_pages(&mut self) {
+        let Some(file) = split_files(&self.file).first().map(|f| expand_home(f)) else {
+            return self.status = "Error: Pick a file first".into();
+        };
+        self.spawn("Reading pages", move || {
+            let total = pdf(&file).and_then(|p| page_count(&p).ok_or("Could not read the PDF".into()));
+            Box::new(move |app: &mut App| match total {
+                Ok(total) => {
+                    let current = parse_ranges(&app.pages, total).unwrap_or_default();
+                    let on = (1..=total).map(|n| current.contains(&n)).collect();
+                    app.status = String::new();
+                    app.mode = Mode::Pages(on, ListState::default().with_selected(Some(0)));
+                }
+                Err(e) => app.status = format!("Error: {e}"),
+            })
+        });
     }
 
     fn show(&mut self, res: Result<String, String>) {
@@ -395,17 +429,7 @@ impl App {
         })
     }
 
-    /// The file itself if it is a PDF, otherwise a PDF converted by LibreOffice.
-    fn pdf(&mut self, term: &mut DefaultTerminal, file: &str) -> Result<String, String> {
-        if page_count(file).is_some() {
-            return Ok(file.into());
-        }
-        self.status = format!("Converting {} to PDF...", name(file));
-        let _ = term.draw(|f| draw(f, self));
-        to_pdf(file)
-    }
-
-    fn try_print(&mut self, term: &mut DefaultTerminal) -> Result<String, String> {
+    fn files(&self) -> Result<Vec<String>, String> {
         self.printers.get(self.printer).ok_or("No printer selected")?;
         let files: Vec<String> = split_files(&self.file).iter().map(|f| expand_home(f)).collect();
         if files.is_empty() {
@@ -414,26 +438,41 @@ impl App {
         if let Some(f) = files.iter().find(|f| !std::path::Path::new(f).is_file()) {
             return Err(format!("File not found: {f}"));
         }
+        Ok(files)
+    }
+
+    /// Converts the files to PDF in the background, then sends the jobs.
+    fn try_print(&mut self) {
+        let files = match self.files() {
+            Ok(f) => f,
+            Err(e) => return self.show(Err(e)),
+        };
+        self.spawn("Preparing files", move || {
+            let pdfs: Result<Vec<String>, String> = files.iter().map(|f| pdf(f)).collect();
+            Box::new(move |app: &mut App| {
+                let res = pdfs.and_then(|p| app.print_pdfs(p));
+                app.show(res)
+            })
+        });
+    }
+
+    fn print_pdfs(&mut self, pdfs: Vec<String>) -> Result<String, String> {
         if self.duplex {
-            return self.duplex(term, files, 0, String::new());
+            return self.duplex(pdfs, 0, String::new());
         }
         let pages = self.pages.trim();
         let range = (!pages.is_empty() && pages != "all").then(|| pages.to_string());
-        let mut sent = Vec::new();
-        for f in &files {
-            let pdf = self.pdf(term, f)?;
-            sent.push(submit(&self.job(&pdf, range.clone(), false, true))?);
-        }
-        Ok(sent.join("\n"))
+        let sent: Result<Vec<String>, String> = pdfs.iter().map(|p| submit(&self.job(p, range.clone(), false, true))).collect();
+        Ok(sent?.join("\n"))
     }
 
     /// Prints the front of files[i..] until one needs flipping, then waits in Mode::Flip.
-    fn duplex(&mut self, term: &mut DefaultTerminal, files: Vec<String>, mut i: usize, mut done: String) -> Result<String, String> {
+    fn duplex(&mut self, files: Vec<String>, mut i: usize, mut done: String) -> Result<String, String> {
         self.mode = Mode::Main;
         while let Some(file) = files.get(i) {
             i += 1;
             let head = if files.len() > 1 { format!("File {i} of {}: {}\n", files.len(), name(file)) } else { String::new() };
-            let pdf = self.pdf(term, file)?;
+            let pdf = file.clone();
             let total = page_count(&pdf).ok_or("Could not read the PDF")?;
             // page-ranges picks pages before number-up groups them, so split whole sheet sides
             let pages = parse_ranges(&self.pages, total)?;
@@ -453,7 +492,7 @@ impl App {
                  2. Take the whole stack out. Do not change the order.{}\n\
                  3. Flip it: printed side facing the BACK of the printer,\n   top of the page going in first (pointing down).\n\
                  4. Put it in the input tray.\n\n\
-                 Enter = print back side    v = watch how (video)    Esc = cancel",
+                 Enter = print back side    Esc = cancel",
                 match (odd, self.copies) {
                     (false, _) => String::new(),
                     (true, 1) => "\n   Put the top sheet aside, it has no back side.".into(),
@@ -470,71 +509,93 @@ impl App {
         Ok(done.trim_end().to_string())
     }
 
-    fn back_side(&mut self, term: &mut DefaultTerminal) -> Result<String, String> {
+    fn back_side(&mut self) -> Result<String, String> {
         let Mode::Flip { back, files, next, .. } = std::mem::replace(&mut self.mode, Mode::Main) else {
             return Ok(String::new());
         };
         let id = submit(&back)?;
-        self.duplex(term, files, next, format!("Back side sent: {id}\n\n"))
+        self.duplex(files, next, format!("Back side sent: {id}\n\n"))
     }
 }
 
 impl App {
-    fn find_scanners(&mut self, term: &mut DefaultTerminal) {
-        self.status = "Searching for scanners...".into();
-        let _ = term.draw(|f| draw(f, self));
-        let list = scanners();
-        self.scanner = list.iter().position(|(d, _)| *d == self.scanner_pref).unwrap_or(0);
-        self.status = if list.is_empty() {
-            "No scanners found. Install sane and sane-airscan (network scanners),\nthen press Enter on Scanner to search again.".into()
-        } else {
-            String::new()
-        };
-        self.scanners = Some(list);
+    fn find_scanners(&mut self, full: bool) {
+        self.spawn("Searching for scanners", move || {
+            let list = scanners(full);
+            Box::new(move |app: &mut App| {
+                app.scanner = list.iter().position(|(d, _)| *d == app.scanner_pref).unwrap_or(0);
+                app.status = if list.is_empty() {
+                    "No scanners found. Install sane and sane-airscan (network scanners),\nthen press Enter on Scanner to search again.".into()
+                } else {
+                    String::new()
+                };
+                app.scanners = Some(list);
+            })
+        });
     }
 
-    fn scan_enter(&mut self, term: &mut DefaultTerminal) {
-        let res = match self.sel {
-            0 => return self.find_scanners(term),
-            SCAN => self.scan_page(term),
+    fn scan_enter(&mut self) {
+        match self.sel {
+            0 => self.find_scanners(true),
+            SCAN => self.scan_page(),
             SAVE => self.save_scans(),
             DISCARD => {
                 self.scans.clear();
                 self.thumb = None;
-                Ok("Scanned pages discarded.".into())
+                self.status = "Scanned pages discarded.".into();
             }
-            _ => return,
-        };
-        self.status = res.unwrap_or_else(|e| format!("Error: {e}"));
+            _ => {}
+        }
     }
 
-    fn scan_page(&mut self, term: &mut DefaultTerminal) -> Result<String, String> {
-        let (device, _) = self.scanners.as_ref().and_then(|l| l.get(self.scanner)).ok_or("No scanner selected")?.clone();
+    fn scan_page(&mut self) {
+        let Some((device, _)) = self.scanners.as_ref().and_then(|l| l.get(self.scanner)).cloned() else {
+            return self.status = "Error: No scanner selected".into();
+        };
         let dir = std::env::temp_dir().join("printertui-scan");
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let n = self.scans.len() + 1;
         let path = dir.join(format!("page-{n}.png")).to_string_lossy().into_owned();
-        self.status = format!("Scanning page {n}...");
-        let _ = term.draw(|f| draw(f, self));
-        // ponytail: blocks the UI while the scanner works; move to a thread if cancelling mid-scan matters
-        scan(&device, SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi], &path)?;
-        self.thumb = thumbnail(&path).ok();
-        self.scans.push(path);
-        Ok(format!("Scanned page {n}. Put the next page on the glass and scan again, or save."))
+        let (mode, dpi) = (SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi]);
+        self.spawn(format!("Scanning page {n}"), move || {
+            let res = std::fs::create_dir_all(&dir)
+                .map_err(|e| e.to_string())
+                .and_then(|_| scan(&device, mode, dpi, &path))
+                .and_then(|_| thumbnail(&path));
+            Box::new(move |app: &mut App| {
+                app.status = match res {
+                    Ok(thumb) => {
+                        app.thumb = Some(thumb);
+                        app.scans.push(path);
+                        format!("Scanned page {n}. Put the next page on the glass and scan again, or save.")
+                    }
+                    Err(e) => format!("Error: {e}"),
+                }
+            })
+        });
     }
 
-    fn save_scans(&mut self) -> Result<String, String> {
+    fn save_scans(&mut self) {
         if self.scans.is_empty() {
-            return Err("Nothing scanned yet".into());
+            return self.status = "Error: Nothing scanned yet".into();
         }
         let out = expand_home(self.save_as.trim());
-        let out = out.trim_end_matches(".pdf").trim_end_matches(".png");
-        let written = save_scans(&self.scans, out, self.scan_pdf, SCAN_MODES[self.scan_mode] == "Lineart", SCAN_DPI[self.scan_dpi])?;
-        self.scans.clear();
-        self.thumb = None;
-        self.save_as = default_scan_name();
-        let _ = self.save();
-        Ok(format!("Saved {}", written.join(", ")))
+        let out = out.trim_end_matches(".pdf").trim_end_matches(".png").to_string();
+        let (scans, pdf, dpi) = (self.scans.clone(), self.scan_pdf, SCAN_DPI[self.scan_dpi]);
+        self.spawn("Saving", move || {
+            let res = save_scans(&scans, &out, pdf, dpi);
+            Box::new(move |app: &mut App| {
+                app.status = match res {
+                    Ok(written) => {
+                        app.scans.clear();
+                        app.thumb = None;
+                        app.save_as = default_scan_name();
+                        let _ = app.save();
+                        format!("Saved {}", written.join(", "))
+                    }
+                    Err(e) => format!("Error: {e}"),
+                }
+            })
+        });
     }
 }
 
@@ -546,21 +607,13 @@ fn default_scan_name() -> String {
     format!("~/{}scan-{date}", if docs { "Documents/" } else { "" })
 }
 
-fn name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+/// The file itself if it is a PDF, otherwise a PDF converted by LibreOffice.
+fn pdf(file: &str) -> Result<String, String> {
+    if page_count(file).is_some() { Ok(file.into()) } else { to_pdf(file) }
 }
 
-/// Writes the embedded duplex tutorial to a temp file and opens it with the default video player.
-fn play_tutorial() -> std::io::Result<()> {
-    let path = std::env::temp_dir().join("printertui-duplex.mp4");
-    std::fs::write(&path, include_bytes!("../assets/duplex.mp4"))?;
-    std::process::Command::new("xdg-open")
-        .arg(path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(drop)
+fn name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 fn expand_home(p: &str) -> String {
@@ -602,10 +655,12 @@ fn draw(f: &mut Frame, app: &App) {
         draw_preview(f, app, area);
     }
 
-    f.render_widget(
-        Paragraph::new(app.status.as_str()).wrap(Wrap { trim: false }).block(Block::bordered()),
-        status,
-    );
+    let tick = app.started.elapsed().as_millis() as usize;
+    let text = match &app.busy {
+        Some((msg, _)) => format!("{msg}... {}", ['|', '/', '-', '\\'][tick / 150 % 4]),
+        None => app.status.clone(),
+    };
+    f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }).block(Block::bordered()), status);
     f.render_widget(
         Line::from(match app.mode {
             Mode::Insert => " -- INSERT --   Esc/Enter done",
@@ -619,7 +674,7 @@ fn draw(f: &mut Frame, app: &App) {
     match &app.mode {
         Mode::Main | Mode::Insert => {}
         Mode::Pick(found, state) => {
-            let area = popup(f, found.len() as u16 + 2);
+            let area = popup(f, 76, found.len() as u16 + 2);
             let items: Vec<ListItem> = found.iter().map(|(n, u)| ListItem::new(format!("{n}  {u}"))).collect();
             let list = List::new(items)
                 .block(Block::bordered().title(" Add printer (Enter add, Esc back) "))
@@ -627,7 +682,7 @@ fn draw(f: &mut Frame, app: &App) {
             f.render_stateful_widget(list, area, &mut state.clone());
         }
         Mode::Pages(on, state) => {
-            let area = popup(f, on.len() as u16 + 2);
+            let area = popup(f, 76, on.len() as u16 + 2);
             let items: Vec<ListItem> =
                 on.iter().enumerate().map(|(i, b)| ListItem::new(format!(" [{}] Page {}", if *b { "x" } else { " " }, i + 1))).collect();
             let n = on.iter().filter(|b| **b).count();
@@ -636,16 +691,59 @@ fn draw(f: &mut Frame, app: &App) {
                 .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
             f.render_stateful_widget(list, area, &mut state.clone());
         }
-        Mode::Flip { .. } => {
-            let area = popup(f, 18);
-            f.render_widget(
-                Paragraph::new(app.status.as_str())
-                    .wrap(Wrap { trim: false })
-                    .block(Block::bordered().title(" Manual duplex ")),
-                area,
-            );
+        Mode::Flip { job, .. } => {
+            let area = popup(f, 100, 18);
+            let block = Block::bordered().title(" Manual duplex ");
+            let [text, anim] = Layout::horizontal([Constraint::Min(30), Constraint::Length(31)]).areas(block.inner(area));
+            f.render_widget(block, area);
+            f.render_widget(Paragraph::new(app.status.as_str()).wrap(Wrap { trim: false }), text);
+            if job.is_none() {
+                let lines: Vec<Line> = duplex_frame(tick / 700).into_iter().map(Line::from).collect();
+                f.render_widget(Paragraph::new(lines), anim);
+            }
         }
     }
+}
+
+/// One frame of the flip animation (front view, you standing in front of the printer):
+/// the printed sheet turns top over bottom and goes into the rear tray.
+fn duplex_frame(tick: usize) -> Vec<String> {
+    const FRONT: [&str; 5] = ["TOP", "", "1", "", ""];
+    const BACK: [&str; 5] = ["", "", "blank", "", "top ▼"];
+    // (card top row, card height, printed side visible, caption)
+    const STEPS: [(usize, usize, bool, &str); 14] = [
+        (1, 7, true, "Printed side facing you,\ntext upright"),
+        (1, 7, true, "Printed side facing you,\ntext upright"),
+        (2, 5, true, "Flip it top over bottom"),
+        (3, 3, true, "Flip it top over bottom"),
+        (4, 1, true, "Flip it top over bottom"),
+        (3, 3, false, "Flip it top over bottom"),
+        (2, 5, false, "Flip it top over bottom"),
+        (1, 7, false, "Blank side facing you,\ntop edge at the bottom"),
+        (1, 7, false, "Blank side facing you,\ntop edge at the bottom"),
+        (3, 7, false, "Put it in the rear tray,\ntop edge going in first"),
+        (5, 7, false, "Put it in the rear tray,\ntop edge going in first"),
+        (7, 7, false, "Put it in the rear tray,\ntop edge going in first"),
+        (9, 7, false, "Press Enter"),
+        (9, 7, false, "Press Enter"),
+    ];
+    let (y, h, front, caption) = STEPS[tick % STEPS.len()];
+    let content = if front { FRONT } else { BACK };
+    let pad = " ".repeat(9);
+    let mut rows = vec![String::new(); 9];
+    for r in y..(y + h).min(9) {
+        let line = match r - y {
+            _ if h == 1 => "─────────────".to_string(),
+            0 => "┌───────────┐".to_string(),
+            i if i == h - 1 => "└───────────┘".to_string(),
+            // squashed card: sample the lines evenly
+            i => format!("│{:^11}│", content[(2 * (i - 1) + 1) * 5 / (2 * (h - 2))]),
+        };
+        rows[r] = format!("{pad}{line}");
+    }
+    rows.extend(["  ┌─────────────────────────┐".into(), "  │         PRINTER         │".into(), "  └─────────────────────────┘".into(), String::new()]);
+    rows.extend(caption.lines().map(|c| format!("{c:^31}")));
+    rows
 }
 
 /// Grayscale half-block rendering of the last scanned page, two pixels per cell.
@@ -661,7 +759,11 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let scale = (cols as f32 / *w as f32).min(rows as f32 / *h as f32);
     let (ow, oh) = (((*w as f32 * scale) as usize).max(1), ((*h as f32 * scale) as usize).max(2) & !1);
     let small = downscale(*w, *h, px, ow, oh);
-    let gray = |v: u8| Color::Rgb(v, v, v);
+    // contrast stretch (30%..97%) so text blocks stand out from the paper
+    let gray = |v: u8| {
+        let v = ((v as i32 - 77) * 255 / 170).clamp(0, 255) as u8;
+        Color::Rgb(v, v, v)
+    };
     let lines: Vec<Line> = (0..oh / 2)
         .map(|y| {
             let spans: Vec<Span> = (0..ow)
@@ -673,9 +775,9 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn popup(f: &mut Frame, height: u16) -> ratatui::layout::Rect {
+fn popup(f: &mut Frame, width: u16, height: u16) -> ratatui::layout::Rect {
     let a = f.area();
-    let w = a.width.saturating_sub(4).min(76);
+    let w = a.width.saturating_sub(4).min(width);
     let h = height.min(a.height);
     let area = ratatui::layout::Rect::new(a.x + (a.width - w) / 2, a.y + (a.height - h) / 2, w, h);
     f.render_widget(Clear, area);

@@ -186,9 +186,14 @@ pub fn discover() -> Vec<(String, String)> {
     found
 }
 
-fn to_ipp(uri: &str) -> Option<(String, String)> {
+/// ("ipp", "192.168.1.46") from "ipp://192.168.1.46/ipp/print".
+pub fn uri_host(uri: &str) -> Option<(&str, &str)> {
     let (scheme, rest) = uri.split_once("://")?;
-    let host = rest.split(['/', ':', '?']).next().filter(|h| !h.is_empty())?;
+    Some((scheme, rest.split(['/', ':', '?']).next().filter(|h| !h.is_empty())?))
+}
+
+fn to_ipp(uri: &str) -> Option<(String, String)> {
+    let (scheme, host) = uri_host(uri)?;
     let name = format!("printer_{}", host.replace(|c: char| !c.is_ascii_alphanumeric(), "_"));
     match scheme {
         "ipp" | "ipps" | "dnssd" => Some((name, uri.to_string())),
@@ -236,17 +241,34 @@ fn lines(s: &str) -> Vec<String> {
     s.split(['\n', '\0']).filter(|l| !l.is_empty()).map(String::from).collect()
 }
 
-pub const SCAN_MODES: [&str; 3] = ["Color", "Gray", "Lineart"];
+pub const SCAN_MODES: [&str; 2] = ["Color", "Gray"];
 pub const SCAN_DPI: [u32; 3] = [150, 300, 600];
 
-/// SANE scanners as (device, description), e.g. ("airscan:e0:HP ...", "eSCL HP Smart Tank 5100").
-pub fn scanners() -> Vec<(String, String)> {
-    run("scanimage", &["-f", "%d\t%v %m%n"])
+/// Scanners as (SANE device, description). Network printers already in CUPS are tried first
+/// as eSCL scanners by address, which is instant and reliable; SANE's own discovery (slow,
+/// finds USB scanners too) runs when `full` is set or nothing was found that way.
+pub fn scanners(full: bool) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = run("lpstat", &["-v"])
         .unwrap_or_default()
         .lines()
-        .filter_map(|l| l.split_once('\t'))
-        .map(|(d, v)| (d.to_string(), v.to_string()))
-        .collect()
+        .filter_map(|l| uri_host(l.rsplit(' ').next()?))
+        .filter(|(scheme, _)| ["ipp", "ipps", "socket", "lpd", "http", "https"].contains(scheme))
+        .filter_map(|(_, host)| {
+            let caps = run("curl", &["-sf", "-m", "2", &format!("http://{host}/eSCL/ScannerCapabilities")]).ok()?;
+            let model = caps.split("<pwg:MakeAndModel>").nth(1)?.split('<').next()?.to_string();
+            Some((format!("airscan:escl:{model}:http://{host}/eSCL"), model))
+        })
+        .collect();
+    if full || found.is_empty() {
+        let sane = run("scanimage", &["-f", "%d\t%v %m%n"]).unwrap_or_default();
+        for (d, v) in sane.lines().filter_map(|l| l.split_once('\t')) {
+            // the same device found by address already is the reliable entry
+            if !found.iter().any(|(_, model)| v.contains(model.as_str())) {
+                found.push((d.to_string(), v.to_string()));
+            }
+        }
+    }
+    found
 }
 
 /// Scans one page from the flatbed into a PNG.
@@ -258,7 +280,8 @@ pub fn scan(device: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String>
 /// Grayscale thumbnail of an image as (width, height, pixels), via ImageMagick.
 pub fn thumbnail(image: &str) -> Result<(usize, usize, Vec<u8>), String> {
     let pgm = format!("{image}.pgm");
-    run("magick", &[image, "-colorspace", "Gray", "-resize", "400x", &pgm])?;
+    // thicken text before shrinking, or it fades to near-white at terminal resolution
+    run("magick", &[image, "-colorspace", "Gray", "-morphology", "Erode", "Disk:2", "-resize", "400x", &pgm])?;
     let bytes = std::fs::read(&pgm).map_err(|e| e.to_string())?;
     parse_pgm(&bytes).ok_or_else(|| "Could not read the scan preview".into())
 }
@@ -297,16 +320,14 @@ pub fn downscale(w: usize, h: usize, px: &[u8], ow: usize, oh: usize) -> Vec<u8>
 }
 
 /// Saves scanned pages as one PDF, or as `out.png` / `out-1.png`, `out-2.png`... Returns the written paths.
-pub fn save_scans(pages: &[String], out: &str, pdf: bool, lineart: bool, dpi: u32) -> Result<Vec<String>, String> {
+pub fn save_scans(pages: &[String], out: &str, pdf: bool, dpi: u32) -> Result<Vec<String>, String> {
     if pdf {
         let path = format!("{out}.pdf");
         // the density sets the PDF page size (pixels / dpi), otherwise ImageMagick assumes 72 dpi
         let dpi = dpi.to_string();
         let mut args = vec!["-units", "PixelsPerInch", "-density", &dpi];
         args.extend(pages.iter().map(String::as_str));
-        if !lineart {
-            args.extend(["-compress", "jpeg", "-quality", "85"]);
-        }
+        args.extend(["-compress", "jpeg", "-quality", "85"]);
         args.push(&path);
         run("magick", &args)?;
         return Ok(vec![path]);
