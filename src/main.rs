@@ -15,13 +15,14 @@ use std::time::{Duration, Instant};
 /// Result of a background task, applied to the app on the UI thread.
 type Done = Box<dyn FnOnce(&mut App) + Send>;
 
-const LABELS: [&str; 11] = [
-    "Printer", "File", "Color", "Sides", "Back order", "Pages", "Paper", "Copies", "Per sheet", "", "",
+const LABELS: [&str; 12] = [
+    "Printer", "File", "Color", "Sides", "Back order", "Pages", "Paper", "Copies", "Per sheet", "", "", "",
 ];
 const FILE: usize = 1;
 const PAGES: usize = 5;
 const PRINT: usize = 9;
 const ADD: usize = 10;
+const QUEUE: usize = 11;
 
 const SCAN_LABELS: [&str; 9] = ["Scanner", "Mode", "Resolution", "Format", "Save as", "", "Page", "", ""];
 const SAVE_AS: usize = 4;
@@ -51,6 +52,8 @@ enum Mode {
     /// Manual duplex: `job` is the front job while it is still printing, `steps` the flip
     /// instructions shown after it, `back` the back-side job, `files[next..]` the files still to print.
     Flip { job: Option<String>, steps: String, back: Vec<String>, files: Vec<String>, next: usize },
+    /// Print queue popup: (job number, description), refreshed every second.
+    Queue(Vec<(String, String)>, ListState),
 }
 
 struct App {
@@ -72,13 +75,15 @@ struct App {
     scanner_pref: String,
     scan_mode: usize,
     scan_dpi: usize,
-    scan_pdf: bool,
+    scan_format: usize,
     save_as: String,
     scans: Vec<ScannedPage>,
     /// Page shown in the preview and edited by the Page row.
     cur: usize,
     /// Slow work (scanning, converting, discovery) runs in a thread so the UI keeps drawing.
     busy: Option<(String, mpsc::Receiver<Done>)>,
+    /// Page rotate/filter re-render, apart from `busy` so pages can be edited while the next one scans.
+    editing: Option<mpsc::Receiver<Done>>,
     /// Some(inside tmux) when the terminal speaks the kitty graphics protocol (kitty, Ghostty).
     graphics: Option<bool>,
     /// Size of the preview panel at the last draw, and the image sent to the terminal for it.
@@ -110,11 +115,12 @@ fn main() -> std::io::Result<()> {
         scanner_pref: String::new(),
         scan_mode: 0,
         scan_dpi: 1,
-        scan_pdf: true,
+        scan_format: 0,
         save_as: default_scan_name(),
         scans: Vec::new(),
         cur: 0,
         busy: None,
+        editing: None,
         graphics: kitty_graphics(),
         preview_area: Cell::default(),
         sent: None,
@@ -139,6 +145,7 @@ fn main() -> std::io::Result<()> {
         emit(&kitty(&format!("a=d,d=I,i={},q=2", image_id()), "", tmux));
     }
     ratatui::restore();
+    stop_all();
     res
 }
 
@@ -146,18 +153,13 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     // first key of vim `gg` / `dd`
     let mut pending: Option<char> = None;
     loop {
-        if let Some((_, rx)) = &app.busy {
-            match rx.try_recv() {
-                Ok(done) => {
-                    app.busy = None;
-                    done(app);
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    app.busy = None;
-                    app.status = "Error: the background task crashed".into();
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
+        if let Some(done) = app.busy.as_ref().and_then(|(_, rx)| finished(rx)) {
+            app.busy = None;
+            done(app);
+        }
+        if let Some(done) = app.editing.as_ref().and_then(finished) {
+            app.editing = None;
+            done(app);
         }
         if app.last_poll.elapsed() >= Duration::from_secs(1) {
             app.last_poll = Instant::now();
@@ -166,6 +168,9 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
             {
                 *job = None;
                 app.status = std::mem::take(steps);
+            }
+            if let Mode::Queue(jobs, _) = &mut app.mode {
+                *jobs = queue();
             }
         }
         term.draw(|f| draw(f, app))?;
@@ -195,6 +200,11 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
         }
         match &mut app.mode {
             Mode::Main => match k.code {
+                // H/L browse the scanned pages from any row
+                KeyCode::Char(c @ ('H' | 'L')) if app.scan_tab && !app.scans.is_empty() => {
+                    let n = app.scans.len();
+                    app.cur = (app.cur + if c == 'L' { 1 } else { n - 1 }) % n;
+                }
                 KeyCode::Char(c) if app.scan_tab && app.sel == PAGE && !app.scans.is_empty() && app.page_key(c, dd) => {}
                 KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
                 KeyCode::Up | KeyCode::Char('k') => app.sel = app.sel.checked_sub(1).unwrap_or(app.last()),
@@ -235,6 +245,10 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     }
                 }
                 KeyCode::Enter if app.sel == PAGES => app.open_pages(),
+                KeyCode::Enter if app.sel == QUEUE => {
+                    app.status = String::new();
+                    app.mode = Mode::Queue(queue(), ListState::default().with_selected(Some(0)));
+                }
                 KeyCode::Enter => app.try_print(),
                 _ => {}
             },
@@ -297,6 +311,23 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     _ => {}
                 }
             }
+            Mode::Queue(jobs, state) => match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Main,
+                KeyCode::Up | KeyCode::Char('k') => state.select_previous(),
+                KeyCode::Down | KeyCode::Char('j') => state.select_next(),
+                KeyCode::Char('g') if gg => state.select_first(),
+                KeyCode::Char('G') => state.select_last(),
+                KeyCode::Char('x') | KeyCode::Delete => {
+                    if let Some((id, desc)) = state.selected().and_then(|i| jobs.get(i)).cloned() {
+                        app.status = match cancel_job(&id) {
+                            Ok(()) => format!("Cancelled {desc}"),
+                            Err(e) => format!("Error: {e}"),
+                        };
+                        *jobs = queue();
+                    }
+                }
+                _ => {}
+            },
             Mode::Flip { job, .. } => match k.code {
                 KeyCode::Esc => {
                     app.status = "Back side cancelled.".into();
@@ -312,12 +343,25 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     }
 }
 
+/// Runs `work` in a thread; its returned closure updates the app when it finishes.
+fn task(work: impl FnOnce() -> Done + Send + 'static) -> mpsc::Receiver<Done> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || tx.send(work()));
+    rx
+}
+
+/// A background task's result once it is done; a crashed task reports an error.
+fn finished(rx: &mpsc::Receiver<Done>) -> Option<Done> {
+    match rx.try_recv() {
+        Ok(done) => Some(done),
+        Err(mpsc::TryRecvError::Disconnected) => Some(Box::new(|app: &mut App| app.status = "Error: the background task crashed".into())),
+        Err(mpsc::TryRecvError::Empty) => None,
+    }
+}
+
 impl App {
-    /// Runs `work` in a thread; its returned closure updates the app when it finishes.
     fn spawn(&mut self, msg: impl Into<String>, work: impl FnOnce() -> Done + Send + 'static) {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || tx.send(work()));
-        self.busy = Some((msg.into(), rx));
+        self.busy = Some((msg.into(), task(work)));
     }
 
     fn set_printers(&mut self, printers: Vec<String>) {
@@ -326,7 +370,7 @@ impl App {
     }
 
     fn last(&self) -> usize {
-        if self.scan_tab { DISCARD } else { ADD }
+        if self.scan_tab { DISCARD } else { QUEUE }
     }
 
     fn text(&mut self) -> Option<&mut String> {
@@ -347,7 +391,7 @@ impl App {
                 0 => self.scanner = step(self.scanner, self.scanners.as_ref().map_or(0, Vec::len)),
                 1 => self.scan_mode = step(self.scan_mode, SCAN_MODES.len()),
                 2 => self.scan_dpi = step(self.scan_dpi, SCAN_DPI.len()),
-                3 => self.scan_pdf = !self.scan_pdf,
+                3 => self.scan_format = step(self.scan_format, SCAN_FORMATS.len()),
                 PAGE => self.cur = step(self.cur, self.scans.len()),
                 _ => {}
             }
@@ -372,7 +416,11 @@ impl App {
                 0 => pick(self.scanners.as_ref().and_then(|l| l.get(self.scanner)).map_or("none", |(_, d)| d.as_str())),
                 1 => pick(SCAN_MODES[self.scan_mode]),
                 2 => pick(&format!("{} dpi", SCAN_DPI[self.scan_dpi])),
-                3 => pick(if self.scan_pdf { "PDF (all pages in one file)" } else { "PNG (one file per page)" }),
+                3 => pick(match SCAN_FORMATS[self.scan_format] {
+                    "PDF" => "PDF (all pages in one file)",
+                    "OCR" => "PDF, searchable text (OCR)",
+                    _ => "PNG (one file per page)",
+                }),
                 SAVE_AS => self.save_as.clone(),
                 SCAN => "[ Scan page ]".into(),
                 PAGE => match self.scans.get(self.cur) {
@@ -416,7 +464,8 @@ impl App {
             7 => pick(&self.copies.to_string()),
             8 => pick(&PER_SHEET[self.per_sheet].to_string()),
             PRINT => "[ Print ]".into(),
-            _ => "[ Add printer ]".into(),
+            ADD => "[ Add printer ]".into(),
+            _ => "[ Print queue ]".into(),
         }
     }
 
@@ -459,7 +508,7 @@ impl App {
             self.printers.get(self.printer).map_or("", String::as_str),
             self.color, self.duplex, self.reverse_back, PAPERS[self.paper], self.copies, PER_SHEET[self.per_sheet],
             self.scanners.as_ref().and_then(|l| l.get(self.scanner)).map_or(self.scanner_pref.as_str(), |(d, _)| d.as_str()),
-            SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi], if self.scan_pdf { "PDF" } else { "PNG" },
+            SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi], SCAN_FORMATS[self.scan_format],
         ))
     }
 
@@ -477,7 +526,7 @@ impl App {
             "scanner" => self.scanner_pref = v.to_string(),
             "scan_mode" => self.scan_mode = SCAN_MODES.iter().position(|m| *m == v).unwrap_or(self.scan_mode),
             "scan_dpi" => self.scan_dpi = SCAN_DPI.iter().position(|d| d.to_string() == v).unwrap_or(self.scan_dpi),
-            "scan_format" => self.scan_pdf = v != "PNG",
+            "scan_format" => self.scan_format = SCAN_FORMATS.iter().position(|f| *f == v).unwrap_or(self.scan_format),
             _ => {}
         }
     }
@@ -600,10 +649,6 @@ impl App {
     /// Page row keys; returns false for keys it does not use.
     fn page_key(&mut self, c: char, dd: bool) -> bool {
         let i = self.cur;
-        // a newer edit may replace a running one, but never a scan or a save
-        if matches!(c, 'r' | 'R' | 'f') && self.busy.as_ref().is_some_and(|(msg, _)| msg != "Editing page") {
-            return true;
-        }
         match c {
             'r' => self.scans[i].rot = (self.scans[i].rot + 90) % 360,
             'R' => self.scans[i].rot = (self.scans[i].rot + 270) % 360,
@@ -612,8 +657,8 @@ impl App {
                 self.scans[i].keep = !self.scans[i].keep;
                 return true;
             }
-            'H' | 'L' => {
-                let j = if c == 'H' { i.checked_sub(1) } else { Some(i + 1).filter(|j| *j < self.scans.len()) };
+            '<' | '>' => {
+                let j = if c == '<' { i.checked_sub(1) } else { Some(i + 1).filter(|j| *j < self.scans.len()) };
                 if let Some(j) = j {
                     self.scans.swap(i, j);
                     self.cur = j;
@@ -637,7 +682,8 @@ impl App {
     fn edit_page(&mut self) {
         let p = &self.scans[self.cur];
         let (orig, rot, filter) = (p.orig.clone(), p.rot, p.filter);
-        self.spawn("Editing page", move || {
+        // a newer edit replaces a running one: dropping the old receiver discards its result
+        self.editing = Some(task(move || {
             let res = edit_page(&orig, rot, filter);
             Box::new(move |app: &mut App| match res {
                 // the page may have moved meanwhile, and only the latest edit counts
@@ -649,7 +695,7 @@ impl App {
                 }
                 Err(e) => app.status = format!("Error: {e}"),
             })
-        });
+        }));
     }
 
     fn find_scanners(&mut self, full: bool) {
@@ -701,7 +747,7 @@ impl App {
                     Ok(thumb) => {
                         app.scans.push(ScannedPage { orig: path.clone(), file: path, rot: 0, filter: 0, keep: true, thumb });
                         app.cur = app.scans.len() - 1;
-                        format!("Scanned page {n}. Put the next page on the glass and scan again, or save.\nOn the Page row: r rotate, f filter, x keep, H/L move, dd delete.")
+                        format!("Scanned page {n}. Put the next page on the glass and scan again, or save.\nOn the Page row: r rotate, f filter, x keep, </> move, dd delete.\nH/L browse pages from any row.")
                     }
                     Err(e) => format!("Error: {e}"),
                 }
@@ -714,11 +760,14 @@ impl App {
         if files.is_empty() {
             return self.status = "Error: No pages to save".into();
         }
+        if self.editing.is_some() {
+            return self.status = "A page edit is still running, press Enter again in a moment.".into();
+        }
         let out = expand_home(self.save_as.trim());
         let out = out.trim_end_matches(".pdf").trim_end_matches(".png").to_string();
-        let (pdf, dpi) = (self.scan_pdf, SCAN_DPI[self.scan_dpi]);
+        let (format, dpi) = (SCAN_FORMATS[self.scan_format], SCAN_DPI[self.scan_dpi]);
         self.spawn("Saving", move || {
-            let res = save_scans(&files, &out, pdf, dpi);
+            let res = save_scans(&files, &out, format, dpi);
             Box::new(move |app: &mut App| {
                 app.status = match res {
                     Ok(written) => {
@@ -830,6 +879,7 @@ fn draw(f: &mut Frame, app: &App) {
     let tick = app.started.elapsed().as_millis() as usize;
     let text = match &app.busy {
         Some((msg, _)) => format!("{msg}... {}", ['|', '/', '-', '\\'][tick / 150 % 4]),
+        None if app.editing.is_some() => format!("Editing page... {}", ['|', '/', '-', '\\'][tick / 150 % 4]),
         // the duplex popup already shows the status
         None if matches!(app.mode, Mode::Flip { .. }) => String::new(),
         None => app.status.clone(),
@@ -838,7 +888,8 @@ fn draw(f: &mut Frame, app: &App) {
     f.render_widget(
         Line::from(match app.mode {
             Mode::Insert => " -- INSERT --   Esc/Enter done",
-            _ if app.sel == PAGE && app.scan_tab => " h/l page   H/L move   r/R rotate   f filter   x keep   dd delete",
+            _ if app.sel == PAGE && app.scan_tab => " H/L page   </> move   r/R rotate   f filter   x keep   dd delete",
+            _ if app.scan_tab && !app.scans.is_empty() => " j/k move   h/l change   H/L page   Enter select   Tab print/scan   q quit",
             _ if app.sel == PAGES && !app.scan_tab => " j/k move   Enter pick pages   i type a range (1-3,7)   q quit",
             _ => " j/k move   h/l change   i edit text   Enter select   Tab print/scan   q quit",
         })
@@ -865,6 +916,23 @@ fn draw(f: &mut Frame, app: &App) {
                 .block(Block::bordered().title(format!(" Pages {n}/{} (Space toggle, a all, Enter ok, Esc back) ", on.len())))
                 .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
             f.render_stateful_widget(list, area, &mut state.clone());
+        }
+        Mode::Queue(jobs, state) => {
+            let area = popup(f, 90, jobs.len().max(1) as u16 + 2);
+            let items: Vec<ListItem> = if jobs.is_empty() {
+                vec![ListItem::new(" No pending jobs")]
+            } else {
+                jobs.iter().map(|(id, desc)| ListItem::new(format!(" #{id}  {desc}"))).collect()
+            };
+            let list = List::new(items)
+                .block(Block::bordered().title(" Print queue (x cancel job, Esc back) ").title_bottom(format!(" {} ", app.status)))
+                .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+            // the list shrinks as jobs finish, keep the cursor on a row
+            let mut state = *state;
+            if state.selected().is_some_and(|i| i >= jobs.len()) {
+                state.select(jobs.len().checked_sub(1));
+            }
+            f.render_stateful_widget(list, area, &mut state);
         }
         Mode::Flip { job, .. } => {
             let area = popup(f, 100, 18);

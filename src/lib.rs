@@ -1,16 +1,29 @@
 //! Thin wrappers around the CUPS command line tools (lp, lpstat, lpinfo, lpadmin).
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
+
+/// Running child pids, and CUPS job ids / eSCL job urls this process started; `stop_all` ends them.
+static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static JOBS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 pub const PAPERS: [&str; 5] = ["A4", "Letter", "Legal", "A5", "A3"];
 /// Pages per sheet side (`number-up`).
 pub const PER_SHEET: [u32; 6] = [1, 2, 4, 6, 9, 16];
 
 fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(cmd)
+    let child = Command::new(cmd)
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("{cmd}: {e}"))?;
+    let pid = child.id();
+    CHILDREN.lock().unwrap().push(pid);
+    let out = child.wait_with_output();
+    CHILDREN.lock().unwrap().retain(|&p| p != pid);
+    let out = out.map_err(|e| format!("{cmd}: {e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
@@ -187,7 +200,30 @@ pub fn parse_config(text: &str) -> Vec<(&str, &str)> {
 /// Sends a job with `lp`, returns its "request id is ..." line.
 pub fn submit(args: &[String]) -> Result<String, String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    run("lp", &args)
+    let out = run("lp", &args)?;
+    if let Some(id) = job_id(&out) {
+        JOBS.lock().unwrap().push(id.to_string());
+    }
+    Ok(out)
+}
+
+/// On quit: cancels this session's unfinished print and scan jobs and kills running tools
+/// (their children first, e.g. LibreOffice's soffice.bin, so none are left orphaned).
+pub fn stop_all() {
+    let pids: Vec<String> = CHILDREN.lock().unwrap().iter().map(u32::to_string).collect();
+    if !pids.is_empty() {
+        let _ = Command::new("pkill").args(["-TERM", "-P", &pids.join(",")]).status();
+        let _ = Command::new("kill").arg("-TERM").args(&pids).status();
+    }
+    let jobs = std::mem::take(&mut *JOBS.lock().unwrap());
+    let (scans, prints): (Vec<String>, Vec<String>) = jobs.into_iter().partition(|j| j.starts_with("http"));
+    let prints: Vec<String> = prints.into_iter().filter(|id| job_active(id)).collect();
+    if !prints.is_empty() {
+        let _ = Command::new("cancel").args(&prints).stderr(Stdio::null()).status();
+    }
+    for job in scans {
+        let _ = Command::new("curl").args(["-sf", "-m", "2", "-X", "DELETE", &job]).stdout(Stdio::null()).status();
+    }
 }
 
 /// "request id is P-12 (1 file(s))" -> "P-12".
@@ -199,6 +235,27 @@ pub fn job_id(lp_out: &str) -> Option<&str> {
 pub fn job_active(id: &str) -> bool {
     run("lpstat", &["-W", "not-completed", "-o"])
         .is_ok_and(|s| s.lines().any(|l| l.split_whitespace().next() == Some(id)))
+}
+
+/// Unfinished jobs on all printers as (job number, "file  size  position") for the queue popup.
+pub fn queue() -> Vec<(String, String)> {
+    parse_lpq(&run("lpq", &["-a"]).unwrap_or_default())
+}
+
+/// `lpq -a` rows: "1st  spartak  8  my file.txt  1024 bytes" (the header and "no entries" are skipped).
+pub fn parse_lpq(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            let [rank, owner, job, ref file @ .., size, "bytes"] = w[..] else { return None };
+            job.parse::<u32>().ok()?;
+            Some((job.to_string(), format!("{}  ({owner}, {} KB, {rank})", file.join(" "), size.parse::<u64>().unwrap_or(0).div_ceil(1024))))
+        })
+        .collect()
+}
+
+pub fn cancel_job(id: &str) -> Result<(), String> {
+    run("cancel", &[id]).map(drop)
 }
 
 /// Network printers found by `lpinfo -v`, as (queue name, IPP uri) ready for `lpadmin -m everywhere`.
@@ -271,6 +328,8 @@ fn lines(s: &str) -> Vec<String> {
 
 pub const SCAN_MODES: [&str; 2] = ["Color", "Gray"];
 pub const SCAN_DPI: [u32; 3] = [150, 300, 600];
+/// Save formats: one PDF, one PDF with a text layer (tesseract OCR), or one PNG per page.
+pub const SCAN_FORMATS: [&str; 3] = ["PDF", "OCR", "PNG"];
 
 /// Scanners as (SANE device, description). Network printers already in CUPS are tried first
 /// as eSCL scanners by address, which is instant and reliable; SANE's own discovery (slow,
@@ -328,7 +387,8 @@ fn escl_scan(url: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
 </scan:ScanSettings>"#
     );
     let jobs = format!("{url}/ScanJobs");
-    let headers = run("curl", &["-sf", "-m", "30", "-D", "-", "-o", "/dev/null", "-H", "Content-Type: text/xml", "--data-binary", &settings, &jobs])
+    // right after a page the scanner answers 503 for a few seconds while the head returns
+    let headers = run("curl", &["-sf", "--retry", "15", "--retry-delay", "2", "-m", "30", "-D", "-", "-o", "/dev/null", "-H", "Content-Type: text/xml", "--data-binary", &settings, &jobs])
         .map_err(|e| format!("The scanner refused the scan job (busy?) {e}"))?;
     let job = headers
         .lines()
@@ -336,10 +396,11 @@ fn escl_scan(url: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
         .ok_or("The scanner did not return a scan job")?;
     // Location may be relative to the scanner ("/eSCL/ScanJobs/..."), keep scheme://host from the url
     let job = if job.starts_with('/') { format!("{}{job}", url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/")) } else { job.to_string() };
+    JOBS.lock().unwrap().push(job.clone());
     // the scanner answers 503 until the page is ready, --retry covers that
-    run("curl", &["-sf", "--retry", "30", "--retry-delay", "2", "-m", "600", "-o", out, &format!("{job}/NextDocument")])
-        .map(drop)
-        .map_err(|e| format!("Could not download the scanned page: {e}"))
+    let res = run("curl", &["-sf", "--retry", "30", "--retry-delay", "2", "-m", "600", "-o", out, &format!("{job}/NextDocument")]);
+    JOBS.lock().unwrap().retain(|j| *j != job);
+    res.map(drop).map_err(|e| format!("Could not download the scanned page: {e}"))
 }
 
 /// Grayscale thumbnail of an image as (width, height, pixels), via ImageMagick.
@@ -387,8 +448,11 @@ pub fn downscale(w: usize, h: usize, px: &[u8], ow: usize, oh: usize) -> Vec<u8>
 }
 
 /// Saves scanned pages as one PDF, or as `out.png` / `out-1.png`, `out-2.png`... Returns the written paths.
-pub fn save_scans(pages: &[String], out: &str, pdf: bool, dpi: u32) -> Result<Vec<String>, String> {
-    if pdf {
+pub fn save_scans(pages: &[String], out: &str, format: &str, dpi: u32) -> Result<Vec<String>, String> {
+    if format == "OCR" {
+        return ocr_pdf(pages, out, dpi);
+    }
+    if format == "PDF" {
         let path = format!("{out}.pdf");
         // the density sets the PDF page size (pixels / dpi), otherwise ImageMagick assumes 72 dpi
         let dpi = dpi.to_string();
@@ -407,6 +471,32 @@ pub fn save_scans(pages: &[String], out: &str, pdf: bool, dpi: u32) -> Result<Ve
         written.push(path);
     }
     Ok(written)
+}
+
+/// Searchable PDF: tesseract lays the recognised text invisibly over each page image.
+fn ocr_pdf(pages: &[String], out: &str, dpi: u32) -> Result<Vec<String>, String> {
+    let langs = run("tesseract", &["--list-langs"]).map_err(|_| "Searchable PDF needs tesseract (and tesseract-data-<language>)")?;
+    // ponytail: every installed language except osd; slower with many installed, add a picker then
+    let langs: Vec<&str> = langs.lines().skip(1).filter(|l| *l != "osd").collect();
+    let tmp = std::env::temp_dir().join(format!("printertui-ocr-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+    // JPEG copies keep the PDF small (tesseract embeds the images as they are), and a list file
+    // with one image per line makes tesseract write all pages into one PDF
+    let res = pages
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let jpg = tmp.join(format!("{i}.jpg")).to_string_lossy().into_owned();
+            run("magick", &[p, "-quality", "85", &jpg]).map(|_| jpg)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|jpgs| {
+            let list = tmp.join("pages.txt");
+            std::fs::write(&list, jpgs.join("\n")).map_err(|e| e.to_string())?;
+            run("tesseract", &[&list.to_string_lossy(), out, "--dpi", &dpi.to_string(), "-l", &langs.join("+"), "pdf"])
+        });
+    let _ = std::fs::remove_dir_all(&tmp);
+    res.map(|_| vec![format!("{out}.pdf")])
 }
 
 pub fn base64(data: &[u8]) -> String {
@@ -450,4 +540,44 @@ pub fn edit_page(orig: &str, rot: u16, filter: usize) -> Result<(String, (usize,
     };
     let thumb = thumbnail(&out)?;
     Ok((out, thumb))
+}
+
+#[test]
+fn lpq_rows() {
+    let out = "Rank    Owner   Job     File(s)                         Total Size\n\
+               active  ana     12      my report.pdf                   20480 bytes\n\
+               no entries";
+    assert_eq!(parse_lpq(out), [("12".to_string(), "my report.pdf  (ana, 20 KB, active)".to_string())]);
+}
+
+/// Tests that spawn tools run one at a time, since `stop_all` kills every running tool.
+#[cfg(test)]
+static SPAWNS: Mutex<()> = Mutex::new(());
+
+#[test]
+fn stop_all_kills_tools_and_their_children() {
+    let _one = SPAWNS.lock().unwrap_or_else(|e| e.into_inner());
+    let t = std::thread::spawn(|| run("sh", &["-c", "sleep 30 & wait"]));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let start = std::time::Instant::now();
+    stop_all();
+    let _ = t.join();
+    assert!(start.elapsed().as_secs() < 5);
+    assert!(Command::new("pgrep").args(["-f", "^sleep 30$"]).output().unwrap().stdout.is_empty());
+}
+
+#[test]
+fn ocr_pdf_has_text() {
+    let _one = SPAWNS.lock().unwrap_or_else(|e| e.into_inner());
+    if run("tesseract", &["--version"]).is_err() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("printertui-ocr-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (img, out) = (dir.join("p.png").to_string_lossy().into_owned(), dir.join("out").to_string_lossy().into_owned());
+    run("magick", &["-size", "1200x300", "xc:white", "-pointsize", "72", "-annotate", "+50+180", "Hello printer", &img]).unwrap();
+    let pdf = save_scans(&[img], &out, "OCR", 150).unwrap().remove(0);
+    let text = run("pdftotext", &[&pdf, "-"]).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(text.contains("Hello printer"), "{text}");
 }
