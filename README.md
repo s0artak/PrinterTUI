@@ -18,6 +18,12 @@ Uninstall:
 curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.sh | sh -s uninstall
 ```
 
+Development setup on Arch (dependencies, clone into `~/Development`, build):
+
+```sh
+git clone https://github.com/s0artak/PrinterTUI ~/Development/PrinterTUI && bash ~/Development/PrinterTUI/setup.sh
+```
+
 Optional: LibreOffice for non-PDF files (`libreoffice-fresh` / `brew install --cask libreoffice`), and SANE for scanners that are not part of a network printer (`sane sane-airscan` / `brew install sane-backends`). Network printers that can scan are used directly over AirScan (eSCL).
 
 ## Use
