@@ -522,7 +522,7 @@ fn searchable_pdf_text_layer() {
     std::fs::write(&pdf, images_to_pdf(&[img], 150, &[words]).unwrap()).unwrap();
     assert_eq!(page_count(&pdf.to_string_lossy()), Some(1));
     // pdftotext (poppler) reads the text back, when installed
-    if let Ok(text) = run("pdftotext", &[&pdf.to_string_lossy(), "-"]) {
+    if let Ok(text) = run("pdftotext", &["-enc", "UTF-8", &pdf.to_string_lossy(), "-"]) {
         assert!(text.contains("Hola") && text.contains("cañón"), "{text}");
     }
     std::fs::remove_dir_all(&dir).unwrap();
