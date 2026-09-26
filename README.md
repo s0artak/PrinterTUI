@@ -6,23 +6,25 @@ Terminal UI for Linux and macOS to print through CUPS and scan over AirScan or S
 
 ## Install
 
-Arch Linux or macOS (with [Homebrew](https://brew.sh)):
+Arch Linux or macOS (with [Homebrew](https://brew.sh)), one command and `printertui` is ready to run:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.sh | sh
 ```
 
-Uninstall:
+It asks for a language, offers the optional extras (LibreOffice, SANE, Tesseract) and checks the download against its SHA-256 before installing it to `/usr/local/bin` (`$(brew --prefix)/bin` on macOS), which is already on your PATH. Run it again to Update or Uninstall, or uninstall directly:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.sh | sh -s uninstall
 ```
 
-Development setup on Arch (dependencies, CUPS, clone into `~/Development`, build):
+Development setup on Arch (dependencies, CUPS, build, link the build as `printertui-dev` so an installed `printertui` is left alone):
 
 ```sh
-git clone https://github.com/s0artak/PrinterTUI ~/Development/PrinterTUI && bash ~/Development/PrinterTUI/setup.sh
+bash test/dev-setup-arch.sh
 ```
+
+`sh test/installer-preview.sh [fresh|jam|smudge]` plays the installer's menus and animations without changing anything.
 
 Optional: LibreOffice for non-PDF files (`libreoffice-fresh` / `brew install --cask libreoffice`), and SANE for scanners that are not part of a network printer (`sane sane-airscan` / `brew install sane-backends`). Network printers that can scan are used directly over AirScan (eSCL). For searchable PDFs (OCR) install Tesseract with the languages you scan (`tesseract tesseract-data-eng tesseract-data-spa` / `brew install tesseract tesseract-lang`).
 

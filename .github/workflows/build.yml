@@ -15,6 +15,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, name: printertui-linux-x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: printertui-linux-aarch64 }
           - { os: macos-latest, target: aarch64-apple-darwin, name: printertui-macos-aarch64 }
           - { os: macos-latest, target: x86_64-apple-darwin, name: printertui-macos-x86_64 }
     runs-on: ${{ matrix.os }}
@@ -23,10 +24,14 @@ jobs:
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
       - run: cp target/${{ matrix.target }}/release/printertui ${{ matrix.name }}
+      # install.sh refuses a binary that does not match this
+      - run: shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256
 
   release:
     if: startsWith(github.ref, 'refs/tags/')
