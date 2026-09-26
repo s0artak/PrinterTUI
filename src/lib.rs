@@ -39,6 +39,25 @@ pub fn page_count(file: &str) -> Option<u32> {
     run("qpdf", &["--show-npages", file]).ok()?.parse().ok()
 }
 
+/// Converts a document, text or image to PDF with LibreOffice, returns the PDF path.
+pub fn to_pdf(file: &str) -> Result<String, String> {
+    let dir = std::env::temp_dir().join("printertui");
+    let d = dir.to_str().ok_or("Bad temp dir")?;
+    let stem = std::path::Path::new(file).file_stem().ok_or("Bad file name")?;
+    let pdf = format!("{d}/{}.pdf", stem.to_string_lossy());
+    let _ = std::fs::remove_file(&pdf);
+    // own profile, so a running LibreOffice window does not swallow the conversion
+    let profile = format!("-env:UserInstallation=file://{d}/profile");
+    run("libreoffice", &[&profile, "--headless", "--convert-to", "pdf", "--outdir", d, file])
+        .map_err(|e| format!("Could not convert {file} to PDF (is libreoffice installed?): {e}"))?;
+    page_count(&pdf).map(|_| pdf).ok_or(format!("LibreOffice could not convert {file} to PDF"))
+}
+
+/// Paths in the File field are separated by ';'.
+pub fn split_files(field: &str) -> Vec<String> {
+    field.split(';').map(str::trim).filter(|f| !f.is_empty()).map(String::from).collect()
+}
+
 /// Expands "1-3,7,9-" into a sorted page list. Empty or "all" means every page.
 pub fn parse_ranges(spec: &str, total: u32) -> Result<Vec<u32>, String> {
     let spec = spec.trim();
@@ -108,6 +127,17 @@ pub fn submit(args: &[String]) -> Result<String, String> {
     run("lp", &args)
 }
 
+/// "request id is P-12 (1 file(s))" -> "P-12".
+pub fn job_id(lp_out: &str) -> Option<&str> {
+    lp_out.strip_prefix("request id is ")?.split_whitespace().next()
+}
+
+/// True while the job is still pending, held or printing.
+pub fn job_active(id: &str) -> bool {
+    run("lpstat", &["-W", "not-completed", "-o"])
+        .is_ok_and(|s| s.lines().any(|l| l.split_whitespace().next() == Some(id)))
+}
+
 /// Network printers found by `lpinfo -v`, as (queue name, IPP uri) ready for `lpadmin -m everywhere`.
 pub fn discover() -> Vec<(String, String)> {
     let mut found: Vec<(String, String)> = run("lpinfo", &["-v"])
@@ -143,24 +173,30 @@ pub fn add_printer(name: &str, uri: &str) -> Result<(), String> {
     if ok { Ok(()) } else { Err(format!("lpadmin failed for {uri}")) }
 }
 
-/// Opens the first installed terminal file manager as a picker. Needs the terminal in normal mode.
-pub fn pick_file() -> Option<String> {
+/// Opens the first installed terminal file manager as a picker, returns the selected files.
+/// Needs the terminal in normal mode.
+pub fn pick_files() -> Vec<String> {
     let out = std::env::temp_dir().join(format!("printertui-pick-{}", std::process::id()));
-    let o = out.to_str()?;
+    let o = out.to_str().unwrap_or_default();
     let pickers: [(&str, Vec<String>); 4] = [
         ("yazi", vec![format!("--chooser-file={o}")]),
         ("lf", vec!["-selection-path".into(), o.into()]),
-        ("ranger", vec![format!("--choosefile={o}")]),
+        ("ranger", vec![format!("--choosefiles={o}")]),
         ("nnn", vec!["-p".into(), o.into()]),
     ];
     for (cmd, args) in pickers {
         if Command::new(cmd).args(&args).status().is_ok() {
-            let picked = std::fs::read_to_string(&out).ok();
+            let picked = std::fs::read_to_string(&out).unwrap_or_default();
             let _ = std::fs::remove_file(&out);
-            return picked?.lines().next().map(str::to_string).filter(|s| !s.is_empty());
+            return lines(&picked);
         }
     }
-    // fzf draws on the tty and prints the choice on stdout
-    let out = Command::new("fzf").stdout(std::process::Stdio::piped()).output().ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty())
+    // fzf draws on the tty and prints the choices on stdout
+    Command::new("fzf").arg("-m").stdout(std::process::Stdio::piped()).output()
+        .map_or(Vec::new(), |out| lines(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// One path per line (nnn may separate them with NUL).
+fn lines(s: &str) -> Vec<String> {
+    s.split(['\n', '\0']).filter(|l| !l.is_empty()).map(String::from).collect()
 }
