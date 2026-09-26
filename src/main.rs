@@ -1,6 +1,6 @@
 use printertui::*;
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -47,6 +47,8 @@ enum Mode {
     /// Editing the selected text field (vim-style, entered with `i`).
     Insert,
     Pick(Vec<(String, String)>, ListState),
+    /// Typing a printer's address when none were found on the network.
+    Address(String),
     /// Page selector: one checkbox per page of the first file.
     Pages(Vec<bool>, ListState),
     /// Manual duplex: `job` is the front job while it is still printing, `steps` the flip
@@ -84,10 +86,13 @@ struct App {
     busy: Option<(String, mpsc::Receiver<Done>)>,
     /// Page rotate/filter re-render, apart from `busy` so pages can be edited while the next one scans.
     editing: Option<mpsc::Receiver<Done>>,
-    /// Some(inside tmux) when the terminal speaks the kitty graphics protocol (kitty, Ghostty).
-    graphics: Option<bool>,
+    /// Graphics protocol supported by the terminal: Kitty, Sixel, or None.
+    graphics: Graphics,
     /// Size of the preview panel at the last draw, and the image sent to the terminal for it.
     preview_area: Cell<ratatui::layout::Rect>,
+    /// Where the form and the open popup were drawn, to map mouse clicks to rows.
+    form_area: Cell<ratatui::layout::Rect>,
+    popup_area: Cell<ratatui::layout::Rect>,
     sent: Option<(String, u16, u16)>,
     started: Instant,
     last_poll: Instant,
@@ -109,7 +114,7 @@ fn main() -> std::io::Result<()> {
         paper: 0,
         copies: 1,
         per_sheet: 0,
-        scan_tab: false,
+        scan_tab: std::env::args().any(|a| a == "--scan"),
         scanners: None,
         scanner: 0,
         scanner_pref: String::new(),
@@ -121,8 +126,10 @@ fn main() -> std::io::Result<()> {
         cur: 0,
         busy: None,
         editing: None,
-        graphics: kitty_graphics(),
+        graphics: detect_graphics(),
         preview_area: Cell::default(),
+        form_area: Cell::default(),
+        popup_area: Cell::default(),
         sent: None,
         started: Instant::now(),
         last_poll: Instant::now(),
@@ -139,14 +146,55 @@ fn main() -> std::io::Result<()> {
     if app.printers.is_empty() {
         app.status = "No printers configured. Select [ Add printer ].".into();
     }
-    let mut term = ratatui::init();
+    // If launched with --scan, preload the most recent scanned page for preview testing
+    if app.scan_tab {
+        let dir = std::env::temp_dir().join("printertui-scan");
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            let mut paths: Vec<_> = rd
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name();
+                    let s = n.to_string_lossy();
+                    s.starts_with("page-") && !s.ends_with(".preview.png")
+                })
+                .collect();
+            paths.sort_by_key(|e| e.file_name());
+            if let Some(entry) = paths.last() {
+                let path = entry.path().to_string_lossy().into_owned();
+                if let Ok(thumb) = thumbnail(&path) {
+                    app.scans.push(ScannedPage { orig: path.clone(), file: path, rot: 0, filter: 0, keep: true, thumb });
+                    app.status = "Loaded last scanned page.".into();
+                }
+            }
+        }
+    }
+
+    let mut term = init();
     let res = run(&mut term, &mut app);
-    if let (Some(tmux), Some(_)) = (app.graphics, &app.sent) {
+    if let (Graphics::Kitty(tmux), Some(_)) = (app.graphics, &app.sent) {
         emit(&kitty(&format!("a=d,d=I,i={},q=2", image_id()), "", tmux));
     }
-    ratatui::restore();
+    restore();
     stop_all();
     res
+}
+
+/// Mouse clicks on Windows, where people expect them; elsewhere the terminal keeps its own text selection.
+const MOUSE: bool = cfg!(windows);
+
+fn init() -> DefaultTerminal {
+    let term = ratatui::init();
+    if MOUSE {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::EnableMouseCapture);
+    }
+    term
+}
+
+fn restore() {
+    if MOUSE {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::DisableMouseCapture);
+    }
+    ratatui::restore();
 }
 
 fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
@@ -173,172 +221,186 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                 *jobs = queue();
             }
         }
+        POPUP.set(Default::default());
         term.draw(|f| draw(f, app))?;
+        app.popup_area.set(POPUP.get());
         app.sync_image();
         // short timeout keeps the spinner and the duplex animation moving
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
-        let Event::Key(k) = event::read()? else { continue };
-        if k.kind != KeyEventKind::Press {
-            continue;
-        }
-        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
-            return Ok(());
-        }
-        // vim `gg`: a second `g` right after the first
-        if app.busy.is_some() && k.code == KeyCode::Enter {
-            continue;
-        }
-        let prev = pending.take();
-        let (gg, dd) = (prev == Some('g') && k.code == KeyCode::Char('g'), prev == Some('d') && k.code == KeyCode::Char('d'));
-        if let KeyCode::Char(c @ ('g' | 'd')) = k.code
-            && prev != Some(c)
-            && !matches!(app.mode, Mode::Insert)
-        {
-            pending = Some(c);
-        }
-        match &mut app.mode {
-            Mode::Main => match k.code {
-                // H/L browse the scanned pages from any row
-                KeyCode::Char(c @ ('H' | 'L')) if app.scan_tab && !app.scans.is_empty() => {
-                    let n = app.scans.len();
-                    app.cur = (app.cur + if c == 'L' { 1 } else { n - 1 }) % n;
-                }
-                KeyCode::Char(c) if app.scan_tab && app.sel == PAGE && !app.scans.is_empty() && app.page_key(c, dd) => {}
-                KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
-                KeyCode::Up | KeyCode::Char('k') => app.sel = app.sel.checked_sub(1).unwrap_or(app.last()),
-                KeyCode::Down | KeyCode::Char('j') => app.sel = (app.sel + 1) % (app.last() + 1),
-                KeyCode::Char('g') if gg => app.sel = 0,
-                KeyCode::Char('G') => app.sel = app.last(),
-                KeyCode::Tab | KeyCode::BackTab => {
-                    app.scan_tab = !app.scan_tab;
-                    app.sel = 0;
-                    app.status = String::new();
-                    if app.scan_tab && app.scanners.is_none() {
-                        app.find_scanners(false);
+        // a mouse click becomes the keys it stands for
+        let keys = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => vec![k],
+            Event::Mouse(m) => app.mouse(m),
+            _ => continue,
+        };
+        for k in keys {
+            if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                return Ok(());
+            }
+            // vim `gg`: a second `g` right after the first
+            if app.busy.is_some() && k.code == KeyCode::Enter {
+                continue;
+            }
+            let prev = pending.take();
+            let (gg, dd) = (prev == Some('g') && k.code == KeyCode::Char('g'), prev == Some('d') && k.code == KeyCode::Char('d'));
+            if let KeyCode::Char(c @ ('g' | 'd')) = k.code
+                && prev != Some(c)
+                && !matches!(app.mode, Mode::Insert)
+            {
+                pending = Some(c);
+            }
+            match &mut app.mode {
+                Mode::Main => match k.code {
+                    // H/L browse the scanned pages from any row
+                    KeyCode::Char(c @ ('H' | 'L')) if app.scan_tab && !app.scans.is_empty() => {
+                        let n = app.scans.len();
+                        app.cur = (app.cur + if c == 'L' { 1 } else { n - 1 }) % n;
                     }
-                }
-                KeyCode::Left | KeyCode::Char('h') => app.cycle(false),
-                KeyCode::Right | KeyCode::Char('l') => app.cycle(true),
-                KeyCode::Char('i') | KeyCode::Char('a') if app.text().is_some() => app.mode = Mode::Insert,
-                KeyCode::Enter if app.scan_tab => app.scan_enter(),
-                KeyCode::Enter if app.sel == ADD => app.spawn("Searching for network printers", || {
-                    let found = discover();
-                    Box::new(move |app: &mut App| {
-                        if found.is_empty() {
-                            app.status = "No network printers found.".into();
-                        } else {
-                            app.status = String::new();
-                            app.mode = Mode::Pick(found, ListState::default().with_selected(Some(0)));
+                    KeyCode::Char(c) if app.scan_tab && app.sel == PAGE && !app.scans.is_empty() && app.page_key(c, dd) => {}
+                    KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Up | KeyCode::Char('k') => app.sel = app.sel.checked_sub(1).unwrap_or(app.last()),
+                    KeyCode::Down | KeyCode::Char('j') => app.sel = (app.sel + 1) % (app.last() + 1),
+                    KeyCode::Char('g') if gg => app.sel = 0,
+                    KeyCode::Char('G') => app.sel = app.last(),
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        app.scan_tab = !app.scan_tab;
+                        app.sent = None;
+                        app.sel = 0;
+                        app.status = String::new();
+                        if app.scan_tab && app.scanners.is_none() {
+                            app.find_scanners(false);
                         }
-                    })
-                }),
-                KeyCode::Enter if app.sel == FILE => {
-                    ratatui::restore();
-                    let picked = pick_files();
-                    *term = ratatui::init();
-                    if picked.is_empty() {
-                        app.status = format!("No file picked ({PICK_HINT}).");
-                    } else {
-                        app.file = picked.join("; ");
                     }
-                }
-                KeyCode::Enter if app.sel == PAGES => app.open_pages(),
-                KeyCode::Enter if app.sel == QUEUE => {
-                    app.status = String::new();
-                    app.mode = Mode::Queue(queue(), ListState::default().with_selected(Some(0)));
-                }
-                KeyCode::Enter => app.try_print(),
-                _ => {}
-            },
-            Mode::Insert => match k.code {
-                KeyCode::Esc | KeyCode::Enter => app.mode = Mode::Main,
-                KeyCode::Backspace => {
-                    app.text().map(String::pop);
-                }
-                KeyCode::Char(c) => {
-                    if let Some(t) = app.text() {
-                        t.push(c)
+                    KeyCode::Left | KeyCode::Char('h') => app.cycle(false),
+                    KeyCode::Right | KeyCode::Char('l') => app.cycle(true),
+                    KeyCode::Char('i') | KeyCode::Char('a') if app.text().is_some() => app.mode = Mode::Insert,
+                    KeyCode::Enter if app.scan_tab => app.scan_enter(),
+                    KeyCode::Enter if app.sel == ADD => app.spawn("Searching for network printers", || {
+                        let found = discover();
+                        Box::new(move |app: &mut App| {
+                            if found.is_empty() {
+                                app.status = "No network printers found.".into();
+                                app.mode = Mode::Address(String::new());
+                            } else {
+                                app.status = String::new();
+                                app.mode = Mode::Pick(found, ListState::default().with_selected(Some(0)));
+                            }
+                        })
+                    }),
+                    KeyCode::Enter if app.sel == FILE => {
+                        restore();
+                        let picked = pick_files();
+                        *term = init();
+                        if picked.is_empty() {
+                            app.status = format!("No file picked ({PICK_HINT}).");
+                        } else {
+                            app.file = picked.join("; ");
+                        }
                     }
-                }
-                _ => {}
-            },
-            Mode::Pick(found, state) => match k.code {
-                KeyCode::Esc => app.mode = Mode::Main,
-                KeyCode::Up | KeyCode::Char('k') => state.select_previous(),
-                KeyCode::Down | KeyCode::Char('j') => state.select_next(),
-                KeyCode::Char('g') if gg => state.select_first(),
-                KeyCode::Char('G') => state.select_last(),
-                KeyCode::Enter => {
-                    let (name, uri) = found[state.selected().unwrap_or(0)].clone();
-                    ratatui::restore();
-                    println!("Adding {name} ({uri}), {ADD_PRINTER_NOTE}...");
-                    let res = add_printer(&name, &uri);
-                    *term = ratatui::init();
-                    app.status = match res {
-                        Ok(()) => format!("Added printer {name}."),
-                        Err(e) => e,
-                    };
-                    app.set_printers(printers());
-                    app.printer = app.printers.iter().position(|p| *p == name).unwrap_or(0);
-                    app.mode = Mode::Main;
-                }
-                _ => {}
-            },
-            Mode::Pages(on, state) => {
-                let i = state.selected().unwrap_or(0);
-                match k.code {
+                    KeyCode::Enter if app.sel == PAGES => app.open_pages(),
+                    KeyCode::Enter if app.sel == QUEUE => {
+                        app.status = String::new();
+                        app.mode = Mode::Queue(queue(), ListState::default().with_selected(Some(0)));
+                    }
+                    KeyCode::Enter => app.try_print(),
+                    _ => {}
+                },
+                Mode::Insert => match k.code {
+                    KeyCode::Esc | KeyCode::Enter => app.mode = Mode::Main,
+                    KeyCode::Backspace => {
+                        app.text().map(String::pop);
+                    }
+                    KeyCode::Char(c) => {
+                        if let Some(t) = app.text() {
+                            t.push(c)
+                        }
+                    }
+                    _ => {}
+                },
+                Mode::Pick(found, state) => match k.code {
                     KeyCode::Esc => app.mode = Mode::Main,
                     KeyCode::Up | KeyCode::Char('k') => state.select_previous(),
                     KeyCode::Down | KeyCode::Char('j') => state.select_next(),
                     KeyCode::Char('g') if gg => state.select_first(),
                     KeyCode::Char('G') => state.select_last(),
-                    KeyCode::Char(' ') | KeyCode::Char('x') => on[i] = !on[i],
-                    KeyCode::Char('a') => {
-                        let all = on.iter().all(|b| *b);
-                        on.iter_mut().for_each(|b| *b = !all);
-                    }
+                    KeyCode::Char('a') => app.mode = Mode::Address(String::new()),
                     KeyCode::Enter => {
-                        let picked: Vec<u32> = (1..).zip(on.iter()).filter(|(_, b)| **b).map(|(n, _)| n).collect();
-                        if picked.is_empty() {
-                            app.status = "Select at least one page.".into();
-                        } else {
-                            app.pages = if picked.len() == on.len() { String::new() } else { join(&picked) };
-                            app.mode = Mode::Main;
+                        let (name, uri) = found[state.selected().unwrap_or(0)].clone();
+                        app.add(term, &name, &uri);
+                    }
+                    _ => {}
+                },
+                Mode::Address(addr) => match k.code {
+                    KeyCode::Esc => app.mode = Mode::Main,
+                    KeyCode::Backspace => {
+                        addr.pop();
+                    }
+                    KeyCode::Char(c) => addr.push(c),
+                    KeyCode::Enter if !addr.trim().is_empty() => {
+                        let addr = addr.trim().to_string();
+                        // a bare IP or name gets the standard IPP Everywhere path; a full uri is used as is
+                        let uri = if addr.contains("://") { addr.clone() } else { format!("ipp://{addr}/ipp/print") };
+                        let host = uri_host(&uri).map_or(addr.clone(), |(_, h)| h.to_string());
+                        app.add(term, &queue_name(&host), &uri);
+                    }
+                    _ => {}
+                },
+                Mode::Pages(on, state) => {
+                    let i = state.selected().unwrap_or(0);
+                    match k.code {
+                        KeyCode::Esc => app.mode = Mode::Main,
+                        KeyCode::Up | KeyCode::Char('k') => state.select_previous(),
+                        KeyCode::Down | KeyCode::Char('j') => state.select_next(),
+                        KeyCode::Char('g') if gg => state.select_first(),
+                        KeyCode::Char('G') => state.select_last(),
+                        KeyCode::Char(' ') | KeyCode::Char('x') => on[i] = !on[i],
+                        KeyCode::Char('a') => {
+                            let all = on.iter().all(|b| *b);
+                            on.iter_mut().for_each(|b| *b = !all);
+                        }
+                        KeyCode::Enter => {
+                            let picked: Vec<u32> = (1..).zip(on.iter()).filter(|(_, b)| **b).map(|(n, _)| n).collect();
+                            if picked.is_empty() {
+                                app.status = "Select at least one page.".into();
+                            } else {
+                                app.pages = if picked.len() == on.len() { String::new() } else { join(&picked) };
+                                app.mode = Mode::Main;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Mode::Queue(jobs, state) => match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Main,
+                    KeyCode::Up | KeyCode::Char('k') => state.select_previous(),
+                    KeyCode::Down | KeyCode::Char('j') => state.select_next(),
+                    KeyCode::Char('g') if gg => state.select_first(),
+                    KeyCode::Char('G') => state.select_last(),
+                    KeyCode::Char('x') | KeyCode::Delete => {
+                        if let Some((id, desc)) = state.selected().and_then(|i| jobs.get(i)).cloned() {
+                            app.status = match cancel_job(&id) {
+                                Ok(()) => format!("Cancelled {desc}"),
+                                Err(e) => format!("Error: {e}"),
+                            };
+                            *jobs = queue();
                         }
                     }
                     _ => {}
-                }
-            }
-            Mode::Queue(jobs, state) => match k.code {
-                KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Main,
-                KeyCode::Up | KeyCode::Char('k') => state.select_previous(),
-                KeyCode::Down | KeyCode::Char('j') => state.select_next(),
-                KeyCode::Char('g') if gg => state.select_first(),
-                KeyCode::Char('G') => state.select_last(),
-                KeyCode::Char('x') | KeyCode::Delete => {
-                    if let Some((id, desc)) = state.selected().and_then(|i| jobs.get(i)).cloned() {
-                        app.status = match cancel_job(&id) {
-                            Ok(()) => format!("Cancelled {desc}"),
-                            Err(e) => format!("Error: {e}"),
-                        };
-                        *jobs = queue();
+                },
+                Mode::Flip { job, .. } => match k.code {
+                    KeyCode::Esc => {
+                        app.status = "Back side cancelled.".into();
+                        app.mode = Mode::Main;
                     }
-                }
-                _ => {}
-            },
-            Mode::Flip { job, .. } => match k.code {
-                KeyCode::Esc => {
-                    app.status = "Back side cancelled.".into();
-                    app.mode = Mode::Main;
-                }
-                KeyCode::Enter if job.is_none() => {
-                    let res = app.back_side();
-                    app.show(res);
-                }
-                _ => {}
-            },
+                    KeyCode::Enter if job.is_none() => {
+                        let res = app.back_side();
+                        app.show(res);
+                    }
+                    _ => {}
+                },
+            }
         }
     }
 }
@@ -362,6 +424,79 @@ fn finished(rx: &mpsc::Receiver<Done>) -> Option<Done> {
 impl App {
     fn spawn(&mut self, msg: impl Into<String>, work: impl FnOnce() -> Done + Send + 'static) {
         self.busy = Some((msg.into(), task(work)));
+    }
+
+    /// The keys a mouse event stands for: a click selects a row (or popup item), a click on `<` / `>`
+    /// changes the value, a click on a button, File or Pages (or on the selected popup item) opens it,
+    /// and the wheel moves up and down.
+    fn mouse(&mut self, m: MouseEvent) -> Vec<KeyEvent> {
+        let key = |code| vec![KeyEvent::new(code, KeyModifiers::NONE)];
+        match m.kind {
+            MouseEventKind::ScrollUp => return key(KeyCode::Up),
+            MouseEventKind::ScrollDown => return key(KeyCode::Down),
+            MouseEventKind::Down(MouseButton::Left) => {}
+            _ => return Vec::new(),
+        }
+        let (x, y) = (m.column, m.row);
+        let popup = self.popup_area.get();
+        let item = (popup.contains((x, y).into()) && y > popup.y).then(|| (y - popup.y - 1) as usize);
+        match &mut self.mode {
+            Mode::Pick(list, state) | Mode::Queue(list, state) => {
+                let Some(i) = item.filter(|i| *i < list.len()) else { return Vec::new() };
+                let again = state.selected() == Some(i);
+                state.select(Some(i));
+                // a second click adds the printer; jobs are only cancelled with x
+                return if again && matches!(self.mode, Mode::Pick(..)) { key(KeyCode::Enter) } else { Vec::new() };
+            }
+            Mode::Pages(on, state) => {
+                let Some(i) = item.filter(|i| *i < on.len()) else { return Vec::new() };
+                state.select(Some(i));
+                return key(KeyCode::Char(' '));
+            }
+            Mode::Flip { .. } => return key(KeyCode::Enter),
+            Mode::Insert | Mode::Address(_) => return Vec::new(),
+            Mode::Main => {}
+        }
+        let form = self.form_area.get();
+        // the tabs in the title: " PrinterTUI  " then " Print " and " Scan "
+        if y == form.y {
+            let tab = x.checked_sub(form.x + 14).map(|c| c < 7);
+            return match tab {
+                Some(print) if print == self.scan_tab => key(KeyCode::Tab),
+                _ => Vec::new(),
+            };
+        }
+        let rows = if self.scan_tab { SCAN_LABELS.len() } else { LABELS.len() };
+        let Some(row) = y.checked_sub(form.y + 1).map(usize::from).filter(|r| *r < rows && form.contains((x, y).into())) else {
+            return Vec::new();
+        };
+        self.sel = row;
+        // each row is " {label:<12}{value}"
+        let value = self.value(row);
+        let Some(c) = x.checked_sub(form.x + 14).and_then(|i| value.chars().nth(i as usize)) else { return Vec::new() };
+        match c {
+            '<' => key(KeyCode::Left),
+            '>' => key(KeyCode::Right),
+            _ if value.starts_with('[') => key(KeyCode::Enter),
+            _ if !self.scan_tab && (row == FILE || row == PAGES) => key(KeyCode::Enter),
+            '[' | 'x' | ']' if self.scan_tab && row == PAGE => key(KeyCode::Char('x')),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Adds a network printer; the terminal is in normal mode meanwhile, for the password / UAC prompt.
+    fn add(&mut self, term: &mut DefaultTerminal, name: &str, uri: &str) {
+        restore();
+        println!("Adding {name} ({uri}), {ADD_PRINTER_NOTE}...");
+        let res = add_printer(name, uri);
+        *term = init();
+        self.status = match res {
+            Ok(()) => format!("Added printer {name}."),
+            Err(e) => e,
+        };
+        self.set_printers(printers());
+        self.printer = self.printers.iter().position(|p| p == name).unwrap_or(0);
+        self.mode = Mode::Main;
     }
 
     fn set_printers(&mut self, printers: Vec<String>) {
@@ -629,16 +764,56 @@ impl App {
 }
 
 impl App {
-    /// Sends the last scanned page to a kitty-protocol terminal as a virtual placement the size
-    /// of the preview panel; draw_preview shows it by writing Unicode placeholder cells.
+    /// Sends the scanned page preview to the terminal using Kitty graphics or Sixel protocol.
     fn sync_image(&mut self) {
-        let Some(tmux) = self.graphics else { return };
-        let area = self.preview_area.get();
-        let want = self.preview_png().map(|p| (p, area.width, area.height));
-        if want.is_some() && want != self.sent && area.width > 0 {
-            let (png, c, r) = want.clone().unwrap_or_default();
-            emit(&kitty(&format!("a=T,U=1,f=100,t=f,i={},q=2,c={c},r={r}", image_id()), &base64(png.as_bytes()), tmux));
-            self.sent = want;
+        match self.graphics {
+            Graphics::Kitty(tmux) => {
+                let area = self.preview_area.get();
+                let want = self.preview_png().map(|p| (p, area.width, area.height));
+                if want.is_some() && want != self.sent && area.width > 0 {
+                    let (png, c, r) = want.clone().unwrap_or_default();
+                    emit(&kitty(&format!("a=T,U=1,f=100,t=f,i={},q=2,c={c},r={r}", image_id()), &base64(png.as_bytes()), tmux));
+                    self.sent = want;
+                }
+            }
+            Graphics::Sixel => {
+                if !self.scan_tab {
+                    self.sent = None;
+                    return;
+                }
+                let area = self.preview_area.get();
+                let Some(page) = self.scans.get(self.cur) else {
+                    self.sent = None;
+                    return;
+                };
+                let want = Some((page.file.clone(), area.width, area.height));
+                if want != self.sent && area.width > 0 && area.height > 0 {
+                    let (w, h, px) = &page.thumb;
+                    let max_w = (area.width as usize).saturating_sub(1) * 10;
+                    let max_h = (area.height as usize) * 18;
+                    if max_w > 0 && max_h > 0 && *w > 0 && *h > 0 {
+                        let scale = (max_w as f32 / *w as f32).min(max_h as f32 / *h as f32);
+                        let ow = ((*w as f32 * scale) as usize).clamp(10, max_w);
+                        let oh = (((((*h as f32 * scale) as usize) + 5) / 6 * 6).max(6)).min(max_h / 6 * 6);
+                        if ow > 0 && oh > 0 {
+                            let small = downscale(*w, *h, px, ow, oh);
+                            let sixel = sixel_encode(ow, oh, &small);
+                            let mut buf = String::new();
+                            for r in 0..area.height {
+                                buf.push_str(&format!("\x1b[{};{}H{:w$}", area.y + 1 + r, area.x + 1, " ", w = area.width as usize));
+                            }
+                            let cols_used = ((ow as f32 / 10.0).ceil() as u16).min(area.width);
+                            let offset_x = (area.width.saturating_sub(cols_used)) / 2;
+                            let x = area.x + 1 + offset_x;
+                            let y = area.y + 1;
+                            buf.push_str(&format!("\x1b[{y};{x}H{sixel}\x1b[?25l"));
+                            emit(&buf);
+                        }
+                    }
+                    self.sent = want;
+                }
+            }
+            Graphics::None => {}
         }
     }
 
@@ -798,18 +973,58 @@ fn image_id() -> u32 {
 /// Row numbers for kitty Unicode placeholders (the first 100 of kitty's rowcolumn-diacritics.txt).
 const ROW_DIACRITICS: &str = "\u{0305}\u{030D}\u{030E}\u{0310}\u{0312}\u{033D}\u{033E}\u{033F}\u{0346}\u{034A}\u{034B}\u{034C}\u{0350}\u{0351}\u{0352}\u{0357}\u{035B}\u{0363}\u{0364}\u{0365}\u{0366}\u{0367}\u{0368}\u{0369}\u{036A}\u{036B}\u{036C}\u{036D}\u{036E}\u{036F}\u{0483}\u{0484}\u{0485}\u{0486}\u{0487}\u{0592}\u{0593}\u{0594}\u{0595}\u{0597}\u{0598}\u{0599}\u{059C}\u{059D}\u{059E}\u{059F}\u{05A0}\u{05A1}\u{05A8}\u{05A9}\u{05AB}\u{05AC}\u{05AF}\u{05C4}\u{0610}\u{0611}\u{0612}\u{0613}\u{0614}\u{0615}\u{0616}\u{0617}\u{0657}\u{0658}\u{0659}\u{065A}\u{065B}\u{065D}\u{065E}\u{06D6}\u{06D7}\u{06D8}\u{06D9}\u{06DA}\u{06DB}\u{06DC}\u{06DF}\u{06E0}\u{06E1}\u{06E2}\u{06E4}\u{06E7}\u{06E8}\u{06EB}\u{06EC}\u{0730}\u{0732}\u{0733}\u{0735}\u{0736}\u{073A}\u{073D}\u{073F}\u{0740}\u{0741}\u{0743}\u{0745}\u{0747}\u{0749}\u{074A}";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Graphics {
+    None,
+    Kitty(bool),
+    Sixel,
+}
+
 /// Kitty graphics protocol support: kitty and Ghostty, directly or through tmux when
 /// `allow-passthrough` is on. Returns Some(inside tmux).
 fn kitty_graphics() -> Option<bool> {
     let var = |k| std::env::var(k).unwrap_or_default();
-    let known = |term: &str| term.contains("kitty") || term.contains("ghostty");
+    let known = |term: &str| {
+        let t = term.to_ascii_lowercase();
+        t.contains("kitty") || t.contains("ghostty")
+    };
     if std::env::var_os("TMUX").is_some() {
         let tmux = |args: &[&str]| std::process::Command::new("tmux").args(args).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
         let outer = tmux(&["display", "-p", "#{client_termname}"]).unwrap_or_default();
         let passthrough = tmux(&["show", "-gv", "allow-passthrough"]).unwrap_or_default();
         return (known(&outer) && (passthrough == "on" || passthrough == "all")).then_some(true);
     }
-    (known(&var("TERM")) || var("TERM_PROGRAM") == "ghostty" || !var("KITTY_WINDOW_ID").is_empty()).then_some(false)
+    (known(&var("TERM")) || known(&var("TERM_PROGRAM")) || !var("KITTY_WINDOW_ID").is_empty()).then_some(false)
+}
+
+fn detect_graphics() -> Graphics {
+    let var = |k| std::env::var(k).unwrap_or_default().to_ascii_lowercase();
+    let pref = var("PRINTERTUI_GRAPHICS");
+    if pref == "sixel" {
+        return Graphics::Sixel;
+    }
+    if pref == "kitty" {
+        return Graphics::Kitty(std::env::var_os("TMUX").is_some());
+    }
+    if pref == "none" {
+        return Graphics::None;
+    }
+    if let Some(tmux) = kitty_graphics() {
+        return Graphics::Kitty(tmux);
+    }
+    let term = var("TERM");
+    let prog = var("TERM_PROGRAM");
+    if std::env::var_os("WT_SESSION").is_some()
+        || std::env::var_os("WT_PROFILE_ID").is_some()
+        || term.contains("sixel")
+        || term.contains("foot")
+        || prog.contains("mintty")
+        || prog.contains("contour")
+        || prog.contains("wezterm")
+    {
+        return Graphics::Sixel;
+    }
+    Graphics::None
 }
 
 /// `~/Documents/scan-2026-09-26_154200` (or in `~` when there is no Documents folder).
@@ -839,7 +1054,8 @@ fn tilde(p: &str) -> String {
 /// `~/x` (or `~\x`) to the full path in the home folder.
 fn expand_home(p: &str) -> String {
     match (p.strip_prefix("~/").or(p.strip_prefix("~\\")), std::env::home_dir()) {
-        (Some(rest), Some(home)) => home.join(rest).to_string_lossy().into_owned(),
+        // one kind of separator on Windows: ~/Documents/x -> C:\\Users\\me\\Documents\\x
+        (Some(rest), Some(home)) => home.join(rest.replace('/', std::path::MAIN_SEPARATOR_STR)).to_string_lossy().into_owned(),
         _ => p.to_string(),
     }
 }
@@ -872,6 +1088,7 @@ fn draw(f: &mut Frame, app: &App) {
     };
     let title = Line::from(vec![Span::raw(" PrinterTUI  "), tab("Print", !app.scan_tab), tab("Scan", app.scan_tab), Span::raw(" ")]);
     f.render_widget(Paragraph::new(lines).block(Block::bordered().title(title)), form);
+    app.form_area.set(form);
     if let Some(area) = preview {
         draw_preview(f, app, area);
     }
@@ -888,6 +1105,7 @@ fn draw(f: &mut Frame, app: &App) {
     f.render_widget(
         Line::from(match app.mode {
             Mode::Insert => " -- INSERT --   Esc/Enter done",
+            Mode::Address(_) => " Type the printer's IP address or name   Enter add   Esc cancel",
             _ if app.sel == PAGE && app.scan_tab => " H/L page   </> move   r/R rotate   f filter   x keep   dd delete",
             _ if app.scan_tab && !app.scans.is_empty() => " j/k move   h/l change   H/L page   Enter select   Tab print/scan   q quit",
             _ if app.sel == PAGES && !app.scan_tab => " j/k move   Enter pick pages   i type a range (1-3,7)   q quit",
@@ -899,11 +1117,16 @@ fn draw(f: &mut Frame, app: &App) {
 
     match &app.mode {
         Mode::Main | Mode::Insert => {}
+        Mode::Address(addr) => {
+            let area = popup(f, 76, 4);
+            let text = vec![Line::from(format!(" Address: {addr}_")), Line::from(" e.g. 192.168.1.46 or printer.local").style(Style::new().add_modifier(Modifier::DIM))];
+            f.render_widget(Paragraph::new(text).block(Block::bordered().title(" Add printer by address ")), area);
+        }
         Mode::Pick(found, state) => {
             let area = popup(f, 76, found.len() as u16 + 2);
             let items: Vec<ListItem> = found.iter().map(|(n, u)| ListItem::new(format!("{n}  {u}"))).collect();
             let list = List::new(items)
-                .block(Block::bordered().title(" Add printer (Enter add, Esc back) "))
+                .block(Block::bordered().title(" Add printer (Enter add, a type an address, Esc back) "))
                 .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
             f.render_stateful_widget(list, area, &mut state.clone());
         }
@@ -998,21 +1221,33 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.preview_area.set(inner);
-    if app.graphics.is_some() {
-        // placeholder cells: U+10EEEE, the row as a diacritic on the first cell (the terminal infers
-        // the columns), and the image id as the foreground color
-        let want = app.preview_png().map(|p| (p, inner.width, inner.height));
-        if want.is_some() && want == app.sent {
-            let id = image_id();
-            let color = Color::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8);
-            for (row, diacritic) in (0..inner.height).zip(ROW_DIACRITICS.chars()) {
-                for col in 0..inner.width {
-                    let symbol = if col == 0 { format!("\u{10EEEE}{diacritic}") } else { "\u{10EEEE}".into() };
-                    f.buffer_mut()[(inner.x + col, inner.y + row)].set_symbol(&symbol).set_fg(color);
+    if app.scans.get(app.cur).is_none() {
+        return;
+    }
+    match app.graphics {
+        Graphics::Kitty(_) => {
+            // placeholder cells: U+10EEEE, the row as a diacritic on the first cell (the terminal infers
+            // the columns), and the image id as the foreground color
+            let want = app.preview_png().map(|p| (p, inner.width, inner.height));
+            if want.is_some() && want == app.sent {
+                let id = image_id();
+                let color = Color::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8);
+                for (row, diacritic) in (0..inner.height).zip(ROW_DIACRITICS.chars()) {
+                    for col in 0..inner.width {
+                        let symbol = if col == 0 { format!("\u{10EEEE}{diacritic}") } else { "\u{10EEEE}".into() };
+                        f.buffer_mut()[(inner.x + col, inner.y + row)].set_symbol(&symbol).set_fg(color);
+                    }
                 }
             }
+            return;
         }
-        return;
+        Graphics::Sixel => {
+            // Sixel images are drawn directly by sync_image() at the preview coordinates.
+            // Leaving the inner cells empty in Ratatui's buffer ensures Ratatui diffing
+            // never overwrites them on subsequent redraws.
+            return;
+        }
+        Graphics::None => {}
     }
     let Some((w, h, px)) = app.scans.get(app.cur).map(|p| &p.thumb) else { return };
     let (cols, rows) = (inner.width as usize, inner.height as usize * 2);
@@ -1035,11 +1270,17 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+thread_local! {
+    /// The last popup drawn, copied into App::popup_area after each draw.
+    static POPUP: Cell<ratatui::layout::Rect> = Cell::default();
+}
+
 fn popup(f: &mut Frame, width: u16, height: u16) -> ratatui::layout::Rect {
     let a = f.area();
     let w = a.width.saturating_sub(4).min(width);
     let h = height.min(a.height);
     let area = ratatui::layout::Rect::new(a.x + (a.width - w) / 2, a.y + (a.height - h) / 2, w, h);
     f.render_widget(Clear, area);
+    POPUP.set(area);
     area
 }

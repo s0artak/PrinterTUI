@@ -168,6 +168,11 @@ pub fn job_id(lp_out: &str) -> Option<&str> {
     lp_out.strip_prefix("request id is ")?.split_whitespace().next()
 }
 
+/// Printer name for a network printer at `host`: printer_192_168_1_46.
+pub fn queue_name(host: &str) -> String {
+    format!("printer_{}", host.replace(|c: char| !c.is_ascii_alphanumeric(), "_"))
+}
+
 /// ("ipp", "192.168.1.46") from "ipp://192.168.1.46/ipp/print".
 pub fn uri_host(uri: &str) -> Option<(&str, &str)> {
     let (scheme, rest) = uri.split_once("://")?;
@@ -454,6 +459,73 @@ pub fn kitty(control: &str, payload: &str, tmux: bool) -> String {
     if tmux { format!("\x1bPtmux;{}\x1b\\", cmd.replace('\x1b', "\x1b\x1b")) } else { cmd }
 }
 
+/// Encodes an 8-bit grayscale image buffer into a Sixel escape sequence (16 gray levels with run-length encoding).
+pub fn sixel_encode(w: usize, h: usize, px: &[u8]) -> String {
+    if w == 0 || h == 0 || px.len() < w * h {
+        return String::new();
+    }
+    let mut out = format!("\x1bPq\"1;1;{w};{h}");
+    for i in 0..16 {
+        let pct = i * 100 / 15;
+        out.push_str(&format!("#{i};2;{pct};{pct};{pct}"));
+    }
+    for y in (0..h).step_by(6) {
+        let band_h = (h - y).min(6);
+        let mut used = [false; 16];
+        for dy in 0..band_h {
+            let row = (y + dy) * w;
+            for x in 0..w {
+                used[(px[row + x] >> 4) as usize] = true;
+            }
+        }
+        for (color, &is_used) in used.iter().enumerate() {
+            if !is_used {
+                continue;
+            }
+            out.push_str(&format!("#{color}"));
+            let mut last_char = None;
+            let mut count = 0;
+            for x in 0..w {
+                let mut mask = 0u8;
+                for dy in 0..band_h {
+                    if (px[(y + dy) * w + x] >> 4) == color as u8 {
+                        mask |= 1 << dy;
+                    }
+                }
+                let ch = (0x3F + mask) as char;
+                if last_char == Some(ch) {
+                    count += 1;
+                } else {
+                    if let Some(c) = last_char {
+                        if count > 3 {
+                            out.push_str(&format!("!{count}{c}"));
+                        } else {
+                            for _ in 0..count {
+                                out.push(c);
+                            }
+                        }
+                    }
+                    last_char = Some(ch);
+                    count = 1;
+                }
+            }
+            if let Some(c) = last_char {
+                if count > 3 {
+                    out.push_str(&format!("!{count}{c}"));
+                } else {
+                    for _ in 0..count {
+                        out.push(c);
+                    }
+                }
+            }
+            out.push('$');
+        }
+        out.push('-');
+    }
+    out.push_str("\x1b\\");
+    out
+}
+
 pub const FILTERS: [&str; 3] = ["Original", "Gray", "B&W"];
 
 /// Rotates (degrees clockwise) and filters a scanned page, always starting from the original scan.
@@ -526,4 +598,13 @@ fn searchable_pdf_text_layer() {
         assert!(text.contains("Hola") && text.contains("cañón"), "{text}");
     }
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_sixel_encode() {
+    let px = vec![0u8; 12 * 12];
+    let six = sixel_encode(12, 12, &px);
+    assert!(six.starts_with("\x1bPq\"1;1;12;12"));
+    assert!(six.ends_with("\x1b\\"));
+    assert!(six.contains("#0"));
 }

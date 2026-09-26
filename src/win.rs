@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Devices::Enumeration::DeviceInformation;
+use windows::Win32::Devices::DeviceAndDriverInstallation::*;
+use windows::Win32::Devices::Properties::DEVPROPTYPE;
+use windows::Win32::Foundation::DEVPROPKEY;
 use windows::Devices::Scanners::{ImageScanner, ImageScannerColorMode, ImageScannerFormat, ImageScannerResolution, ImageScannerScanSource};
 use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Ocr::OcrEngine;
@@ -113,18 +116,63 @@ pub fn printer_labels(queues: &[String]) -> Vec<String> {
 
 /// Hosts of the installed network printers, to try as eSCL scanners.
 pub fn printer_hosts() -> Vec<String> {
-    installed().iter().filter_map(|(_, port, _)| port_host(port)).collect()
+    let mut hosts: Vec<String> = installed().iter().filter_map(|(_, port, _)| port_host(port)).collect();
+    hosts.extend(ipp_urls().iter().filter_map(|u| uri_host(u)).map(|(_, host)| host.to_string()));
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// URLs of the printers Windows added over IPP (Add-Printer -IppURL, or found on the network):
+/// their port is just "WSD-<id>", the URL is a property of their SWD\IPP\... device.
+fn ipp_urls() -> Vec<String> {
+    // the printer URI property, {A35996AB-11CF-4935-8B61-A6761081ECDF} 12 in Get-PnpDeviceProperty
+    const URI: DEVPROPKEY = DEVPROPKEY { fmtid: windows::core::GUID::from_u128(0xa35996ab_11cf_4935_8b61_a6761081ecdf), pid: 12 };
+    let filter = wide("SWD");
+    let flags = CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT;
+    let mut len = 0;
+    if unsafe { CM_Get_Device_ID_List_SizeW(&mut len, PCWSTR(filter.as_ptr()), flags) } != CR_SUCCESS {
+        return Vec::new();
+    }
+    let mut ids = vec![0u16; len as usize];
+    if unsafe { CM_Get_Device_ID_ListW(PCWSTR(filter.as_ptr()), &mut ids, flags) } != CR_SUCCESS {
+        return Vec::new();
+    }
+    ids.split(|&c| c == 0)
+        .filter(|id| String::from_utf16_lossy(id).to_ascii_uppercase().starts_with("SWD\\IPP\\"))
+        .filter_map(|id| {
+            let id: Vec<u16> = id.iter().copied().chain([0]).collect();
+            let mut node = 0;
+            let mut buf = [0u16; 512];
+            let mut size = (buf.len() * 2) as u32;
+            let mut kind = DEVPROPTYPE::default();
+            unsafe {
+                if CM_Locate_DevNodeW(&mut node, PCWSTR(id.as_ptr()), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS
+                    || CM_Get_DevNode_PropertyW(node, &URI, &mut kind, Some(buf.as_mut_ptr().cast()), &mut size, 0) != CR_SUCCESS
+                {
+                    return None;
+                }
+            }
+            Some(String::from_utf16_lossy(&buf[..size as usize / 2]).trim_end_matches('\0').to_string())
+        })
+        .collect()
 }
 
 /// pdfium.dll, embedded at build time (see build.rs) and unpacked next to the settings on first use.
-fn pdfium() -> Result<Pdfium, String> {
+/// It can only be loaded once per process, so every print shares it.
+fn pdfium() -> Result<&'static Pdfium, String> {
+    static PDFIUM: std::sync::OnceLock<Pdfium> = std::sync::OnceLock::new();
+    if let Some(p) = PDFIUM.get() {
+        return Ok(p);
+    }
     const DLL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pdfium.dll"));
     let dir = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join("printertui");
     let path = dir.join("pdfium-7881.dll");
     if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(DLL.len() as u64) {
         std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, DLL)).map_err(|e| format!("{}: {e}", path.display()))?;
     }
-    Ok(Pdfium::new(Pdfium::bind_to_library(&path).map_err(|e| format!("pdfium: {e}"))?))
+    let bindings = Pdfium::bind_to_library(&path).map_err(|e| format!("pdfium: {e}"))?;
+    Ok(PDFIUM.get_or_init(|| Pdfium::new(bindings)))
 }
 
 /// Pages per sheet side as (columns, rows).

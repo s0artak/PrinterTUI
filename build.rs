@@ -17,6 +17,9 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    println!("cargo::rerun-if-changed=assets/printertui.rc");
+    println!("cargo::rerun-if-changed=assets/printertui.ico");
+    let _ = embed_resource::compile("assets/printertui.rc", embed_resource::NONE);
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let dll = out.join("pdfium.dll");
     if let Ok(local) = std::env::var("PDFIUM_DLL") {

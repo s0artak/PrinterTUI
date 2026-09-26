@@ -1,7 +1,7 @@
 # PrinterTUI installer for Windows 10/11.
 #   irm https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.ps1 | iex
 # Asks for a language, then Install the first time, Update or Uninstall afterwards, and offers
-# LibreOffice. Installs for this user only (no administrator), on the PATH and in the Start menu.
+# LibreOffice and a desktop shortcut. Installs for this user only (no administrator), on the PATH and in the Start menu.
 # $env:PRINTERTUI_PREVIEW = 'fresh' | 'installed' | 'jam' | 'smudge' plays the menus and animations
 # without changing anything (see test/installer-preview.ps1).
 # Runs through `iex` in the user's own PowerShell: never `exit`, it would close their window.
@@ -19,6 +19,8 @@ $dir = Join-Path $base 'Programs\PrinterTUI'
 $exe = Join-Path $dir 'printertui.exe'
 $startMenu = [Environment]::GetFolderPath('Programs')
 $shortcut = if ($startMenu) { Join-Path $startMenu 'PrinterTUI.lnk' } else { 'PrinterTUI.lnk' }
+$desktop = [Environment]::GetFolderPath('Desktop')
+$desktopLink = if ($desktop) { Join-Path $desktop 'PrinterTUI.lnk' } else { 'Desktop\PrinterTUI.lnk' }
 # menus and animations only when a person is watching
 $tty = -not [Console]::IsOutputRedirected -and -not [Console]::IsInputRedirected
 
@@ -78,6 +80,7 @@ $Langs = [ordered]@{
         extras_inst = 'Installing the extras'
         left_win = 'Your printers were left as they are.'
         start = 'Also in the Start menu: PrinterTUI'
+        desktop = 'Desktop shortcut for PrinterTUI'
     }
     zh = @{
         name = '🇨🇳 中文'
@@ -106,6 +109,7 @@ $Langs = [ordered]@{
         extras_inst = '正在安装附加组件'
         left_win = '你的打印机保持原样。'
         start = '开始菜单里也有：PrinterTUI'
+        desktop = '在桌面创建 PrinterTUI 快捷方式'
     }
     hi = @{
         name = '🇮🇳 हिन्दी'
@@ -134,6 +138,7 @@ $Langs = [ordered]@{
         extras_inst = 'अतिरिक्त चीज़ें इंस्टॉल हो रही हैं'
         left_win = 'आपके प्रिंटर जैसे थे वैसे ही हैं।'
         start = 'स्टार्ट मेनू में भी: PrinterTUI'
+        desktop = 'डेस्कटॉप पर PrinterTUI का शॉर्टकट'
     }
     es = @{
         name = '🇪🇸 Español'
@@ -162,6 +167,7 @@ $Langs = [ordered]@{
         extras_inst = 'Instalando los extras'
         left_win = 'Tus impresoras se quedan como estaban.'
         start = 'También en el menú Inicio: PrinterTUI'
+        desktop = 'Acceso directo a PrinterTUI en el escritorio'
     }
     ar = @{
         name = '🇸🇦 العربية'
@@ -190,6 +196,7 @@ $Langs = [ordered]@{
         extras_inst = 'جارٍ تثبيت الإضافات'
         left_win = 'بقيت طابعاتك كما هي.'
         start = 'موجود أيضاً في قائمة ابدأ: PrinterTUI'
+        desktop = 'اختصار PrinterTUI على سطح المكتب'
     }
     fr = @{
         name = '🇫🇷 Français'
@@ -218,6 +225,7 @@ $Langs = [ordered]@{
         extras_inst = 'Installation des extras'
         left_win = 'Vos imprimantes restent telles quelles.'
         start = 'Aussi dans le menu Démarrer : PrinterTUI'
+        desktop = 'Raccourci PrinterTUI sur le bureau'
     }
     bn = @{
         name = '🇧🇩 বাংলা'
@@ -246,6 +254,7 @@ $Langs = [ordered]@{
         extras_inst = 'বাড়তি জিনিস ইনস্টল হচ্ছে'
         left_win = 'আপনার প্রিন্টার যেমন ছিল তেমনই আছে।'
         start = 'স্টার্ট মেনুতেও আছে: PrinterTUI'
+        desktop = 'ডেস্কটপে PrinterTUI-এর শর্টকাট'
     }
     pt = @{
         name = '🇧🇷 Português'
@@ -274,6 +283,7 @@ $Langs = [ordered]@{
         extras_inst = 'Instalando os extras'
         left_win = 'Suas impressoras ficaram como estavam.'
         start = 'Também no menu Iniciar: PrinterTUI'
+        desktop = 'Atalho do PrinterTUI na área de trabalho'
     }
     ru = @{
         name = '🇷🇺 Русский'
@@ -302,6 +312,7 @@ $Langs = [ordered]@{
         extras_inst = 'Устанавливаю дополнения'
         left_win = 'Ваши принтеры остались как были.'
         start = 'Также в меню «Пуск»: PrinterTUI'
+        desktop = 'Ярлык PrinterTUI на рабочем столе'
     }
     id = @{
         name = '🇮🇩 Bahasa Indonesia'
@@ -330,6 +341,7 @@ $Langs = [ordered]@{
         extras_inst = 'Memasang tambahan'
         left_win = 'Printermu tetap seperti semula.'
         start = 'Juga ada di menu Start: PrinterTUI'
+        desktop = 'Pintasan PrinterTUI di desktop'
     }
 }
 
@@ -486,8 +498,16 @@ function Get-Soffice {
     return $false
 }
 
+function New-Shortcut([string]$path) {
+    $link = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
+    $link.TargetPath = $exe
+    $link.IconLocation = "$exe,0"
+    $link.WorkingDirectory = [Environment]::GetFolderPath('MyDocuments')
+    $link.Save()
+}
+
 # Downloads the exe and its checksum while the printer prints: $true when installed
-function Install-PrinterTUI([bool]$libreoffice) {
+function Install-PrinterTUI([bool]$libreoffice, [bool]$onDesktop) {
     if ($libreoffice) {
         Say $T.extras_inst
         Step 'winget install TheDocumentFoundation.LibreOffice' {
@@ -495,7 +515,9 @@ function Install-PrinterTUI([bool]$libreoffice) {
         }
     }
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
-    $url = "https://github.com/$repo/releases/latest/download/printertui-windows-$arch.exe"
+    # $env:PRINTERTUI_DOWNLOAD points at another folder of release files, for testing a build
+    $from = if ($env:PRINTERTUI_DOWNLOAD) { $env:PRINTERTUI_DOWNLOAD } else { "https://github.com/$repo/releases/latest/download" }
+    $url = "$from/printertui-windows-$arch.exe"
     $tmp = Join-Path ([IO.Path]::GetTempPath()) "printertui-$PID.exe"
     Say "$($T.download) (windows $arch)"
     if ($preview) {
@@ -535,21 +557,17 @@ function Install-PrinterTUI([bool]$libreoffice) {
         if ($path -notcontains $dir) { [Environment]::SetEnvironmentVariable('Path', (($path + $dir) -join ';'), 'User') }
         if (($env:Path -split ';') -notcontains $dir) { $env:Path += ";$dir" }
     }
-    Step $shortcut {
-        $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
-        $link.TargetPath = $exe
-        $link.WorkingDirectory = [Environment]::GetFolderPath('MyDocuments')
-        $link.Save()
-    }
+    Step $shortcut { New-Shortcut $shortcut }
+    if ($onDesktop) { Step $desktopLink { New-Shortcut $desktopLink } }
     return $true
 }
 
 function Uninstall-PrinterTUI {
     Say $T.rm_cmd
-    Step "remove $dir, $shortcut, PATH" {
+    Step "remove $dir, $shortcut, $desktopLink, PATH" {
         Get-Process printertui -ErrorAction SilentlyContinue | Stop-Process -Force
         Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
-        Remove-Item $shortcut -ErrorAction SilentlyContinue
+        Remove-Item $shortcut, $desktopLink -ErrorAction SilentlyContinue
         $path = [Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ -and $_ -ne $dir }
         [Environment]::SetEnvironmentVariable('Path', ($path -join ';'), 'User')
     }
@@ -572,6 +590,7 @@ $T = $Langs[$codes[$lang]]
 try {
     $action = if ($installed) { 'update' } else { 'install' }
     $libreoffice = $false
+    $onDesktop = $true
     if ($tty) {
         W "`n  $E[1mPrinterTUI$E[0m`n`n"
         $lang = Menu @($codes | ForEach-Object { $Langs[$_].name }) $lang
@@ -589,8 +608,10 @@ try {
         }
         if ($action -eq 'install' -or $action -eq 'update') {
             Talk $T.extras
-            $marks = [bool[]]@(Get-Soffice)
-            if ((Menu @($T.lo) 0 $marks) -lt 0) { $action = 'quit' } else { $libreoffice = $marks[0] -and -not (Get-Soffice) }
+            # LibreOffice starts marked when it is already there, the desktop shortcut always
+            $marks = [bool[]]@((Get-Soffice), $true)
+            if ((Menu @($T.lo, $T.desktop) 0 $marks) -lt 0) { $action = 'quit' }
+            else { $libreoffice = $marks[0] -and -not (Get-Soffice); $onDesktop = $marks[1] }
         }
         W "`n"
     }
@@ -602,7 +623,7 @@ try {
             Say $T.left_win
         }
         default {
-            if (Install-PrinterTUI $libreoffice) {
+            if (Install-PrinterTUI $libreoffice $onDesktop) {
                 Talk $T.done
                 Say $T.start
             }

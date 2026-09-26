@@ -105,7 +105,7 @@ pub fn discover() -> Vec<(String, String)> {
 
 fn to_ipp(uri: &str) -> Option<(String, String)> {
     let (scheme, host) = uri_host(uri)?;
-    let name = format!("printer_{}", host.replace(|c: char| !c.is_ascii_alphanumeric(), "_"));
+    let name = queue_name(host);
     match scheme {
         "ipp" | "ipps" | "dnssd" => Some((name, uri.to_string())),
         // ponytail: assumes the standard IPP Everywhere path; edit the queue with lpadmin if a printer differs
