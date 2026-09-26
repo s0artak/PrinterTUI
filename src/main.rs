@@ -2,8 +2,8 @@ use printertui::*;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout},
-    style::{Modifier, Style},
-    text::Line,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
     DefaultTerminal, Frame,
 };
@@ -15,6 +15,12 @@ const FILE: usize = 1;
 const PAGES: usize = 5;
 const PRINT: usize = 9;
 const ADD: usize = 10;
+
+const SCAN_LABELS: [&str; 8] = ["Scanner", "Mode", "Resolution", "Format", "Save as", "", "", ""];
+const SAVE_AS: usize = 4;
+const SCAN: usize = 5;
+const SAVE: usize = 6;
+const DISCARD: usize = 7;
 
 enum Mode {
     Main,
@@ -39,6 +45,17 @@ struct App {
     paper: usize,
     copies: u32,
     per_sheet: usize,
+    scan_tab: bool,
+    /// None until the Scan tab is first opened (discovery takes a few seconds).
+    scanners: Option<Vec<(String, String)>>,
+    scanner: usize,
+    scanner_pref: String,
+    scan_mode: usize,
+    scan_dpi: usize,
+    scan_pdf: bool,
+    save_as: String,
+    scans: Vec<String>,
+    thumb: Option<(usize, usize, Vec<u8>)>,
     sel: usize,
     status: String,
     mode: Mode,
@@ -56,6 +73,16 @@ fn main() -> std::io::Result<()> {
         paper: 0,
         copies: 1,
         per_sheet: 0,
+        scan_tab: false,
+        scanners: None,
+        scanner: 0,
+        scanner_pref: String::new(),
+        scan_mode: 0,
+        scan_dpi: 1,
+        scan_pdf: true,
+        save_as: default_scan_name(),
+        scans: Vec::new(),
+        thumb: None,
         sel: 0,
         status: String::new(),
         mode: Mode::Main,
@@ -100,13 +127,22 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
         match &mut app.mode {
             Mode::Main => match k.code {
                 KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
-                KeyCode::Up | KeyCode::Char('k') => app.sel = app.sel.checked_sub(1).unwrap_or(ADD),
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => app.sel = (app.sel + 1) % (ADD + 1),
+                KeyCode::Up | KeyCode::Char('k') => app.sel = app.sel.checked_sub(1).unwrap_or(app.last()),
+                KeyCode::Down | KeyCode::Char('j') => app.sel = (app.sel + 1) % (app.last() + 1),
                 KeyCode::Char('g') if gg => app.sel = 0,
-                KeyCode::Char('G') => app.sel = ADD,
+                KeyCode::Char('G') => app.sel = app.last(),
+                KeyCode::Tab | KeyCode::BackTab => {
+                    app.scan_tab = !app.scan_tab;
+                    app.sel = 0;
+                    app.status = String::new();
+                    if app.scan_tab && app.scanners.is_none() {
+                        app.find_scanners(term);
+                    }
+                }
                 KeyCode::Left | KeyCode::Char('h') => app.cycle(false),
                 KeyCode::Right | KeyCode::Char('l') => app.cycle(true),
                 KeyCode::Char('i') | KeyCode::Char('a') if app.text().is_some() => app.mode = Mode::Insert,
+                KeyCode::Enter if app.scan_tab => app.scan_enter(term),
                 KeyCode::Enter if app.sel == ADD => {
                     app.status = "Searching for network printers...".into();
                     term.draw(|f| draw(f, app))?;
@@ -219,7 +255,14 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
 }
 
 impl App {
+    fn last(&self) -> usize {
+        if self.scan_tab { DISCARD } else { ADD }
+    }
+
     fn text(&mut self) -> Option<&mut String> {
+        if self.scan_tab {
+            return (self.sel == SAVE_AS).then_some(&mut self.save_as);
+        }
         match self.sel {
             FILE => Some(&mut self.file),
             PAGES => Some(&mut self.pages),
@@ -229,6 +272,16 @@ impl App {
 
     fn cycle(&mut self, fwd: bool) {
         let step = |i: usize, n: usize| if n == 0 { 0 } else if fwd { (i + 1) % n } else { (i + n - 1) % n };
+        if self.scan_tab {
+            match self.sel {
+                0 => self.scanner = step(self.scanner, self.scanners.as_ref().map_or(0, Vec::len)),
+                1 => self.scan_mode = step(self.scan_mode, SCAN_MODES.len()),
+                2 => self.scan_dpi = step(self.scan_dpi, SCAN_DPI.len()),
+                3 => self.scan_pdf = !self.scan_pdf,
+                _ => {}
+            }
+            return;
+        }
         match self.sel {
             0 => self.printer = step(self.printer, self.printers.len()),
             2 => self.color = !self.color,
@@ -243,6 +296,18 @@ impl App {
 
     fn value(&self, row: usize) -> String {
         let pick = |s: &str| format!("< {s} >");
+        if self.scan_tab {
+            return match row {
+                0 => pick(self.scanners.as_ref().and_then(|l| l.get(self.scanner)).map_or("none", |(_, d)| d.as_str())),
+                1 => pick(SCAN_MODES[self.scan_mode]),
+                2 => pick(&format!("{} dpi", SCAN_DPI[self.scan_dpi])),
+                3 => pick(if self.scan_pdf { "PDF (all pages in one file)" } else { "PNG (one file per page)" }),
+                SAVE_AS => self.save_as.clone(),
+                SCAN => "[ Scan page ]".into(),
+                SAVE => format!("[ Save {} page{} ]", self.scans.len(), if self.scans.len() == 1 { "" } else { "s" }),
+                _ => "[ Discard ]".into(),
+            };
+        }
         match row {
             0 => pick(self.printers.get(self.printer).map_or("none", String::as_str)),
             FILE if matches!(self.mode, Mode::Insert) => self.file.clone(),
@@ -294,9 +359,12 @@ impl App {
         let path = config_path().ok_or(std::io::Error::other("HOME is not set"))?;
         std::fs::create_dir_all(path.parent().unwrap_or(&path))?;
         std::fs::write(path, format!(
-            "printer={}\ncolor={}\nduplex={}\nreverse_back={}\npaper={}\ncopies={}\nper_sheet={}\n",
+            "printer={}\ncolor={}\nduplex={}\nreverse_back={}\npaper={}\ncopies={}\nper_sheet={}\n\
+             scanner={}\nscan_mode={}\nscan_dpi={}\nscan_format={}\n",
             self.printers.get(self.printer).map_or("", String::as_str),
             self.color, self.duplex, self.reverse_back, PAPERS[self.paper], self.copies, PER_SHEET[self.per_sheet],
+            self.scanners.as_ref().and_then(|l| l.get(self.scanner)).map_or(self.scanner_pref.as_str(), |(d, _)| d.as_str()),
+            SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi], if self.scan_pdf { "PDF" } else { "PNG" },
         ))
     }
 
@@ -311,6 +379,10 @@ impl App {
             "paper" => self.paper = PAPERS.iter().position(|p| *p == v).unwrap_or(self.paper),
             "copies" => self.copies = v.parse().ok().filter(|n| *n > 0).unwrap_or(self.copies),
             "per_sheet" => self.per_sheet = PER_SHEET.iter().position(|n| n.to_string() == v).unwrap_or(self.per_sheet),
+            "scanner" => self.scanner_pref = v.to_string(),
+            "scan_mode" => self.scan_mode = SCAN_MODES.iter().position(|m| *m == v).unwrap_or(self.scan_mode),
+            "scan_dpi" => self.scan_dpi = SCAN_DPI.iter().position(|d| d.to_string() == v).unwrap_or(self.scan_dpi),
+            "scan_format" => self.scan_pdf = v != "PNG",
             _ => {}
         }
     }
@@ -407,6 +479,73 @@ impl App {
     }
 }
 
+impl App {
+    fn find_scanners(&mut self, term: &mut DefaultTerminal) {
+        self.status = "Searching for scanners...".into();
+        let _ = term.draw(|f| draw(f, self));
+        let list = scanners();
+        self.scanner = list.iter().position(|(d, _)| *d == self.scanner_pref).unwrap_or(0);
+        self.status = if list.is_empty() {
+            "No scanners found. Install sane and sane-airscan (network scanners),\nthen press Enter on Scanner to search again.".into()
+        } else {
+            String::new()
+        };
+        self.scanners = Some(list);
+    }
+
+    fn scan_enter(&mut self, term: &mut DefaultTerminal) {
+        let res = match self.sel {
+            0 => return self.find_scanners(term),
+            SCAN => self.scan_page(term),
+            SAVE => self.save_scans(),
+            DISCARD => {
+                self.scans.clear();
+                self.thumb = None;
+                Ok("Scanned pages discarded.".into())
+            }
+            _ => return,
+        };
+        self.status = res.unwrap_or_else(|e| format!("Error: {e}"));
+    }
+
+    fn scan_page(&mut self, term: &mut DefaultTerminal) -> Result<String, String> {
+        let (device, _) = self.scanners.as_ref().and_then(|l| l.get(self.scanner)).ok_or("No scanner selected")?.clone();
+        let dir = std::env::temp_dir().join("printertui-scan");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let n = self.scans.len() + 1;
+        let path = dir.join(format!("page-{n}.png")).to_string_lossy().into_owned();
+        self.status = format!("Scanning page {n}...");
+        let _ = term.draw(|f| draw(f, self));
+        // ponytail: blocks the UI while the scanner works; move to a thread if cancelling mid-scan matters
+        scan(&device, SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi], &path)?;
+        self.thumb = thumbnail(&path).ok();
+        self.scans.push(path);
+        Ok(format!("Scanned page {n}. Put the next page on the glass and scan again, or save."))
+    }
+
+    fn save_scans(&mut self) -> Result<String, String> {
+        if self.scans.is_empty() {
+            return Err("Nothing scanned yet".into());
+        }
+        let out = expand_home(self.save_as.trim());
+        let out = out.trim_end_matches(".pdf").trim_end_matches(".png");
+        let written = save_scans(&self.scans, out, self.scan_pdf, SCAN_MODES[self.scan_mode] == "Lineart", SCAN_DPI[self.scan_dpi])?;
+        self.scans.clear();
+        self.thumb = None;
+        self.save_as = default_scan_name();
+        let _ = self.save();
+        Ok(format!("Saved {}", written.join(", ")))
+    }
+}
+
+/// `~/Documents/scan-2026-09-26_154200` (or in `~` when there is no Documents folder).
+fn default_scan_name() -> String {
+    let date = std::process::Command::new("date").arg("+%Y-%m-%d_%H%M%S").output();
+    let date = date.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let docs = std::env::var("HOME").is_ok_and(|h| std::path::Path::new(&h).join("Documents").is_dir());
+    format!("~/{}scan-{date}", if docs { "Documents/" } else { "" })
+}
+
 fn name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
@@ -432,17 +571,21 @@ fn expand_home(p: &str) -> String {
 }
 
 fn draw(f: &mut Frame, app: &App) {
-    let [form, status, help] = Layout::vertical([
-        Constraint::Length(LABELS.len() as u16 + 2),
-        Constraint::Min(3),
-        Constraint::Length(1),
-    ])
-    .areas(f.area());
+    let labels: &[&str] = if app.scan_tab { &SCAN_LABELS } else { &LABELS };
+    let [main, help] = Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(f.area());
+    let (left, preview) = if app.scan_tab {
+        let [l, r] = Layout::horizontal([Constraint::Min(40), Constraint::Percentage(45)]).areas(main);
+        (l, Some(r))
+    } else {
+        (main, None)
+    };
+    let [form, status] =
+        Layout::vertical([Constraint::Length(labels.len() as u16 + 2), Constraint::Min(3)]).areas(left);
 
-    let lines: Vec<Line> = (0..LABELS.len())
+    let lines: Vec<Line> = (0..labels.len())
         .map(|i| {
             let cursor = if i == app.sel && matches!(app.mode, Mode::Insert) { "_" } else { "" };
-            let line = Line::from(format!(" {:<12}{}{}", LABELS[i], app.value(i), cursor));
+            let line = Line::from(format!(" {:<12}{}{}", labels[i], app.value(i), cursor));
             if i == app.sel {
                 line.style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD))
             } else {
@@ -450,7 +593,14 @@ fn draw(f: &mut Frame, app: &App) {
             }
         })
         .collect();
-    f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" PrinterTUI ")), form);
+    let tab = |name: &'static str, on: bool| {
+        Span::styled(format!(" {name} "), if on { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() })
+    };
+    let title = Line::from(vec![Span::raw(" PrinterTUI  "), tab("Print", !app.scan_tab), tab("Scan", app.scan_tab), Span::raw(" ")]);
+    f.render_widget(Paragraph::new(lines).block(Block::bordered().title(title)), form);
+    if let Some(area) = preview {
+        draw_preview(f, app, area);
+    }
 
     f.render_widget(
         Paragraph::new(app.status.as_str()).wrap(Wrap { trim: false }).block(Block::bordered()),
@@ -459,8 +609,8 @@ fn draw(f: &mut Frame, app: &App) {
     f.render_widget(
         Line::from(match app.mode {
             Mode::Insert => " -- INSERT --   Esc/Enter done",
-            _ if app.sel == PAGES => " j/k move   Enter pick pages   i type a range (1-3,7)   q quit",
-            _ => " j/k move   h/l change   i edit text   Enter select   q quit",
+            _ if app.sel == PAGES && !app.scan_tab => " j/k move   Enter pick pages   i type a range (1-3,7)   q quit",
+            _ => " j/k move   h/l change   i edit text   Enter select   Tab print/scan   q quit",
         })
             .style(Style::new().add_modifier(Modifier::DIM)),
         help,
@@ -496,6 +646,31 @@ fn draw(f: &mut Frame, app: &App) {
             );
         }
     }
+}
+
+/// Grayscale half-block rendering of the last scanned page, two pixels per cell.
+fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let block = Block::bordered().title(match app.scans.len() {
+        0 => " Preview ".to_string(),
+        n => format!(" Preview: page {n} "),
+    });
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let Some((w, h, px)) = &app.thumb else { return };
+    let (cols, rows) = (inner.width as usize, inner.height as usize * 2);
+    let scale = (cols as f32 / *w as f32).min(rows as f32 / *h as f32);
+    let (ow, oh) = (((*w as f32 * scale) as usize).max(1), ((*h as f32 * scale) as usize).max(2) & !1);
+    let small = downscale(*w, *h, px, ow, oh);
+    let gray = |v: u8| Color::Rgb(v, v, v);
+    let lines: Vec<Line> = (0..oh / 2)
+        .map(|y| {
+            let spans: Vec<Span> = (0..ow)
+                .map(|x| Span::styled("▀", Style::new().fg(gray(small[2 * y * ow + x])).bg(gray(small[(2 * y + 1) * ow + x]))))
+                .collect();
+            Line::from(spans).centered()
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn popup(f: &mut Frame, height: u16) -> ratatui::layout::Rect {

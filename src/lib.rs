@@ -235,3 +235,87 @@ pub fn pick_files() -> Vec<String> {
 fn lines(s: &str) -> Vec<String> {
     s.split(['\n', '\0']).filter(|l| !l.is_empty()).map(String::from).collect()
 }
+
+pub const SCAN_MODES: [&str; 3] = ["Color", "Gray", "Lineart"];
+pub const SCAN_DPI: [u32; 3] = [150, 300, 600];
+
+/// SANE scanners as (device, description), e.g. ("airscan:e0:HP ...", "eSCL HP Smart Tank 5100").
+pub fn scanners() -> Vec<(String, String)> {
+    run("scanimage", &["-f", "%d\t%v %m%n"])
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(d, v)| (d.to_string(), v.to_string()))
+        .collect()
+}
+
+/// Scans one page from the flatbed into a PNG.
+pub fn scan(device: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
+    let dpi = dpi.to_string();
+    run("scanimage", &["-d", device, "--mode", mode, "--resolution", &dpi, "--format=png", "-o", out]).map(drop)
+}
+
+/// Grayscale thumbnail of an image as (width, height, pixels), via ImageMagick.
+pub fn thumbnail(image: &str) -> Result<(usize, usize, Vec<u8>), String> {
+    let pgm = format!("{image}.pgm");
+    run("magick", &[image, "-colorspace", "Gray", "-resize", "400x", &pgm])?;
+    let bytes = std::fs::read(&pgm).map_err(|e| e.to_string())?;
+    parse_pgm(&bytes).ok_or_else(|| "Could not read the scan preview".into())
+}
+
+/// Parses a binary 8-bit PGM (P5) as written by ImageMagick.
+pub fn parse_pgm(b: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    let mut fields = Vec::new();
+    let mut i = 0;
+    while fields.len() < 4 {
+        while b.get(i)?.is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while !b.get(i)?.is_ascii_whitespace() {
+            i += 1;
+        }
+        fields.push(std::str::from_utf8(&b[start..i]).ok()?);
+    }
+    let (w, h): (usize, usize) = (fields[1].parse().ok()?, fields[2].parse().ok()?);
+    let px = b.get(i + 1..i + 1 + w * h)?;
+    (fields[0] == "P5" && fields[3] == "255").then(|| (w, h, px.to_vec()))
+}
+
+/// Box-average downscale of a grayscale image to `ow` x `oh`.
+pub fn downscale(w: usize, h: usize, px: &[u8], ow: usize, oh: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ow * oh);
+    for y in 0..oh {
+        let (y0, y1) = (y * h / oh, ((y + 1) * h / oh).max(y * h / oh + 1));
+        for x in 0..ow {
+            let (x0, x1) = (x * w / ow, ((x + 1) * w / ow).max(x * w / ow + 1));
+            let sum: u32 = (y0..y1).flat_map(|yy| (x0..x1).map(move |xx| px[yy * w + xx] as u32)).sum();
+            out.push((sum / ((y1 - y0) * (x1 - x0)) as u32) as u8);
+        }
+    }
+    out
+}
+
+/// Saves scanned pages as one PDF, or as `out.png` / `out-1.png`, `out-2.png`... Returns the written paths.
+pub fn save_scans(pages: &[String], out: &str, pdf: bool, lineart: bool, dpi: u32) -> Result<Vec<String>, String> {
+    if pdf {
+        let path = format!("{out}.pdf");
+        // the density sets the PDF page size (pixels / dpi), otherwise ImageMagick assumes 72 dpi
+        let dpi = dpi.to_string();
+        let mut args = vec!["-units", "PixelsPerInch", "-density", &dpi];
+        args.extend(pages.iter().map(String::as_str));
+        if !lineart {
+            args.extend(["-compress", "jpeg", "-quality", "85"]);
+        }
+        args.push(&path);
+        run("magick", &args)?;
+        return Ok(vec![path]);
+    }
+    let mut written = Vec::new();
+    for (i, p) in pages.iter().enumerate() {
+        let path = if pages.len() == 1 { format!("{out}.png") } else { format!("{out}-{}.png", i + 1) };
+        std::fs::copy(p, &path).map_err(|e| format!("{path}: {e}"))?;
+        written.push(path);
+    }
+    Ok(written)
+}
