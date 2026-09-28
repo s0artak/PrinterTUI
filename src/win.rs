@@ -309,11 +309,10 @@ pub fn ink(_queue: &str) -> Vec<(u32, i32)> {
 /// One page of a PDF as a PNG for the preview, drawn by pdfium.
 pub fn render_page(pdf: &str, page: u32, png: &str) -> Result<(), String> {
     let doc = pdfium()?.load_pdf_from_file(pdf, None).map_err(|e| format!("{pdf}: {e}"))?;
-    let bitmap = doc
-        .pages()
-        .get((page - 1) as PdfPageIndex)
-        .and_then(|p| p.render_with_config(&PdfRenderConfig::new().set_target_width(1000).render_form_data(true)))
-        .map_err(|e| format!("page {page}: {e}"))?;
+    let err = |e: PdfiumError| format!("page {page}: {e}");
+    // the bitmap borrows the page, so it has to outlive it
+    let pdf_page = doc.pages().get((page - 1) as PdfPageIndex).map_err(err)?;
+    let bitmap = pdf_page.render_with_config(&PdfRenderConfig::new().set_target_width(1000).render_form_data(true)).map_err(err)?;
     let img = image::RgbaImage::from_raw(bitmap.width() as u32, bitmap.height() as u32, bitmap.as_rgba_bytes()).ok_or("pdfium: bad bitmap")?;
     img.save_with_format(png, image::ImageFormat::Png).map_err(|e| format!("{png}: {e}"))
 }
@@ -542,4 +541,19 @@ fn system_bits() {
     assert!(config_path().unwrap().ends_with(r"printertui\config"));
     let _ = queue();
     let _ = local_scanners();
+}
+
+#[test]
+fn renders_a_preview_page() {
+    let dir = std::env::temp_dir().join(format!("printertui-render-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_string_lossy().into_owned();
+    image::RgbImage::from_pixel(200, 100, image::Rgb([0, 0, 0])).save(p("black.png")).unwrap();
+    std::fs::write(p("in.pdf"), images_to_pdf(&[p("black.png")], 100, &[]).unwrap()).unwrap();
+    // scaled to half: the page stays white at the corner and black in the middle
+    render_page(&scale_pdf(&p("in.pdf"), 50).unwrap(), 1, &p("page.png")).unwrap();
+    let img = image::open(p("page.png")).unwrap().to_luma8();
+    assert_eq!(img.width(), 1000);
+    assert!(img.get_pixel(2, 2)[0] > 200 && img.get_pixel(500, img.height() / 2)[0] < 50);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
