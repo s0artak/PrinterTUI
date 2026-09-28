@@ -1485,6 +1485,34 @@ fn width(s: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(s)
 }
 
+/// Lines `text` takes wrapped at word boundaries into `cols` columns, as the bubble's paragraph wraps it.
+fn wrapped_rows(text: &str, cols: usize) -> usize {
+    text.lines()
+        .map(|line| {
+            let (mut rows, mut x) = (1, 0);
+            for word in line.split(' ') {
+                let w = width(word);
+                if x > 0 && x + 1 + w > cols {
+                    (rows, x) = (rows + 1, 0);
+                }
+                // a word longer than the line is cut into pieces
+                rows += w.saturating_sub(1) / cols;
+                x = if x == 0 { w % cols.max(1) } else { x + 1 + w };
+            }
+            rows
+        })
+        .sum()
+}
+
+#[test]
+fn bubble_wrapping() {
+    assert_eq!(wrapped_rows("request id is Smart_Tank-73 (1 file(s))", 23), 3);
+    assert_eq!(wrapped_rows("aaaa bbbb", 9), 1);
+    assert_eq!(wrapped_rows("aaaa bbbbb", 9), 2);
+    assert_eq!(wrapped_rows("one\ntwo", 20), 2);
+    assert_eq!(wrapped_rows(&"x".repeat(25), 10), 3);
+}
+
 /// The character at a screen column of `s`, for mouse clicks.
 fn char_at(s: &str, col: usize) -> Option<char> {
     let mut x = 0;
@@ -1574,9 +1602,8 @@ fn draw_stage(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(edge))
         .padding(ratatui::widgets::Padding::horizontal(1));
-    // as tall as its text, roughly (wrapping by characters)
-    let width = bubble.width.saturating_sub(4).max(1) as usize;
-    let rows: usize = text.lines().map(|l| self::width(l).div_ceil(width).max(1)).sum();
+    // as tall as its text
+    let rows = wrapped_rows(&text, bubble.width.saturating_sub(4).max(1) as usize);
     let bubble = ratatui::layout::Rect { height: (rows as u16 + 2).clamp(3, bubble.height), ..bubble };
     f.render_widget(Paragraph::new(text).style(style).wrap(Wrap { trim: false }).block(block), bubble);
     if pet_w > 0 && bubble.height > 3 {
