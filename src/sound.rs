@@ -27,7 +27,10 @@ pub const ALL: [Sound; 6] = [Sound::Boot, Sound::Blip, Sound::Print, Sound::Scan
 
 const RATE: u32 = 22050;
 
-static VOLUME: AtomicU8 = AtomicU8::new(60);
+/// Gentle: heard over a quiet room, not over a conversation (see the default_volume_is_gentle test).
+pub const DEFAULT_VOLUME: u8 = 50;
+
+static VOLUME: AtomicU8 = AtomicU8::new(DEFAULT_VOLUME);
 
 /// 0 (muted) to 100.
 pub fn set_volume(v: u8) {
@@ -74,7 +77,8 @@ pub fn play(s: Sound) {
 /// The sound as a WAV file in the temp folder, written the first time it is needed.
 pub fn file(s: Sound, vol: u8) -> Option<std::path::PathBuf> {
     let dir = std::env::temp_dir().join("printertui").join("sounds");
-    let path = dir.join(format!("{}-{vol}.wav", name(s)));
+    // the version changes with the sounds, so an update does not play the old ones
+    let path = dir.join(format!("{}-{vol}-v2.wav", name(s)));
     if !path.exists() {
         std::fs::create_dir_all(&dir).ok()?;
         let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
@@ -161,13 +165,13 @@ pub fn samples(s: Sound) -> Vec<f32> {
     match s {
         Sound::Boot => {
             for f in [523.25, 659.25, 783.99] {
-                note(&mut out, f, 0.12, 0.35);
+                note(&mut out, f, 0.12, 0.56);
             }
         }
-        Sound::Blip => note(&mut out, 1318.5, 0.05, 0.25),
+        Sound::Blip => note(&mut out, 1318.5, 0.05, 0.35),
         Sound::Done => {
-            note(&mut out, 880.0, 0.12, 0.35);
-            note(&mut out, 1318.5, 0.3, 0.35);
+            note(&mut out, 880.0, 0.12, 0.7);
+            note(&mut out, 1318.5, 0.3, 0.7);
         }
         Sound::Print => {
             // the motor: a buzzing sawtooth, pulsing like a print head going back and forth
@@ -177,7 +181,7 @@ pub fn samples(s: Sound) -> Vec<f32> {
                 let fade = (t * 20.0).min(1.0) * ((1.1 - t) * 20.0).min(1.0);
                 let saw = 2.0 * ((t * 70.0 + 0.5 * (t * 3.0).sin()).fract()) - 1.0;
                 let pulse = 0.55 + 0.45 * (TAU * 7.0 * t).sin();
-                out.push(0.22 * fade * pulse * (0.7 * saw + 0.3 * noise.next()));
+                out.push(0.55 * fade * pulse * (0.7 * saw + 0.3 * noise.next()));
             }
             // the sheet sliding out: a short hiss
             let n = (0.18 * RATE as f32) as usize;
@@ -185,7 +189,7 @@ pub fn samples(s: Sound) -> Vec<f32> {
             for i in 0..n {
                 let x = noise.next();
                 let env = (1.0 - i as f32 / n as f32).powi(2);
-                out.push(0.3 * env * (x - last));
+                out.push(0.12 * env * (x - last));
                 last = x;
             }
         }
@@ -198,7 +202,7 @@ pub fn samples(s: Sound) -> Vec<f32> {
                 let f = 110.0 + 40.0 * (std::f32::consts::PI * t / 1.6).sin();
                 phase += TAU * f / RATE as f32;
                 let fade = (t * 10.0).min(1.0) * ((1.6 - t) * 10.0).min(1.0);
-                out.push(0.28 * fade * (phase.sin() + 0.5 * (2.0 * phase).sin() + 0.05 * noise.next()) / 1.5);
+                out.push(0.38 * fade * (phase.sin() + 0.5 * (2.0 * phase).sin() + 0.05 * noise.next()) / 1.5);
             }
         }
         Sound::Jam => {
@@ -209,7 +213,7 @@ pub fn samples(s: Sound) -> Vec<f32> {
                     let t = secs(i);
                     let square = if (t * 95.0).fract() < 0.5 { 1.0 } else { -1.0 };
                     let env = (t * 200.0).min(1.0) * (1.0 - t / 0.16);
-                    out.push(0.25 * env * (0.8 * square + 0.2 * noise.next()));
+                    out.push(0.42 * env * (0.8 * square + 0.2 * noise.next()));
                 }
                 silence(&mut out, 0.05);
             }
@@ -218,11 +222,31 @@ pub fn samples(s: Sound) -> Vec<f32> {
             for i in 0..n {
                 let t = secs(i);
                 phase += TAU * (300.0 - 500.0 * t) / RATE as f32;
-                out.push(0.3 * (1.0 - t / 0.35) * phase.sin());
+                out.push(0.5 * (1.0 - t / 0.35) * phase.sin());
             }
         }
     }
     out
+}
+
+/// Every sound at the default volume is easy to hear but never loud: its average level (RMS)
+/// between -30 and -22 dBFS, like the system's own notification sounds, its peaks below -12 dBFS.
+#[test]
+fn default_volume_is_gentle() {
+    let gain = (DEFAULT_VOLUME as f32 / 100.0).powi(2);
+    let levels: Vec<(Sound, f32, f32)> = ALL
+        .iter()
+        .map(|&s| {
+            let loud: Vec<f32> = samples(s).iter().map(|v| v * gain).filter(|v| v.abs() > 1e-3).collect();
+            let rms = 20.0 * (loud.iter().map(|v| v * v).sum::<f32>() / loud.len() as f32).sqrt().log10();
+            let peak = 20.0 * loud.iter().fold(0f32, |m, v| m.max(v.abs())).log10();
+            println!("{s:?}: rms {rms:.1} dBFS, peak {peak:.1} dBFS");
+            (s, rms, peak)
+        })
+        .collect();
+    for (s, rms, peak) in levels {
+        assert!((-30.0..=-22.0).contains(&rms) && peak < -12.0, "{s:?}: rms {rms:.1}, peak {peak:.1}");
+    }
 }
 
 #[test]

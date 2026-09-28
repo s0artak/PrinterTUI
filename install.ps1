@@ -65,6 +65,93 @@ function Talk([string]$t, [switch]$Pet, [int]$Color = 69) {
     $script:drawn = 0
 }
 
+# --- sounds: the app's (see src/sound.rs), synthesized here, as there are no files to ship ---
+# The app's volume when it has one (an update keeps it, muted too), else its gentle default.
+$volume = 50
+$configFile = Join-Path $env:APPDATA 'printertui\config'
+if (Test-Path $configFile) {
+    $found = [IO.File]::ReadAllLines($configFile) | Select-String '^volume=(\d+)$' | Select-Object -Last 1
+    if ($found) { $volume = [int]$found.Matches[0].Groups[1].Value }
+}
+$script:sounds = @{}
+$script:playing = [System.Collections.ArrayList]::new()
+
+# Plays a sound (boot blip print done jam bye) in the background, when a person is listening.
+function Play([string]$name) {
+    if (-not $tty -or $volume -le 0) { return }
+    try {
+        if (-not $script:sounds[$name]) { $script:sounds[$name] = Synth $name $volume }
+        $player = [System.Media.SoundPlayer]::new([IO.MemoryStream]::new($script:sounds[$name]))
+        $player.Play()
+        # kept alive while it plays
+        [void]$script:playing.Add($player)
+    } catch { }
+}
+
+# A sound at a volume as the bytes of an 8-bit WAV file.
+function Synth([string]$name, [int]$vol) {
+    $R = 11025
+    $tau = 2 * [math]::PI
+    $s = [System.Collections.Generic.List[double]]::new()
+    $rnd = [Random]::new(7)
+    function Note($f, $secs, $amp) {
+        for ($i = 0; $i -lt [int]($secs * $R); $i++) {
+            $t = $i / $R
+            $shape = [math]::Min($t * 400, 1) * [math]::Exp(-$t * 9)
+            $s.Add($amp * $shape * ([math]::Sin($tau * $f * $t) + 0.3 * [math]::Sin(3 * $tau * $f * $t)) / 1.3)
+        }
+    }
+    switch ($name) {
+        'boot' { Note 523.25 0.12 0.56; Note 659.25 0.12 0.56; Note 783.99 0.12 0.56 }
+        'bye' { Note 783.99 0.14 0.56; Note 659.25 0.14 0.56; Note 523.25 0.2 0.56 }
+        'blip' { Note 1318.5 0.05 0.35 }
+        'done' { Note 880 0.12 0.7; Note 1318.5 0.3 0.7 }
+        'print' {
+            for ($i = 0; $i -lt [int](1.1 * $R); $i++) {
+                $t = $i / $R
+                $fade = [math]::Min($t * 20, 1) * [math]::Min((1.1 - $t) * 20, 1)
+                $x = $t * 70 + 0.5 * [math]::Sin($t * 3)
+                $saw = 2 * ($x - [math]::Floor($x)) - 1
+                $s.Add(0.55 * $fade * (0.55 + 0.45 * [math]::Sin($tau * 7 * $t)) * (0.7 * $saw + 0.3 * ($rnd.NextDouble() * 2 - 1)))
+            }
+            $last = 0
+            $n = [int](0.18 * $R)
+            for ($i = 0; $i -lt $n; $i++) {
+                $x = $rnd.NextDouble() * 2 - 1
+                $s.Add(0.12 * [math]::Pow(1 - $i / $n, 2) * ($x - $last))
+                $last = $x
+            }
+        }
+        'jam' {
+            for ($k = 0; $k -lt 3; $k++) {
+                for ($i = 0; $i -lt [int](0.16 * $R); $i++) {
+                    $t = $i / $R
+                    $shape = [math]::Min($t * 200, 1) * (1 - $t / 0.16)
+                    $square = if ($t * 95 - [math]::Floor($t * 95) -lt 0.5) { 1 } else { -1 }
+                    $s.Add(0.42 * $shape * (0.8 * $square + 0.2 * ($rnd.NextDouble() * 2 - 1)))
+                }
+                for ($i = 0; $i -lt [int](0.05 * $R); $i++) { $s.Add(0) }
+            }
+            $ph = 0
+            for ($i = 0; $i -lt [int](0.35 * $R); $i++) {
+                $t = $i / $R
+                $ph += $tau * (300 - 500 * $t) / $R
+                $s.Add(0.5 * (1 - $t / 0.35) * [math]::Sin($ph))
+            }
+        }
+    }
+    $gain = [math]::Pow($vol / 100, 2)
+    $out = [IO.MemoryStream]::new()
+    $w = [IO.BinaryWriter]::new($out)
+    $ascii = [Text.Encoding]::ASCII
+    $w.Write($ascii.GetBytes('RIFF')); $w.Write([int](36 + $s.Count)); $w.Write($ascii.GetBytes('WAVEfmt '))
+    $w.Write([int]16); $w.Write([int16]1); $w.Write([int16]1); $w.Write([int]$R); $w.Write([int]$R); $w.Write([int16]1); $w.Write([int16]8)
+    $w.Write($ascii.GetBytes('data')); $w.Write([int]$s.Count)
+    foreach ($v in $s) { $w.Write([byte][math]::Max(0, [math]::Min(255, [math]::Round(128 + 127 * $v * $gain)))) }
+    $w.Flush()
+    , $out.ToArray()
+}
+
 # Screen columns of a text: Chinese takes two, the marks Hindi, Bengali and Arabic draw over the
 # letter before take none.
 function Cols([string]$s) {
@@ -491,16 +578,22 @@ function Animate([string]$what, $task) {
     # finish and jam carry on from where print stopped
     if ($what -ne 'finish' -and $what -ne 'jam') { $script:drawn = 0 }
     switch ($what) {
-        'boot' { foreach ($l in 'gg', 'Gg', 'gg', 'Gg', 'GG') { Show 0 $l[0] $l[1] } }
+        'boot' { Play 'boot'; foreach ($l in 'gg', 'Gg', 'gg', 'Gg', 'GG') { Show 0 $l[0] $l[1] } }
         'print' {
             $script:n = 0
-            while (-not $task.IsCompleted) { Blink $script:n; $script:n = ($script:n + 1) % 11 }
+            while (-not $task.IsCompleted) {
+                if ($script:n -eq 0) { Play 'print' }
+                Blink $script:n
+                $script:n = ($script:n + 1) % 11
+            }
         }
         'finish' {
             for (; $script:n -le 10; $script:n++) { Blink $script:n }
+            Play 'done'
             Show 10 'G' 'G'
         }
         'jam' {
+            Play 'jam'
             $script:paper = $Jam
             $i = 0
             foreach ($x in 1, 3, 1, 3, 1, 3, 2, 2, 2, 2) {
@@ -511,6 +604,7 @@ function Animate([string]$what, $task) {
             $script:paper = $Page
         }
         'unprint' {
+            Play 'bye'
             for ($n = 10; $n -ge 0; $n--) { if ($n % 2) { Show $n 'g' 'r' } else { Show $n 'r' 'g' } }
             Show 0 'r' 'r'
         }
@@ -535,8 +629,8 @@ function Menu([string[]]$items, [int]$sel = 0, [bool[]]$marks = $null) {
         W "`n  $E[2m$hint$E[0m$E[K`n"
         $key = [Console]::ReadKey($true)
         switch ($key.Key) {
-            { $_ -eq 'UpArrow' -or $_ -eq 'K' } { if ($sel -gt 0) { $sel-- } }
-            { $_ -eq 'DownArrow' -or $_ -eq 'J' } { if ($sel -lt $n - 1) { $sel++ } }
+            { $_ -eq 'UpArrow' -or $_ -eq 'K' } { if ($sel -gt 0) { $sel--; Play 'blip' } }
+            { $_ -eq 'DownArrow' -or $_ -eq 'J' } { if ($sel -lt $n - 1) { $sel++; Play 'blip' } }
             'Spacebar' { if ($null -ne $marks) { $marks[$sel] = -not $marks[$sel] } }
             'Enter' { $done = $true }
             { $_ -eq 'Q' -or $_ -eq 'Escape' } { $sel = -1; $done = $true }

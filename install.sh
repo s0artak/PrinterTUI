@@ -61,6 +61,79 @@ talk() {
     drawn=
 }
 
+# --- sounds: the app's (see src/sound.rs), synthesized here, as there are no files to ship ---
+# The app's volume when it has one (an update keeps it, muted too), else its gentle default.
+vol=$(sed -n 's/^volume=\([0-9][0-9]*\)$/\1/p' "${XDG_CONFIG_HOME:-$HOME/.config}/printertui/config" 2>/dev/null | tail -n 1)
+vol=${vol:-50}
+
+# Plays sound $1 (boot blip print done jam bye) in the background, when a person is listening.
+play() {
+    [ -n "$tty" ] && [ "$vol" -gt 0 ] || return 0
+    # v2: the sounds' version, as in src/sound.rs
+    f="${TMPDIR:-/tmp}/printertui-sounds/$1-$vol-v2.wav"
+    if [ ! -s "$f" ]; then
+        mkdir -p "${f%/*}" 2>/dev/null || return 0
+        # shellcheck disable=SC2059 # the format is the sound's bytes, as octal escapes
+        printf "$(synth "$1" "$vol")" >"$f" 2>/dev/null || return 0
+    fi
+    for p in afplay pw-play paplay 'aplay -q'; do
+        if command -v "${p%% *}" >/dev/null 2>&1; then
+            $p "$f" >/dev/null 2>&1 &
+            return 0
+        fi
+    done
+}
+
+# Sound $1 at volume $2 as an 8-bit WAV file, written as printf octal escapes (POSIX, so the
+# same in every sh and awk).
+synth() {
+    LC_ALL=C awk -v name="$1" -v vol="$2" '
+        function note(f, secs, amp,   i, n, t, env) {
+            n = int(secs * R)
+            for (i = 0; i < n; i++) {
+                t = i / R; env = (t * 400 < 1 ? t * 400 : 1) * exp(-t * 9)
+                s[N++] = amp * env * (sin(TAU * f * t) + 0.3 * sin(3 * TAU * f * t)) / 1.3
+            }
+        }
+        function silence(secs,   i) { for (i = 0; i < int(secs * R); i++) s[N++] = 0 }
+        function fract(x) { return x - int(x) }
+        function le(n, k,   i) { for (i = 0; i < k; i++) { printf "\\%03o", n % 256; n = int(n / 256) } }
+        function text(t,   i) { for (i = 1; i <= length(t); i++) printf "%s", substr(t, i, 1) }
+        BEGIN {
+            R = 11025; TAU = 6.283185307; N = 0; srand(7)
+            if (name == "boot") { note(523.25, 0.12, 0.56); note(659.25, 0.12, 0.56); note(783.99, 0.12, 0.56) }
+            else if (name == "bye") { note(783.99, 0.14, 0.56); note(659.25, 0.14, 0.56); note(523.25, 0.2, 0.56) }
+            else if (name == "blip") note(1318.5, 0.05, 0.35)
+            else if (name == "done") { note(880, 0.12, 0.7); note(1318.5, 0.3, 0.7) }
+            else if (name == "print") {
+                for (i = 0; i < int(1.1 * R); i++) {
+                    t = i / R; fade = (t * 20 < 1 ? t * 20 : 1) * ((1.1 - t) * 20 < 1 ? (1.1 - t) * 20 : 1)
+                    saw = 2 * fract(t * 70 + 0.5 * sin(t * 3)) - 1
+                    s[N++] = 0.55 * fade * (0.55 + 0.45 * sin(TAU * 7 * t)) * (0.7 * saw + 0.3 * (2 * rand() - 1))
+                }
+                last = 0; n = int(0.18 * R)
+                for (i = 0; i < n; i++) { x = 2 * rand() - 1; s[N++] = 0.12 * (1 - i / n) ^ 2 * (x - last); last = x }
+            } else if (name == "jam") {
+                for (k = 0; k < 3; k++) {
+                    for (i = 0; i < int(0.16 * R); i++) {
+                        t = i / R; env = (t * 200 < 1 ? t * 200 : 1) * (1 - t / 0.16)
+                        s[N++] = 0.42 * env * (0.8 * (fract(t * 95) < 0.5 ? 1 : -1) + 0.2 * (2 * rand() - 1))
+                    }
+                    silence(0.05)
+                }
+                ph = 0
+                for (i = 0; i < int(0.35 * R); i++) { t = i / R; ph += TAU * (300 - 500 * t) / R; s[N++] = 0.5 * (1 - t / 0.35) * sin(ph) }
+            }
+            gain = (vol / 100) ^ 2
+            text("RIFF"); le(36 + N, 4); text("WAVEfmt "); le(16, 4); le(1, 2); le(1, 2); le(R, 4); le(R, 4); le(1, 2); le(8, 2)
+            text("data"); le(N, 4)
+            for (i = 0; i < N; i++) {
+                v = int(128 + 127 * s[i] * gain + 0.5)
+                printf "\\%03o", (v < 0 ? 0 : v > 255 ? 255 : v)
+            }
+        }'
+}
+
 # Word-wraps $1 into lines of at most $2 screen columns, each as "columns<TAB>text". Counted by
 # bytes (the same in every awk): Chinese takes two columns, the marks that Hindi, Bengali and
 # Arabic draw over the letter before take none.
@@ -513,10 +586,12 @@ animate() {
     case $1 in finish | jam) ;; *) drawn= ;; esac
     case $1 in
         boot) # lights wake up one by one
+            play boot
             for l in "g g" "G g" "g g" "G g" "G G"; do show 0 $l; done ;;
-        print) # pages slide out while the lights blink, as long as process $2 runs
+        print) # pages slide out while the lights blink, as long as process $2 runs, whirring
             n=0
             while kill -0 "$2" 2>/dev/null; do
+                [ $n -ne 0 ] || play print
                 blink $n
                 n=$(((n + 1) % 11))
             done ;;
@@ -525,8 +600,10 @@ animate() {
                 blink $n
                 n=$((n + 1))
             done
+            play done
             show 10 G G ;;
         jam) # the page crumples in the slot, the printer shakes and flashes red
+            play jam
             paper=$JAM
             i=0
             for x in 1 3 1 3 1 3 2 2 2 2; do
@@ -536,6 +613,7 @@ animate() {
             show 5 r r
             paper= ;;
         unprint) # page gets pulled back in, lights go red
+            play bye
             n=10
             while [ $n -ge 0 ]; do
                 if [ $((n % 2)) -eq 0 ]; then show $n r g; else show $n g r; fi
@@ -586,8 +664,8 @@ menu() {
         printf '\n  \033[2m%s\033[0m\033[K\n' "$hint"
         readkey
         case $k in
-            up | k) if [ $sel -gt 1 ]; then sel=$((sel - 1)); fi ;;
-            down | j) if [ $sel -lt $# ]; then sel=$((sel + 1)); fi ;;
+            up | k) if [ $sel -gt 1 ]; then sel=$((sel - 1)); play blip; fi ;;
+            down | j) if [ $sel -lt $# ]; then sel=$((sel + 1)); play blip; fi ;;
             ' ') if [ -n "$checked" ]; then
                      checked=$(printf '%s' "$checked" | awk -v i=$sel '{ print substr($0, 1, i - 1) (1 - substr($0, i, 1)) substr($0, i + 1) }')
                  fi ;;
@@ -650,7 +728,7 @@ do_uninstall() {
         run rm -f "$bin" 2>/dev/null || run sudo rm -f "$bin"
     done
     say "$T_rm_cfg"
-    run rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/printertui" "${TMPDIR:-/tmp}/printertui" "${TMPDIR:-/tmp}/printertui-scan"
+    run rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/printertui" "${TMPDIR:-/tmp}/printertui" "${TMPDIR:-/tmp}/printertui-scan" "${TMPDIR:-/tmp}/printertui-sounds"
     # installed from source by an earlier run
     if [ -f "$HOME/.local/.crates.toml" ] && command -v cargo >/dev/null; then
         run cargo uninstall --root "$HOME/.local" printertui 2>/dev/null || true
