@@ -55,8 +55,9 @@ pub fn play(s: Sound) {
     if let Ok(log) = std::env::var("PRINTERTUI_SOUND_LOG") {
         use std::io::Write;
         let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let wav = file(s, vol.max(1)).map_or(String::new(), |p| p.to_string_lossy().into_owned());
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
-            let _ = writeln!(f, "{ms} {} {vol}", name(s));
+            let _ = writeln!(f, "{ms} {} {vol} {wav}", name(s));
         }
         return;
     }

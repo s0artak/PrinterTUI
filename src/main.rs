@@ -153,6 +153,8 @@ struct App {
     busy: Option<(String, mpsc::Receiver<Done>)>,
     /// A scan is running (the printer shows its scan light).
     scanning: bool,
+    /// Redraw the whole screen: another language can leave letters of different widths behind.
+    clear: bool,
     /// Language from the settings ("es"), empty to follow the system's.
     lang: String,
     /// Page rotate/filter re-render, apart from `busy` so pages can be edited while the next one scans.
@@ -212,6 +214,7 @@ fn main() -> std::io::Result<()> {
         cur: 0,
         busy: None,
         scanning: false,
+        clear: false,
         lang: String::new(),
         editing: None,
         graphics: detect_graphics(),
@@ -334,6 +337,10 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
             }
         }
         POPUP.set(Default::default());
+        if std::mem::take(&mut app.clear) {
+            term.clear()?;
+            app.sent = None;
+        }
         term.draw(|f| draw(f, app))?;
         app.popup_area.set(POPUP.get());
         app.sync_image();
@@ -1171,7 +1178,9 @@ impl App {
 
     /// Puts the language, theme, volume and image preview settings into effect.
     fn apply_settings(&mut self) {
+        let before = t().code;
         i18n::set(if self.lang.is_empty() { system_language() } else { self.lang.clone() }.as_str());
+        self.clear |= t().code != before;
         pet::set_theme(self.theme);
         let graphics = match GRAPHICS_PREFS[self.graphics_pref] {
             "kitty" => Graphics::Kitty(std::env::var_os("TMUX").is_some()),
