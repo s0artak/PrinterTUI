@@ -954,7 +954,9 @@ fn scale_pdf_wraps_every_page() {
         assert!(content.starts_with("q 0.5000 0 0 0.5000 36.0000 18.0000 cm"), "{content}");
         assert!(content.trim_end().ends_with('Q'), "{content}");
     }
-    // pdftoppm (poppler) draws it, when installed
+    // pdftoppm (poppler) draws it, when installed; one tool at a time, as stop_all's test kills them
+    #[cfg(unix)]
+    let _one = unix::SPAWNS.lock().unwrap_or_else(|e| e.into_inner());
     if run("pdftoppm", &["-v"]).is_ok() {
         let png = dir.join("p1.png").to_string_lossy().into_owned();
         render_page(&out, 2, &png).unwrap();

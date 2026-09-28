@@ -14,7 +14,7 @@ esc=$(printf '\033')
 cr=$(printf '\r')
 
 # menus and animations only when a person is watching
-tty= saved= tmp=
+tty= saved= tmp= drawn=
 if [ -t 1 ] && { : </dev/tty; } 2>/dev/null; then
     tty=1
     saved=$(stty -g </dev/tty)
@@ -28,7 +28,78 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 say() { printf '  \033[38;5;69m▸\033[0m %s\n' "$*"; }
-talk() { printf '\n  \033[1;38;5;69m%s\033[0m\n\n' "$*"; }
+# The printer's speech bubble, as in the app. "talk TEXT pet" puts it beside the printer just
+# drawn, its tail pointing at it; a third argument is the border color (203: red, for errors).
+talk() {
+    if [ -z "$tty" ]; then
+        printf '\n  %s\n\n' "$1"
+        return
+    fi
+    cols=$(stty size </dev/tty 2>/dev/null | cut -d' ' -f2)
+    left=2
+    if [ "${2:-}" = pet ] && [ -n "$drawn" ] && [ "${cols:-80}" -ge 64 ]; then left=24; fi
+    max=$((${cols:-80} - left - 5))
+    [ $max -le 60 ] || max=60
+    lines=$(wrap "$1" $max)
+    n=$(printf '%s\n' "$lines" | wc -l)
+    w=$(printf '%s\n' "$lines" | cut -f1 | sort -n | tail -n 1)
+    bar=$(printf '%*s' $((w + 2)) '' | sed 's/ /─/g')
+    c="\033[38;5;${3:-69}m" go="\033[$((left + 1))G"
+    # beside the printer: back up to its second row, so the tail meets its lights
+    if [ $left -gt 2 ]; then printf '\033[%dA' $((drawn - 1)); else echo; fi
+    printf "$go$c╭%s╮\033[0m\n" "$bar"
+    first=1
+    printf '%s\n' "$lines" | while IFS='	' read -r lw line; do
+        edge=│
+        if [ $left -gt 2 ] && [ -n "$first" ]; then edge=◀; fi
+        printf "$go$c%s\033[0m %s%*s $c│\033[0m\n" "$edge" "$line" $((w - lw)) ''
+        first=
+    done
+    printf "$go$c╰%s╯\033[0m\n" "$bar"
+    if [ $left -gt 2 ] && [ $((n + 3)) -lt "$drawn" ]; then printf '\033[%dB' $((drawn - n - 3)); fi
+    echo
+    drawn=
+}
+
+# Word-wraps $1 into lines of at most $2 screen columns, each as "columns<TAB>text". Counted by
+# bytes (the same in every awk): Chinese takes two columns, the marks that Hindi, Bengali and
+# Arabic draw over the letter before take none.
+wrap() {
+    printf '%s\n' "$1" | LC_ALL=C awk -v max="$2" '
+        BEGIN { for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i }
+        function mark(u) {
+            return (u >= 768 && u <= 879) || (u >= 1611 && u <= 1631) || u == 1648 ||
+                (u >= 2304 && u <= 2306) || u == 2362 || u == 2364 || (u >= 2369 && u <= 2376) || u == 2381 ||
+                (u >= 2385 && u <= 2391) || (u >= 2402 && u <= 2403) || u == 2433 || u == 2492 ||
+                (u >= 2497 && u <= 2500) || u == 2509 || (u >= 2530 && u <= 2531) || u == 8204 || u == 8205
+        }
+        function wide(u) {
+            return (u >= 4352 && u <= 4447) || (u >= 11904 && u <= 42191) || (u >= 44032 && u <= 55203) ||
+                (u >= 63744 && u <= 64255) || (u >= 65040 && u <= 65135) || (u >= 65280 && u <= 65376) || (u >= 65504 && u <= 65510)
+        }
+        function cols(s,   i, n, b, u, w) {
+            n = length(s); w = 0
+            for (i = 1; i <= n;) {
+                b = ord[substr(s, i, 1)]
+                if (b < 128) { w++; i++; continue }
+                if (b < 224) { u = (b % 32) * 64 + ord[substr(s, i + 1, 1)] % 64; i += 2 }
+                else if (b < 240) { u = ((b % 16) * 64 + ord[substr(s, i + 1, 1)] % 64) * 64 + ord[substr(s, i + 2, 1)] % 64; i += 3 }
+                else { w += 2; i += 4; continue }
+                if (wide(u)) w += 2; else if (!mark(u)) w++
+            }
+            return w
+        }
+        {
+            n = split($0, word, " "); line = ""; lw = 0
+            for (j = 1; j <= n; j++) {
+                ww = cols(word[j])
+                if (lw > 0 && lw + 1 + ww > max) { print lw "\t" line; line = word[j]; lw = ww }
+                else if (lw > 0) { line = line " " word[j]; lw += 1 + ww }
+                else { line = word[j]; lw = ww }
+            }
+            print lw "\t" line
+        }'
+}
 die() { printf '  \033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 # every command that changes the system goes through run, so the preview can skip it
 run() {
@@ -653,8 +724,8 @@ do_install() {
     fi
     case $status in
         0) echo ;;
-        2) talk "$T_smudge"; die "$T_e_sum" ;;
-        *) talk "$T_jam"; die "$T_e_net" ;;
+        2) talk "$T_smudge" pet 203; die "$T_e_sum" ;;
+        *) talk "$T_jam" pet 203; die "$T_e_net" ;;
     esac
 
     say "$T_put $bin_dir"
@@ -668,7 +739,7 @@ do_install() {
 
 # the app speaks the language picked in the menu (without a menu it follows the system's)
 save_lang() {
-    [ -n "$picked" ] || return 0
+    [ -n "$lang_picked" ] || return 0
     conf="${XDG_CONFIG_HOME:-$HOME/.config}/printertui/config"
     if [ -n "$preview" ]; then
         printf '    \033[2m%s lang=%s > %s\033[0m\n' "$T_skip" "$lang" "$conf"
@@ -690,36 +761,37 @@ fi
 extras=000 checked=
 
 # the system language is preselected in the menu, and used as is when there is no menu
-sel=1 i=1 lang=en picked=
+sel=1 lang=en lang_picked=
 for c in $LANGS; do
-    case ${LC_ALL:-${LC_MESSAGES:-${LANG:-}}} in "$c"*) sel=$i lang=$c ;; esac
-    i=$((i + 1))
+    case ${LC_ALL:-${LC_MESSAGES:-${LANG:-}}} in "$c"*) lang=$c ;; esac
 done
+# the system's language comes first in the menu
+order="$lang $(printf '%s\n' $LANGS | grep -vx "$lang" | tr '\n' ' ')"
 lang_$lang
 
 action=${1:-}
 if [ -z "$action" ] && [ -n "$tty" ]; then
     printf '\n  \033[1mPrinterTUI\033[0m\n\n'
     set --
-    for c in $LANGS; do lang_$c; set -- "$@" "$T_name"; done
+    for c in $order; do lang_$c; set -- "$@" "$T_name"; done
     lang_$lang
     menu "$@"
     if [ $sel -eq 0 ]; then talk "$T_quit"; exit 0; fi
     # shellcheck disable=SC2086
-    set -- $LANGS
+    set -- $order
     eval "lang=\${$sel}"
     lang_$lang
-    picked=1
+    lang_picked=1
     [ -z "$preview" ] || printf '\n  \033[33m%s\033[0m\n' "$T_prev"
     echo
     animate boot
     sel=1
     if [ -n "$installed" ]; then
-        talk "$T_hi_old"
+        talk "$T_hi_old" pet
         menu "$T_update" "$T_uninstall"
         set -- quit update uninstall
     else
-        talk "$T_hi_new"
+        talk "$T_hi_new" pet
         menu "$T_install"
         set -- quit install
     fi
@@ -746,7 +818,7 @@ case ${action:-install} in
         do_uninstall
         echo
         animate unprint
-        talk "$T_bye"
+        talk "$T_bye" pet
         say "$T_left" ;;
     quit)
         talk "$T_quit" ;;

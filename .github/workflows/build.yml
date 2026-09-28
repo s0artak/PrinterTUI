@@ -30,6 +30,24 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
+      # the installers: syntax, and the speech bubble's text measuring with this system's awk / PowerShell
+      - if: runner.os != 'Windows'
+        run: |
+          sh -n install.sh
+          sed -n '/^wrap() {/,/^}/p' install.sh > wrap.sh
+          . ./wrap.sh
+          test "$(wrap '你好 ab' 20)" = "$(printf '7\t你好 ab')"
+          test "$(wrap 'aaaa bbbbb' 9 | wc -l | tr -d ' ')" = 2
+          test "$(wrap 'पेज स्कैन' 20 | cut -f1)" = 6
+      - if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile("$PWD\install.ps1", [ref]$null, [ref]$errors)
+          if ($errors) { $errors; exit 1 }
+          $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -in 'Cols', 'Wrap' }, $true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
+          if ((Cols ([string]::new([char[]](0x4F60, 0x597D))) + 'ab') -ne 6) { exit 1 }
+          if ((Wrap 'aaaa bbbbb' 9).Count -ne 2) { exit 1 }
       - if: matrix.test
         run: cargo test --release --target ${{ matrix.target }}
       - run: cp target/${{ matrix.target }}/release/printertui${{ matrix.exe }} ${{ matrix.name }}

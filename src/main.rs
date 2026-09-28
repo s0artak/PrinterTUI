@@ -1192,7 +1192,7 @@ impl App {
     /// Saves the settings right away, as the Settings tab changes them.
     fn save_settings(&mut self) {
         if let Err(e) = self.save() {
-            self.status = format!("{}", fill(t().settings_not_saved, &[("e", &e)]));
+            self.status = fill(t().settings_not_saved, &[("e", &e)]);
         }
     }
 
@@ -1704,7 +1704,7 @@ fn draw_config(f: &mut Frame, _app: &App, area: ratatui::layout::Rect) {
     let text = config_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
     let mut lines = vec![Line::styled(fill(t().saved_to, &[("path", &path)]), Style::new().fg(theme().dim)), Line::default()];
     lines.extend(parse_config(&text).into_iter().map(|(k, v)| {
-        Line::from(vec![Span::styled(format!("{k}"), Style::new().fg(ACCENT)), Span::styled("=", Style::new().fg(theme().dim)), Span::raw(v.to_string())])
+        Line::from(vec![Span::styled(k.to_string(), Style::new().fg(ACCENT)), Span::styled("=", Style::new().fg(theme().dim)), Span::raw(v.to_string())])
     }));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }

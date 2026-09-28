@@ -401,6 +401,7 @@ fn cups_copy_of_the_state() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_draws_and_reads_pages() {
+    let _one = SPAWNS.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("printertui-macos-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let txt = dir.join("hello.txt").to_string_lossy().into_owned();
@@ -432,7 +433,7 @@ fn lpq_rows() {
 
 /// Tests that spawn tools run one at a time, since `stop_all` kills every running tool.
 #[cfg(test)]
-static SPAWNS: Mutex<()> = Mutex::new(());
+pub(crate) static SPAWNS: Mutex<()> = Mutex::new(());
 
 #[test]
 fn stop_all_kills_tools_and_their_children() {

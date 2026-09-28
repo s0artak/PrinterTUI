@@ -39,7 +39,71 @@ if ($tty -and $PSVersionTable.PSVersion.Major -lt 6 -and -not $Host.UI.SupportsV
 
 function W([string]$s) { [Console]::Write($s) }
 function Say([string]$t) { W "  $E[38;5;69m▸$E[0m $t`n" }
-function Talk([string]$t) { W "`n  $E[1;38;5;69m$t$E[0m`n`n" }
+# The printer's speech bubble, as in the app. With -Pet it goes beside the printer just drawn,
+# its tail pointing at it; -Color 203 draws it red, for errors.
+function Talk([string]$t, [switch]$Pet, [int]$Color = 69) {
+    if (-not $tty) { W "`n  $t`n`n"; return }
+    $cols = try { [Console]::WindowWidth } catch { 80 }
+    $left = if ($Pet -and $script:drawn -and $cols -ge 64) { 24 } else { 2 }
+    $lines = Wrap $t ([math]::Min(60, $cols - $left - 5))
+    $w = ($lines | Measure-Object -Property Cols -Maximum).Maximum
+    $c = "$E[38;5;$($Color)m"
+    $go = "$E[$($left + 1)G"
+    $bar = [string]::new([char]0x2500, $w + 2)
+    # beside the printer: back up to its second row, so the tail meets its lights
+    if ($left -gt 2) { W "$E[$($script:drawn - 1)A" } else { W "`n" }
+    W "$go$c$([char]0x256D)$bar$([char]0x256E)$E[0m`n"
+    $first = $true
+    foreach ($l in $lines) {
+        $edge = if ($left -gt 2 -and $first) { [char]0x25C0 } else { [char]0x2502 }
+        W "$go$c$edge$E[0m $($l.Text)$(' ' * ($w - $l.Cols)) $c$([char]0x2502)$E[0m`n"
+        $first = $false
+    }
+    W "$go$c$([char]0x2570)$bar$([char]0x256F)$E[0m`n"
+    if ($left -gt 2 -and $lines.Count + 3 -lt $script:drawn) { W "$E[$($script:drawn - $lines.Count - 3)B" }
+    W "`n"
+    $script:drawn = 0
+}
+
+# Screen columns of a text: Chinese takes two, the marks Hindi, Bengali and Arabic draw over the
+# letter before take none.
+function Cols([string]$s) {
+    $w = 0
+    foreach ($ch in $s.ToCharArray()) {
+        $u = [int]$ch
+        if ([char]::IsLowSurrogate($ch)) { continue }
+        if ([char]::IsHighSurrogate($ch)) { $w += 2; continue }
+        $cat = [Globalization.CharUnicodeInfo]::GetUnicodeCategory($ch)
+        if ($cat -in 'NonSpacingMark', 'EnclosingMark', 'Format') { continue }
+        $wide = ($u -ge 0x1100 -and $u -le 0x115F) -or ($u -ge 0x2E80 -and $u -le 0xA4CF) -or ($u -ge 0xAC00 -and $u -le 0xD7A3) -or
+            ($u -ge 0xF900 -and $u -le 0xFAFF) -or ($u -ge 0xFE30 -and $u -le 0xFE4F) -or ($u -ge 0xFF00 -and $u -le 0xFF60) -or ($u -ge 0xFFE0 -and $u -le 0xFFE6)
+        $w += if ($wide) { 2 } else { 1 }
+    }
+    $w
+}
+
+# Word-wraps a text into lines of at most $max screen columns.
+function Wrap([string]$t, [int]$max) {
+    $out = @()
+    $line = ''
+    $lw = 0
+    foreach ($word in $t -split ' ') {
+        $ww = Cols $word
+        if ($lw -gt 0 -and $lw + 1 + $ww -gt $max) {
+            $out += [pscustomobject]@{ Cols = $lw; Text = $line }
+            $line = $word
+            $lw = $ww
+        } elseif ($lw -gt 0) {
+            $line += " $word"
+            $lw += 1 + $ww
+        } else {
+            $line = $word
+            $lw = $ww
+        }
+    }
+    $out += [pscustomobject]@{ Cols = $lw; Text = $line }
+    , $out
+}
 function Fail([string]$t) { W "  $E[31m✗ $t$E[0m`n" }
 # every step that changes the system goes through Step, so the preview can skip it
 function Step([string]$what, [scriptblock]$do) {
@@ -542,7 +606,7 @@ function Install-PrinterTUI([bool]$libreoffice, [bool]$onDesktop) {
     if ($status -eq 0) { Animate 'finish' } else { Animate 'jam' }
     if ($status -ne 0) {
         Remove-Item $tmp -ErrorAction SilentlyContinue
-        if ($status -eq 1) { Talk $T.jam; Fail $T.e_net } else { Talk $T.smudge; Fail $T.e_sum }
+        if ($status -eq 1) { Talk $T.jam -Pet -Color 203; Fail $T.e_net } else { Talk $T.smudge -Pet -Color 203; Fail $T.e_sum }
         return $false
     }
     W "`n"
@@ -594,8 +658,10 @@ function Save-Lang([string]$code) {
 # --- main -----------------------------------------------------------------------------------
 $installed = if ($preview) { $preview -eq 'installed' } else { Test-Path $exe }
 $codes = @($Langs.Keys)
-$lang = $codes.IndexOf([Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName)
-if ($lang -lt 0) { $lang = 0 }
+# the system's language comes first in the menu
+$system = [Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName
+if ($codes -contains $system) { $codes = @($system) + @($codes | Where-Object { $_ -ne $system }) }
+$lang = 0
 $T = $Langs[$codes[$lang]]
 
 $picked = $false
@@ -613,10 +679,10 @@ try {
         W "`n"
         Animate 'boot'
         if ($installed) {
-            Talk $T.hi_old
+            Talk $T.hi_old -Pet
             $action = @('quit', 'update', 'uninstall')[(Menu @($T.update, $T.uninstall)) + 1]
         } else {
-            Talk $T.hi_new
+            Talk $T.hi_new -Pet
             $action = @('quit', 'install')[(Menu @($T.install)) + 1]
         }
         if ($action -eq 'install' -or $action -eq 'update') {
@@ -632,7 +698,7 @@ try {
         'quit' { Talk $T.quit }
         'uninstall' {
             Uninstall-PrinterTUI
-            Talk $T.bye
+            Talk $T.bye -Pet
             Say $T.left_win
         }
         default {
