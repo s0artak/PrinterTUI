@@ -43,10 +43,12 @@ jobs:
         shell: powershell
         run: |
           $errors = $null
-          $ast = [System.Management.Automation.Language.Parser]::ParseFile("$PWD\install.ps1", [ref]$null, [ref]$errors)
+          # as `irm | iex` gets it: UTF-8 (Windows PowerShell would read the file as ANSI)
+          $source = [IO.File]::ReadAllText("$PWD\install.ps1", [Text.Encoding]::UTF8)
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$null, [ref]$errors)
           if ($errors) { $errors; exit 1 }
           $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -in 'Cols', 'Wrap' }, $true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
-          if ((Cols ([string]::new([char[]](0x4F60, 0x597D))) + 'ab') -ne 6) { exit 1 }
+          if ((Cols ([string]::new([char[]](0x4F60, 0x597D)) + 'ab')) -ne 6) { exit 1 }
           if ((Wrap 'aaaa bbbbb' 9).Count -ne 2) { exit 1 }
       - if: matrix.test
         run: cargo test --release --target ${{ matrix.target }}
