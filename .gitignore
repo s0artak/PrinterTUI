@@ -1,3 +1,5 @@
 /target/
 /tmp/
 /.claude/
+# full-resolution demo video, kept local (docs/demo.mp4 is the one in the repo)
+/docs/demo-hq.mp4
