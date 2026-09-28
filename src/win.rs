@@ -20,9 +20,14 @@ use windows::Win32::Graphics::Printing::*;
 use windows::Win32::Storage::Xps::{AbortDoc, EndDoc, EndPage, StartDocW, StartPage, DOCINFOW};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
-pub const ADD_PRINTER_NOTE: &str = "Windows will ask you to allow it";
-pub const PICK_HINT: &str = "the file dialog was closed";
-pub const SCANNER_HINT: &str = "USB scanners need their Windows driver installed";
+
+/// The user's first display language, like "es-ES".
+pub fn system_language() -> String {
+    windows::Globalization::ApplicationLanguages::Languages()
+        .and_then(|l| l.GetAt(0))
+        .map(|l| l.to_string())
+        .unwrap_or_default()
+}
 
 /// Printer of each job id seen, since winspool needs the printer to look a job up.
 static JOB_PRINTER: Mutex<Option<HashMap<u32, String>>> = Mutex::new(None);
@@ -70,13 +75,13 @@ fn enum_buffer(call: impl Fn(Option<&mut [u8]>, &mut u32, &mut u32) -> bool) -> 
     (buf, count as usize)
 }
 
-/// Installed printers as (name, port, attributes).
-fn installed() -> Vec<(String, String, u32)> {
+/// Installed printers as (name, port, attributes, status).
+fn installed() -> Vec<(String, String, u32, u32)> {
     let (buf, n) = enum_buffer(|b, need, count| unsafe {
         EnumPrintersW(PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS, PCWSTR::null(), 2, b, need, count).is_ok()
     });
     let infos = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const PRINTER_INFO_2W, n) };
-    infos.iter().map(|p| (text(p.pPrinterName), text(p.pPortName), p.Attributes)).collect()
+    infos.iter().map(|p| (text(p.pPrinterName), text(p.pPortName), p.Attributes, p.Status)).collect()
 }
 
 /// Network address in a printer port: "IP_192.168.1.46", "192.168.1.46" or "http://host:631/...".
@@ -90,7 +95,7 @@ fn port_host(port: &str) -> Option<String> {
 
 /// Installed printers, default printer first.
 pub fn printers() -> Vec<String> {
-    let mut list: Vec<String> = installed().into_iter().map(|(name, _, _)| name).collect();
+    let mut list: Vec<String> = installed().into_iter().map(|(name, ..)| name).collect();
     let mut buf = [0u16; 512];
     let mut len = buf.len() as u32;
     if unsafe { GetDefaultPrinterW(Some(PWSTR(buf.as_mut_ptr())), &mut len) }.as_bool() {
@@ -107,7 +112,7 @@ pub fn printer_labels(queues: &[String]) -> Vec<String> {
     let all = installed();
     queues
         .iter()
-        .map(|q| match all.iter().find(|(name, _, _)| name == q).and_then(|(_, port, _)| port_host(port)) {
+        .map(|q| match all.iter().find(|(name, ..)| name == q).and_then(|(_, port, ..)| port_host(port)) {
             Some(host) => format!("{q} ({host})"),
             None => q.clone(),
         })
@@ -116,7 +121,7 @@ pub fn printer_labels(queues: &[String]) -> Vec<String> {
 
 /// Hosts of the installed network printers, to try as eSCL scanners.
 pub fn printer_hosts() -> Vec<String> {
-    let mut hosts: Vec<String> = installed().iter().filter_map(|(_, port, _)| port_host(port)).collect();
+    let mut hosts: Vec<String> = installed().iter().filter_map(|(_, port, ..)| port_host(port)).collect();
     hosts.extend(ipp_urls().iter().filter_map(|u| uri_host(u)).map(|(_, host)| host.to_string()));
     hosts.sort();
     hosts.dedup();
@@ -300,10 +305,33 @@ fn draw_sheet(hdc: HDC, doc: &PdfDocument, sheet: &[u32], job: &Job) -> Result<(
     Ok(())
 }
 
-/// Ink levels are not read on Windows yet.
-// ponytail: the spooler has no ink API; ask the printer over IPP (marker-levels) like CUPS does if wanted
-pub fn ink(_queue: &str) -> Vec<(u32, i32)> {
-    Vec::new()
+/// Spooler status bits and the IPP printer-state-reasons they stand for.
+const PROBLEMS: [(u32, &str); 8] = [
+    (PRINTER_STATUS_PAUSED, "stopped"),
+    (PRINTER_STATUS_PAPER_JAM, "media-jam"),
+    (PRINTER_STATUS_PAPER_OUT, "media-empty"),
+    (PRINTER_STATUS_OFFLINE, "offline"),
+    (PRINTER_STATUS_NOT_AVAILABLE, "offline"),
+    (PRINTER_STATUS_DOOR_OPEN, "door-open"),
+    (PRINTER_STATUS_NO_TONER, "marker-supply-empty"),
+    (PRINTER_STATUS_OUTPUT_BIN_FULL, "output-area-full"),
+];
+
+/// The printer's problems from the spooler, and its ink asked over IPP when it is on the network.
+// ponytail: printers added by URL only (a "WSD-..." port) have no address here, so no ink
+pub fn printer_state(queue: &str) -> PrinterState {
+    let Some((_, port, _, status)) = installed().into_iter().find(|(name, ..)| name == queue) else {
+        return PrinterState::default();
+    };
+    let mut state = port_host(&port)
+        .and_then(|host| ipp_attributes(&format!("ipp://{host}/ipp/print"), &STATE_ATTRIBUTES).ok())
+        .map_or_else(PrinterState::default, |attrs| PrinterState::from(&attrs));
+    for (bit, problem) in PROBLEMS {
+        if status & bit != 0 && !state.problems.iter().any(|p| p == problem) {
+            state.problems.push(problem.into());
+        }
+    }
+    state
 }
 
 /// One page of a PDF as a PNG for the preview, drawn by pdfium.
@@ -339,7 +367,7 @@ pub fn job_active(id: &str) -> bool {
 /// Unfinished jobs on all printers as (job id, "file  (owner, printer, pages)") for the queue popup.
 pub fn queue() -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for (printer, _, _) in installed() {
+    for (printer, ..) in installed() {
         let _ = with_printer(&printer, |h| {
             let (buf, n) = enum_buffer(|b, need, count| unsafe { EnumJobsW(h, 0, 999, 1, b, need, count).is_ok() });
             let jobs = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const JOB_INFO_1W, n) };

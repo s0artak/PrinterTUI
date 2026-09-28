@@ -12,7 +12,7 @@ Arch Linux or macOS (with [Homebrew](https://brew.sh)), one command and `printer
 curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.sh | sh
 ```
 
-It asks for a language, offers the optional extras (LibreOffice, SANE, Tesseract) and checks the download against its SHA-256 before installing it to `/usr/local/bin` (`$(brew --prefix)/bin` on macOS), which is already on your PATH. Run it again to Update or Uninstall, or uninstall directly:
+It asks for a language (the app then speaks it too), offers the optional extras (LibreOffice, SANE, Tesseract) and checks the download against its SHA-256 before installing it to `/usr/local/bin` (`$(brew --prefix)/bin` on macOS), which is already on your PATH. Run it again to Update or Uninstall, or uninstall directly:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.sh | sh -s uninstall
@@ -47,14 +47,21 @@ printertui [file]
 | Tab | Switch between Print and Scan |
 | `j` / `k`, `gg` / `G` | Move |
 | `h` / `l` | Change option |
+| `H` / `L` | Browse the preview's pages, or the scanned pages |
 | `i` | Type in File or Pages (Esc to finish) |
 | Enter | Pick files, pick pages, print, scan, save |
 | `q` | Quit |
 
-The page about to print is previewed on the right, converted and scaled as it will come out: `H`/`L` browse the pages (or the sheets, with several pages per sheet). **Scale** shrinks or enlarges the content (25-200%) on the same paper. Photos (JPEG, PNG) print without LibreOffice, filling the paper and turned upright. The printer's ink levels show under the form when it reports them (CUPS). The pixel-art printer from the installer keeps you company: it prints, scans and jams along with the app.
+**Preview.** The page about to print is shown on the right as it will come out, converted and scaled: `H`/`L` browse the pages, or the sheets with several pages per sheet. Images show in full quality in kitty and Ghostty (also inside tmux with `set -g allow-passthrough on`) and in Sixel terminals (Windows Terminal, foot, WezTerm, mintty), in colored blocks elsewhere.
 
-Double-sided: the front pages print, then flip the stack and press Enter. An animation shows how to flip it. If the back pages come out in the wrong order, set **Back order** to *Reversed*.
+**Scale** shrinks or enlarges the content (25-200%) on the same paper, centered; above 100% the edges are cut off. **Photos** (JPEG, PNG) print without LibreOffice, filling the paper and turned upright as the camera took them.
 
-Scan: put a page on the glass, press Enter on **Scan page**, repeat for more pages, then **Save** them as one PDF or as PNG files, or **Copy** them: they print at their real size with the Print tab's settings (with nothing scanned yet, Copy scans a page and prints it, like a photocopier). On the **Page** row: `h`/`l` browse pages, `r`/`R` rotate, `f` filter (gray, black & white), `x` keep or leave out, `H`/`L` reorder, `dd` delete. The last scanned page is previewed on the right: as the real image in kitty and Ghostty (also inside tmux with `set -g allow-passthrough on`), in grayscale blocks elsewhere.
+**The printer.** The pixel-art printer from the installer lives in the app: it prints the pages you send, scans with a sweeping light, hops when you change a setting and jams on errors. It also tells how the real printer is doing, asked over IPP every 20 seconds: its ink tanks fill up to the real levels (in red when low), its tray empties when the printer is out of paper, its lights go out when the printer is off or paused, and it says what to do about a jam or an open cover. On Windows the problems come from the print spooler and the ink over IPP, for printers added by IP address.
 
-Settings are remembered in `~/.config/printertui/config`.
+**Double-sided**: the front pages print, then an animation shows how to flip the stack and put it back; press Enter for the back pages. If they come out in the wrong order, set **Back order** to *Reversed*.
+
+**Scan**: put a page on the glass, press Enter on **Scan page**, repeat for more pages, then **Save** them as one PDF (optionally searchable) or as PNG files, or **Copy** them: they print at their real size with the Print tab's settings (with nothing scanned yet, Copy scans a page and prints it, like a photocopier). On the **Page** row: `h`/`l` browse pages (`H`/`L` from any row), `r`/`R` rotate, `f` filter (gray, black & white), `x` keep or leave out, `<`/`>` reorder, `dd` delete.
+
+**Languages**: English, 中文, हिन्दी, Español, العربية, Français, বাংলা, Português, Русский and Bahasa Indonesia, the same as the installer. The app follows the language picked in the installer's menu, else the system's; set `lang=es` (or another code) in the settings to change it.
+
+Settings are remembered in `~/.config/printertui/config` (`%APPDATA%\printertui\config` on Windows).

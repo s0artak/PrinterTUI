@@ -666,6 +666,18 @@ do_install() {
     run rm -f "$HOME/.local/bin/printertui" # older installs, would shadow the new one
 }
 
+# the app speaks the language picked in the menu (without a menu it follows the system's)
+save_lang() {
+    [ -n "$picked" ] || return 0
+    conf="${XDG_CONFIG_HOME:-$HOME/.config}/printertui/config"
+    if [ -n "$preview" ]; then
+        printf '    \033[2m%s lang=%s > %s\033[0m\n' "$T_skip" "$lang" "$conf"
+        return
+    fi
+    mkdir -p "$(dirname "$conf")"
+    { grep -v '^lang=' "$conf" 2>/dev/null; echo "lang=$lang"; } > "$conf.tmp" && mv "$conf.tmp" "$conf"
+}
+
 # --- main -------------------------------------------------------------------
 installed=
 if [ -n "$preview" ]; then
@@ -678,7 +690,7 @@ fi
 extras=000 checked=
 
 # the system language is preselected in the menu, and used as is when there is no menu
-sel=1 i=1 lang=en
+sel=1 i=1 lang=en picked=
 for c in $LANGS; do
     case ${LC_ALL:-${LC_MESSAGES:-${LANG:-}}} in "$c"*) sel=$i lang=$c ;; esac
     i=$((i + 1))
@@ -697,6 +709,7 @@ if [ -z "$action" ] && [ -n "$tty" ]; then
     set -- $LANGS
     eval "lang=\${$sel}"
     lang_$lang
+    picked=1
     [ -z "$preview" ] || printf '\n  \033[33m%s\033[0m\n' "$T_prev"
     echo
     animate boot
@@ -727,6 +740,7 @@ fi
 case ${action:-install} in
     install | update | reinstall)
         do_install
+        save_lang
         talk "$T_done" ;;
     uninstall)
         do_uninstall

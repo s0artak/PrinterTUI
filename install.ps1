@@ -580,6 +580,17 @@ function Uninstall-PrinterTUI {
     Animate 'unprint'
 }
 
+# the app speaks the language picked in the menu (without a menu it follows the system's)
+function Save-Lang([string]$code) {
+    $conf = Join-Path $env:APPDATA 'printertui\config'
+    Step "lang=$code > $conf" {
+        New-Item -ItemType Directory -Force (Split-Path $conf) | Out-Null
+        $lines = @(if (Test-Path $conf) { [IO.File]::ReadAllLines($conf) | Where-Object { $_ -notmatch '^lang=' } })
+        # UTF-8 without the BOM Windows PowerShell adds, which the app would read as part of a key
+        [IO.File]::WriteAllLines($conf, [string[]]($lines + "lang=$code"), [Text.UTF8Encoding]::new($false))
+    }
+}
+
 # --- main -----------------------------------------------------------------------------------
 $installed = if ($preview) { $preview -eq 'installed' } else { Test-Path $exe }
 $codes = @($Langs.Keys)
@@ -587,6 +598,7 @@ $lang = $codes.IndexOf([Globalization.CultureInfo]::CurrentUICulture.TwoLetterIS
 if ($lang -lt 0) { $lang = 0 }
 $T = $Langs[$codes[$lang]]
 
+$picked = $false
 try {
     $action = if ($installed) { 'update' } else { 'install' }
     $libreoffice = $false
@@ -596,6 +608,7 @@ try {
         $lang = Menu @($codes | ForEach-Object { $Langs[$_].name }) $lang
         if ($lang -lt 0) { Talk $Langs[$codes[0]].quit; return }
         $T = $Langs[$codes[$lang]]
+        $picked = $true
         if ($preview) { W "`n  $E[33m$($T.prev)$E[0m`n" }
         W "`n"
         Animate 'boot'
@@ -624,6 +637,7 @@ try {
         }
         default {
             if (Install-PrinterTUI $libreoffice $onDesktop) {
+                if ($picked) { Save-Lang $codes[$lang] }
                 Talk $T.done
                 Say $T.start
             }

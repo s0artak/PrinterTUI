@@ -10,6 +10,7 @@ lopdf = { version = "0.45.0", default-features = false }
 minreq = "3.0.0"
 pdf-writer = "0.15.0"
 ratatui = "0.30.2"
+unicode-width = "0.2.2"
 
 [target."cfg(windows)".dependencies]
 mdns-sd = "0.21.4"

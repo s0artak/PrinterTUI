@@ -297,6 +297,8 @@ pub fn config_path() -> Option<std::path::PathBuf> {
 
 /// `key=value` lines as trimmed pairs; other lines are skipped.
 pub fn parse_config(text: &str) -> Vec<(&str, &str)> {
+    // Notepad and Windows PowerShell start UTF-8 files with a byte order mark
+    let text = text.trim_start_matches('\u{feff}');
     text.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect()
 }
 
@@ -331,6 +333,139 @@ pub fn queue_name(host: &str) -> String {
 pub fn uri_host(uri: &str) -> Option<(&str, &str)> {
     let (scheme, rest) = uri.split_once("://")?;
     Some((scheme, rest.split(['/', ':', '?']).next().filter(|h| !h.is_empty())?))
+}
+
+/// A value of an IPP attribute: integers and enums, or text (keywords, names, uris).
+#[derive(Debug, Clone, PartialEq)]
+pub enum IppValue {
+    Int(i32),
+    Text(String),
+}
+
+pub type IppAttributes = std::collections::HashMap<String, Vec<IppValue>>;
+
+/// What the printer state shows: ink, and the problems that need a person.
+pub const STATE_ATTRIBUTES: [&str; 5] = ["printer-state", "printer-state-reasons", "marker-colors", "marker-levels", "marker-low-levels"];
+
+/// Asks a printer for attributes over IPP (Get-Printer-Attributes). `url` is its ipp://,
+/// ipps:// or http:// address; the request goes over plain HTTP, port 631 unless one is given.
+pub fn ipp_attributes(url: &str, names: &[&str]) -> Result<IppAttributes, String> {
+    let (_, rest) = url.split_once("://").ok_or(format!("Bad printer address: {url}"))?;
+    let (authority, path) = rest.find('/').map_or((rest, "/ipp/print"), |i| (&rest[..i], &rest[i..]));
+    let authority = if authority.contains(':') { authority.to_string() } else { format!("{authority}:631") };
+    let mut body = vec![1, 1, 0, 0x0B, 0, 0, 0, 1, 0x01];
+    let mut attr = |tag: u8, name: &str, value: &[u8]| {
+        body.push(tag);
+        body.extend((name.len() as u16).to_be_bytes());
+        body.extend(name.as_bytes());
+        body.extend((value.len() as u16).to_be_bytes());
+        body.extend(value);
+    };
+    attr(0x47, "attributes-charset", b"utf-8");
+    attr(0x48, "attributes-natural-language", b"en");
+    attr(0x45, "printer-uri", format!("ipp://{authority}{path}").as_bytes());
+    for (i, name) in names.iter().enumerate() {
+        // more values of the same attribute have no name
+        attr(0x44, if i == 0 { "requested-attributes" } else { "" }, name.as_bytes());
+    }
+    body.push(0x03);
+    let res = minreq::post(format!("http://{authority}{path}"))
+        .with_header("Content-Type", "application/ipp")
+        .with_body(body)
+        .with_timeout(3)
+        .send()
+        .map_err(|e| e.to_string())?;
+    parse_ipp(res.as_bytes()).ok_or(format!("{url}: not an IPP answer"))
+}
+
+/// An IPP response's attributes; None when it is malformed or reports an error.
+fn parse_ipp(data: &[u8]) -> Option<IppAttributes> {
+    let take = |i: &mut usize, n: usize| {
+        let part = data.get(*i..*i + n)?;
+        *i += n;
+        Some(part)
+    };
+    let short = |i: &mut usize| take(i, 2).map(|b| u16::from_be_bytes([b[0], b[1]]) as usize);
+    if u16::from_be_bytes([*data.get(2)?, *data.get(3)?]) >= 0x0400 {
+        return None;
+    }
+    let (mut i, mut attrs, mut last) = (8, IppAttributes::new(), String::new());
+    while let Some(&tag) = data.get(i) {
+        i += 1;
+        match tag {
+            0x03 => break,
+            // the start of an attribute group
+            0x00..=0x0F => continue,
+            _ => {}
+        }
+        let n = short(&mut i)?;
+        let name = String::from_utf8_lossy(take(&mut i, n)?).into_owned();
+        let n = short(&mut i)?;
+        let value = take(&mut i, n)?;
+        if !name.is_empty() {
+            last = name;
+        }
+        let value = match (tag, value) {
+            (0x21 | 0x23, &[a, b, c, d]) => IppValue::Int(i32::from_be_bytes([a, b, c, d])),
+            _ => IppValue::Text(String::from_utf8_lossy(value).into_owned()),
+        };
+        attrs.entry(last.clone()).or_default().push(value);
+    }
+    Some(attrs)
+}
+
+/// What a printer reports about itself.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct PrinterState {
+    /// Each ink or toner as (RGB color, percent or -1 when unknown, running low).
+    pub ink: Vec<(u32, i32, bool)>,
+    /// What needs a person, as IPP printer-state-reasons without their -error / -warning
+    /// ending: "media-empty", "media-jam", "door-open", "offline", "stopped"...
+    pub problems: Vec<String>,
+}
+
+impl PrinterState {
+    /// From IPP attributes, or from CUPS' copy of them (see `STATE_ATTRIBUTES`).
+    pub fn from(attrs: &IppAttributes) -> PrinterState {
+        let ints = |key: &str| -> Vec<i32> {
+            attrs.get(key).into_iter().flatten().map(|v| match v {
+                IppValue::Int(n) => *n,
+                IppValue::Text(t) => t.trim().parse().unwrap_or(-1),
+            }).collect()
+        };
+        let texts = |key: &str| -> Vec<String> {
+            attrs.get(key).into_iter().flatten().filter_map(|v| match v {
+                IppValue::Text(t) => Some(t.clone()),
+                IppValue::Int(_) => None,
+            }).collect()
+        };
+        let (levels, lows) = (ints("marker-levels"), ints("marker-low-levels"));
+        let ink = texts("marker-colors")
+            .iter()
+            .zip(&levels)
+            .enumerate()
+            .map(|(i, (color, &level))| {
+                // a marker with several colors ("#00FFFF#FF00FF") shows the first
+                let rgb = color.get(1..7).and_then(|c| u32::from_str_radix(c, 16).ok()).unwrap_or(0x808080);
+                let level = if level < 0 { -1 } else { level };
+                (rgb, level, level >= 0 && level <= lows.get(i).copied().unwrap_or(10).max(10))
+            })
+            .collect();
+        let mut problems: Vec<String> = texts("printer-state-reasons")
+            .iter()
+            // -report ones are just news
+            .filter(|r| !r.ends_with("-report"))
+            .map(|r| r.trim_end_matches("-error").trim_end_matches("-warning").to_string())
+            // low ink shows on the tanks; CUPS' own notes are not the printer's
+            .filter(|r| r != "none" && !r.starts_with("cups-") && !r.ends_with("-low"))
+            .collect();
+        // 5: stopped (a paused queue, or a printer that gave up)
+        if ints("printer-state") == [5] {
+            problems.push("stopped".into());
+        }
+        problems.dedup();
+        PrinterState { ink, problems }
+    }
 }
 
 pub const SCAN_MODES: [&str; 2] = ["Color", "Gray"];
@@ -788,6 +923,40 @@ fn photo_fills_the_paper_and_sheets_hold_their_pages() {
     assert!(img.get_pixel(sw / 4, sh / 4)[0] < 50 && img.get_pixel(sw * 3 / 4, sh / 4)[0] < 50 && img.get_pixel(sw / 4, sh * 3 / 4)[0] < 50);
     assert!(img.get_pixel(sw * 3 / 4, sh * 3 / 4)[0] > 200);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn config_with_a_byte_order_mark() {
+    assert_eq!(parse_config("\u{feff}printer=Tank\r\nlang=es\n"), [("printer", "Tank"), ("lang", "es")]);
+}
+
+#[test]
+fn ipp_answer_to_state() {
+    // a Get-Printer-Attributes answer: status ok, printer group, then the attributes
+    let mut data = vec![1, 1, 0, 0, 0, 0, 0, 1, 0x04];
+    let mut attr = |tag: u8, name: &str, value: &[u8]| {
+        data.push(tag);
+        data.extend((name.len() as u16).to_be_bytes());
+        data.extend(name.as_bytes());
+        data.extend((value.len() as u16).to_be_bytes());
+        data.extend(value);
+    };
+    attr(0x23, "printer-state", &3i32.to_be_bytes());
+    attr(0x44, "printer-state-reasons", b"media-empty-error");
+    attr(0x44, "", b"marker-supply-low-warning");
+    attr(0x42, "marker-colors", b"#00FFFF");
+    attr(0x42, "", b"#000000");
+    attr(0x21, "marker-levels", &8i32.to_be_bytes());
+    attr(0x21, "", &60i32.to_be_bytes());
+    attr(0x21, "marker-low-levels", &2i32.to_be_bytes());
+    attr(0x21, "", &2i32.to_be_bytes());
+    data.push(0x03);
+    let state = PrinterState::from(&parse_ipp(&data).unwrap());
+    assert_eq!(state.ink, [(0x00FFFF, 8, true), (0, 60, false)]);
+    assert_eq!(state.problems, ["media-empty"]);
+    // an error status, or a cut-off answer, is no answer
+    assert!(parse_ipp(&[1, 1, 0x04, 0x06, 0, 0, 0, 1, 3]).is_none());
+    assert!(parse_ipp(&data[..30]).is_none());
 }
 
 #[test]

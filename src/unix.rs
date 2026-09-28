@@ -3,9 +3,11 @@
 use crate::*;
 use std::process::Command;
 
-pub const ADD_PRINTER_NOTE: &str = "sudo may ask for your password";
-pub const PICK_HINT: &str = "install yazi, lf, ranger, nnn or fzf";
-pub const SCANNER_HINT: &str = "for other scanners install SANE";
+
+/// The user's language from the locale: "es_ES.UTF-8", "C" when unset.
+pub fn system_language() -> String {
+    ["LC_ALL", "LC_MESSAGES", "LANG"].iter().filter_map(|k| std::env::var(k).ok()).find(|v| !v.is_empty()).unwrap_or_default()
+}
 
 /// Printer URI schemes that point at a network printer.
 const NETWORK: [&str; 6] = ["ipp", "ipps", "socket", "lpd", "http", "https"];
@@ -51,22 +53,31 @@ fn lpoption(lpoptions: &str, key: &str) -> Option<String> {
     Some(v.replace("\\ ", " "))
 }
 
-/// Ink or toner left as (RGB color, percent, -1 when unknown) from the printer's IPP marker
-/// attributes; empty when it does not report them.
-pub fn ink(queue: &str) -> Vec<(u32, i32)> {
-    parse_ink(&run("lpoptions", &["-p", queue]).unwrap_or_default())
+/// The printer's ink and problems: asked over IPP when CUPS reaches it that way (live, and
+/// "offline" when it does not answer), else CUPS' copy from its last job.
+pub fn printer_state(queue: &str) -> PrinterState {
+    let opts = run("lpoptions", &["-p", queue]).unwrap_or_default();
+    let uri = lpoption(&opts, "device-uri").unwrap_or_default();
+    if !matches!(uri_host(&uri), Some(("ipp" | "ipps" | "http", _))) {
+        return cups_state(&opts);
+    }
+    ipp_attributes(&uri, &STATE_ATTRIBUTES).map_or_else(
+        |_| {
+            let mut state = cups_state(&opts);
+            state.problems.push("offline".into());
+            state
+        },
+        |attrs| PrinterState::from(&attrs),
+    )
 }
 
-pub fn parse_ink(lpoptions: &str) -> Vec<(u32, i32)> {
-    let (Some(colors), Some(levels)) = (lpoption(lpoptions, "marker-colors"), lpoption(lpoptions, "marker-levels")) else {
-        return Vec::new();
-    };
-    colors
-        .split(',')
-        .zip(levels.split(','))
-        // a marker with several colors ("#00FFFF#FF00FF") shows the first
-        .map(|(c, l)| (c.get(1..7).and_then(|c| u32::from_str_radix(c, 16).ok()).unwrap_or(0x808080), l.parse().ok().filter(|l| *l >= 0).unwrap_or(-1)))
-        .collect()
+/// CUPS keeps the printer's state attributes as queue options: marker-levels=80,100.
+fn cups_state(lpoptions: &str) -> PrinterState {
+    let attrs = STATE_ATTRIBUTES
+        .iter()
+        .filter_map(|k| Some((k.to_string(), lpoption(lpoptions, k)?.split(',').map(|v| IppValue::Text(v.to_string())).collect())))
+        .collect();
+    PrinterState::from(&attrs)
 }
 
 pub fn printer_labels(queues: &[String]) -> Vec<String> {
@@ -274,11 +285,14 @@ pub fn ocr_pdf(pages: &[String], out: &str, dpi: u32) -> Result<Vec<String>, Str
 }
 
 #[test]
-fn ink_levels() {
-    let out = "device-uri=ipp://192.168.1.46/ipp/print marker-colors=#00FFFF,#000000 marker-levels=80,-1 marker-names='cyan\\ ink,black\\ ink' printer-info=Tank";
-    assert_eq!(parse_ink(out), [(0x00FFFF, 80), (0, -1)]);
-    assert_eq!(printer_label("q", out), "Tank (192.168.1.46)");
-    assert!(parse_ink("printer-info=x").is_empty());
+fn cups_copy_of_the_state() {
+    let out = "device-uri=usb://x marker-colors=#00FFFF,#000000 marker-levels=80,-1 marker-low-levels=2,2 \
+               marker-names='cyan\\ ink,black\\ ink' printer-info=Tank printer-state=5 printer-state-reasons=media-jam-error";
+    let state = cups_state(out);
+    assert_eq!(state.ink, [(0x00FFFF, 80, false), (0, -1, false)]);
+    assert_eq!(state.problems, ["media-jam", "stopped"]);
+    assert_eq!(printer_label("q", out), "Tank");
+    assert_eq!(cups_state("printer-info=x"), PrinterState::default());
 }
 
 #[test]
