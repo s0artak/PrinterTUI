@@ -156,8 +156,25 @@ pub fn add_printer(name: &str, uri: &str) -> Result<(), String> {
     if ok { Ok(()) } else { Err(format!("lpadmin failed for {uri}")) }
 }
 
+/// macOS: the system's file dialog (cancelling it picks nothing).
+#[cfg(target_os = "macos")]
+pub fn pick_files() -> Vec<String> {
+    let script = [
+        "activate",
+        "set picked to choose file with prompt \"PrinterTUI\" with multiple selections allowed",
+        "set out to \"\"",
+        "repeat with f in picked",
+        "set out to out & POSIX path of f & linefeed",
+        "end repeat",
+        "return out",
+    ];
+    let args: Vec<&str> = script.iter().flat_map(|l| ["-e", *l]).collect();
+    run("osascript", &args).map_or(Vec::new(), |out| lines(&out))
+}
+
 /// Opens the first installed terminal file manager as a picker, returns the selected files.
 /// Needs the terminal in normal mode.
+#[cfg(not(target_os = "macos"))]
 pub fn pick_files() -> Vec<String> {
     let out = std::env::temp_dir().join(format!("printertui-pick-{}", std::process::id()));
     let o = out.to_str().unwrap_or_default();
@@ -207,15 +224,70 @@ pub fn lp_args(job: &Job) -> Vec<String> {
     a
 }
 
-/// One page of a PDF as a PNG for the preview: poppler's pdftoppm, or on macOS without it the
-/// system's sips, which only draws the first page.
+/// macOS: JavaScript for Automation, which reaches the system's own frameworks (PDFKit, Vision)
+/// with nothing to install. `run(argv)` gets `args`; what it returns is the output.
+#[cfg(target_os = "macos")]
+fn jxa(script: &str, args: &[&str]) -> Result<String, String> {
+    let mut all = vec!["-l", "JavaScript", "-e", script];
+    all.extend(args);
+    run("osascript", &all)
+}
+
+/// PDFKit draws page argv[1] of argv[0] at 100 dpi into the PNG argv[2].
+#[cfg(target_os = "macos")]
+const RENDER_JS: &str = r#"
+ObjC.import('PDFKit'); ObjC.import('AppKit');
+function run(argv) {
+  const doc = $.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(argv[0]));
+  if (doc.isNil()) throw new Error('cannot open ' + argv[0]);
+  const page = doc.pageAtIndex(Number(argv[1]) - 1);
+  if (page.isNil()) throw new Error('no page ' + argv[1]);
+  const box = page.boundsForBox(0);
+  let w = box.size.width * 100 / 72, h = box.size.height * 100 / 72;
+  if (page.rotation % 180 != 0) [w, h] = [h, w];
+  const img = page.thumbnailOfSizeForBox($.NSMakeSize(Math.round(w), Math.round(h)), 0);
+  const png = $.NSBitmapImageRep.imageRepWithData(img.TIFFRepresentation).representationUsingTypeProperties(4, $({}));
+  if (!png.writeToFileAtomically(argv[2], true)) throw new Error('cannot write ' + argv[2]);
+}"#;
+
+/// Vision reads the text of each image in argv: one line per text line found, as
+/// "image index, x, y, width, height, text" separated by tabs, the box in 0..1 from the bottom left.
+#[cfg(target_os = "macos")]
+const OCR_JS: &str = r#"
+ObjC.import('Vision'); ObjC.import('Foundation');
+function run(argv) {
+  const out = [];
+  argv.forEach((path, n) => {
+    const req = $.VNRecognizeTextRequest.alloc.init;
+    req.recognitionLevel = 0;
+    req.usesLanguageCorrection = true;
+    if (req.respondsToSelector('setAutomaticallyDetectsLanguage:')) req.automaticallyDetectsLanguage = true;
+    const handler = $.VNImageRequestHandler.alloc.initWithURLOptions($.NSURL.fileURLWithPath(path), $({}));
+    if (!handler.performRequestsError($([req]), null)) throw new Error('Vision could not read ' + path);
+    const res = req.results;
+    for (let i = 0; i < res.count; i++) {
+      const obs = res.objectAtIndex(i);
+      const top = obs.topCandidates(1);
+      if (top.count == 0) continue;
+      const b = obs.boundingBox;
+      out.push([n, b.origin.x, b.origin.y, b.size.width, b.size.height, top.objectAtIndex(0).string.js.replace(/[\t\n]/g, ' ')].join('\t'));
+    }
+  });
+  return out.join('\n');
+}"#;
+
+/// One page of a PDF as a PNG for the preview: macOS draws it itself (PDFKit), elsewhere
+/// poppler's pdftoppm, which comes with CUPS.
 pub fn render_page(pdf: &str, page: u32, png: &str) -> Result<(), String> {
-    let n = page.to_string();
-    let prefix = png.trim_end_matches(".png");
-    match run("pdftoppm", &["-f", &n, "-l", &n, "-r", "100", "-png", "-singlefile", pdf, prefix]) {
-        Err(_) if cfg!(target_os = "macos") && page == 1 => run("sips", &["-s", "format", "png", pdf, "--out", png]).map(drop),
-        Err(e) if cfg!(target_os = "macos") => Err(format!("Previewing pages after the first needs poppler (brew install poppler): {e}")),
-        r => r.map(drop).map_err(|e| format!("Preview needs pdftoppm (poppler): {e}")),
+    #[cfg(target_os = "macos")]
+    return jxa(RENDER_JS, &[pdf, &page.to_string(), png]).map(drop).map_err(|e| format!("Preview: {e}"));
+    #[cfg(not(target_os = "macos"))]
+    {
+        let n = page.to_string();
+        let prefix = png.trim_end_matches(".png");
+        run("pdftoppm", &["-f", &n, "-l", &n, "-r", "100", "-png", "-singlefile", pdf, prefix])
+            .map(drop)
+            .map_err(|e| format!("Preview needs pdftoppm (poppler): {e}"))
     }
 }
 
@@ -258,8 +330,38 @@ pub fn timestamp() -> String {
     run("date", &["+%Y-%m-%d_%H%M%S"]).unwrap_or_default()
 }
 
-/// Searchable PDF: tesseract lays the recognised text invisibly over each page image.
+/// Searchable PDF: on macOS the system's text recognition (Vision), else tesseract, lays the
+/// recognised text invisibly over each page image.
 pub fn ocr_pdf(pages: &[String], out: &str, dpi: u32) -> Result<Vec<String>, String> {
+    #[cfg(target_os = "macos")]
+    if let Ok(words) = vision_words(pages) {
+        let path = format!("{out}.pdf");
+        std::fs::write(&path, images_to_pdf(pages, dpi, &words)?).map_err(|e| format!("{path}: {e}"))?;
+        return Ok(vec![path]);
+    }
+    tesseract_pdf(pages, out, dpi)
+}
+
+/// The text lines Vision finds on each page, with their boxes in the image's pixels.
+#[cfg(target_os = "macos")]
+fn vision_words(pages: &[String]) -> Result<Vec<Vec<Word>>, String> {
+    let args: Vec<&str> = pages.iter().map(String::as_str).collect();
+    let found = jxa(OCR_JS, &args)?;
+    let sizes = pages.iter().map(|p| image_size(p)).collect::<Result<Vec<_>, _>>()?;
+    let mut words: Vec<Vec<Word>> = pages.iter().map(|_| Vec::new()).collect();
+    for line in found.lines() {
+        let f: Vec<&str> = line.splitn(6, '\t').collect();
+        let [n, x, y, w, h, text] = f[..] else { continue };
+        let (Ok(n), Ok(x), Ok(y), Ok(w), Ok(h)) = (n.parse::<usize>(), x.parse::<f32>(), y.parse::<f32>(), w.parse::<f32>(), h.parse::<f32>()) else { continue };
+        let Some(&(iw, ih)) = sizes.get(n) else { continue };
+        let (iw, ih) = (iw as f32, ih as f32);
+        // Vision's boxes start at the bottom left; images at the top left
+        words[n].push(Word { text: text.to_string(), x: x * iw, y: (1.0 - y - h) * ih, w: w * iw, h: h * ih });
+    }
+    Ok(words)
+}
+
+fn tesseract_pdf(pages: &[String], out: &str, dpi: u32) -> Result<Vec<String>, String> {
     let langs = run("tesseract", &["--list-langs"]).map_err(|_| "Searchable PDF needs tesseract (and tesseract-data-<language>)")?;
     // ponytail: every installed language except osd; slower with many installed, add a picker then
     let langs: Vec<&str> = langs.lines().skip(1).filter(|l| *l != "osd").collect();
@@ -293,6 +395,31 @@ fn cups_copy_of_the_state() {
     assert_eq!(state.problems, ["media-jam", "stopped"]);
     assert_eq!(printer_label("q", out), "Tank");
     assert_eq!(cups_state("printer-info=x"), PrinterState::default());
+}
+
+/// PDFKit draws a page, and Vision reads back the text on it.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_draws_and_reads_pages() {
+    let dir = std::env::temp_dir().join(format!("printertui-macos-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let txt = dir.join("hello.txt").to_string_lossy().into_owned();
+    std::fs::write(&txt, "HELLO PRINTER\n\nsecond page follows\n").unwrap();
+    let pdf = printable(&txt, 100, "A4").unwrap();
+    let png = dir.join("page.png").to_string_lossy().into_owned();
+    render_page(&pdf, 1, &png).unwrap();
+    let (w, h) = image_size(&png).unwrap();
+    // A4 at 100 dpi
+    assert!((820..=830).contains(&w) && (1165..=1175).contains(&h), "{w}x{h}");
+    let words = vision_words(&[png.clone()]).unwrap();
+    let text: Vec<&str> = words[0].iter().map(|w| w.text.as_str()).collect();
+    assert!(text.iter().any(|t| t.contains("HELLO PRINTER")), "{text:?}");
+    // the box is near the top left of the page, where the text is
+    let first = words[0].iter().find(|w| w.text.contains("HELLO")).unwrap();
+    assert!(first.x < w as f32 / 3.0 && first.y < h as f32 / 5.0, "{} {}", first.x, first.y);
+    let searchable = ocr_pdf(&[png], &dir.join("out").to_string_lossy(), 100).unwrap().remove(0);
+    assert_eq!(page_count(&searchable), Some(1));
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

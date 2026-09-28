@@ -3,13 +3,65 @@
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub const ACCENT: Color = Color::Indexed(69);
-pub const DIM: Color = Color::Indexed(245);
 pub const RED: Color = Color::Indexed(203);
 pub const YELLOW: Color = Color::Indexed(221);
 pub const WHITE: Color = Color::Indexed(231);
+
+/// The app's colors: Auto keeps the terminal's own background and text, Dark and Light paint theirs.
+pub struct Theme {
+    pub bg: Option<Color>,
+    pub fg: Option<Color>,
+    /// Labels and hints.
+    pub dim: Color,
+    /// Key chips at the bottom: text on background.
+    pub chip: (Color, Color),
+    /// A value that just changed.
+    pub hop: Color,
+}
+
+/// Auto, Dark, Light; the names the settings file uses.
+pub const THEMES: [(&str, Theme); 3] = [
+    ("auto", Theme { bg: None, fg: None, dim: Color::Indexed(245), chip: (WHITE, Color::Indexed(238)), hop: YELLOW }),
+    ("dark", Theme { bg: Some(Color::Indexed(235)), fg: Some(Color::Indexed(252)), dim: Color::Indexed(245), chip: (WHITE, Color::Indexed(238)), hop: YELLOW }),
+    ("light", Theme { bg: Some(Color::Indexed(255)), fg: Some(Color::Indexed(236)), dim: Color::Indexed(242), chip: (Color::Indexed(236), Color::Indexed(252)), hop: Color::Indexed(166) }),
+];
+
+static THEME: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_theme(i: usize) {
+    THEME.store(i.min(THEMES.len() - 1), Ordering::Relaxed);
+}
+
+pub fn theme() -> &'static Theme {
+    &THEMES[THEME.load(Ordering::Relaxed)].1
+}
+
+/// A 24-bit color, or the nearest of the 256 in terminals without 24-bit color (macOS Terminal).
+pub fn rgb(r: u8, g: u8, b: u8) -> Color {
+    static TRUECOLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let truecolor = *TRUECOLOR.get_or_init(|| {
+        let var = |k| std::env::var(k).unwrap_or_default();
+        var("TERM_PROGRAM") != "Apple_Terminal" || matches!(var("COLORTERM").as_str(), "truecolor" | "24bit")
+    });
+    if truecolor { Color::Rgb(r, g, b) } else { Color::Indexed(to_256(r, g, b)) }
+}
+
+/// The nearest xterm-256 color: a gray from the ramp, or one of the 6x6x6 cube.
+fn to_256(r: u8, g: u8, b: u8) -> u8 {
+    if r == g && g == b {
+        return match r {
+            0..8 => 16,
+            249.. => 231,
+            v => 232 + (v - 8) / 10,
+        };
+    }
+    let q = |v: u8| if v < 48 { 0 } else if v < 115 { 1 } else { (v - 35) / 40 };
+    16 + 36 * q(r) + 6 * q(g) + q(b)
+}
 
 // . empty  w paper  o paper edge  k ink  b blue  d dark body  g light body  s slot  G green
 // r red  c cyan  L M the two lights. The paper has a gray edge, or it vanishes on a light terminal.
@@ -292,7 +344,7 @@ pub fn tanks(inks: &[(u32, i32, bool)]) -> Vec<Line<'static>> {
             inks.iter()
                 .flat_map(|&(rgb, level, _)| {
                     let full = y > 0 && y < H - 1 && (H - 1 - y) * 100 / (H - 2) <= level;
-                    let ink = Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
+                    let ink = self::rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
                     let fill = if y == 0 || y == H - 1 { dark } else if full { Some(ink) } else { None };
                     [dark, fill, dark, None]
                 })
@@ -304,11 +356,20 @@ pub fn tanks(inks: &[(u32, i32, bool)]) -> Vec<Line<'static>> {
         .iter()
         .map(|&(_, l, low)| {
             let text = if l < 0 { format!("{:^3} ", "?") } else { format!("{l:^3} ") };
-            Span::styled(text, Style::new().fg(if low { RED } else { DIM }))
+            Span::styled(text, Style::new().fg(if low { RED } else { theme().dim }))
         })
         .collect();
     lines.push(Line::from(labels));
     lines
+}
+
+#[test]
+fn colors_for_256_color_terminals() {
+    assert_eq!(to_256(0, 0, 0), 16);
+    assert_eq!(to_256(255, 255, 255), 231);
+    assert_eq!(to_256(128, 128, 128), 244);
+    assert_eq!(to_256(0, 255, 255), 51);
+    assert_eq!(to_256(255, 0, 255), 201);
 }
 
 #[test]

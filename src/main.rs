@@ -1,8 +1,10 @@
 mod i18n;
 mod pet;
+mod sound;
 
 use i18n::{fill, t};
-use pet::{Act, Mood, Work, ACCENT, DIM, RED, WHITE, YELLOW};
+use pet::{theme, Act, Mood, Work, ACCENT, RED, WHITE, YELLOW};
+use sound::Sound;
 use printertui::*;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
@@ -20,9 +22,29 @@ use std::time::{Duration, Instant};
 /// Result of a background task, applied to the app on the UI thread.
 type Done = Box<dyn FnOnce(&mut App) + Send>;
 
-/// Rows of the Print and Scan forms.
+/// Rows of the Print, Scan and Settings forms.
 const ROWS: usize = 13;
 const SCAN_ROWS: usize = 10;
+const SETTINGS_ROWS: usize = 6;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Print,
+    Scan,
+    Settings,
+}
+
+const TABS: [Tab; 3] = [Tab::Print, Tab::Scan, Tab::Settings];
+
+// Settings rows
+const LANG: usize = 0;
+const THEME: usize = 1;
+const VOLUME: usize = 2;
+const MASCOT: usize = 3;
+const GRAPHICS: usize = 4;
+const FOLDER: usize = 5;
+/// Image preview choices as the settings file names them.
+const GRAPHICS_PREFS: [&str; 4] = ["auto", "kitty", "sixel", "blocks"];
 const FILE: usize = 1;
 const PAGES: usize = 5;
 const SCALE: usize = 9;
@@ -104,11 +126,18 @@ struct App {
     copies: u32,
     per_sheet: usize,
     scale: usize,
+    tab: Tab,
+    /// Index in pet::THEMES.
+    theme: usize,
+    mascot: bool,
+    /// Index in GRAPHICS_PREFS.
+    graphics_pref: usize,
+    /// Where scans are saved by default; empty for ~/Documents.
+    scan_folder: String,
     /// Print tab preview for its key (or why there is none), the render running, and the page asked for.
     view: Option<(ViewKey, Result<PrintView, String>)>,
     viewing: Option<(ViewKey, mpsc::Receiver<Done>)>,
     view_page: usize,
-    scan_tab: bool,
     /// None until the Scan tab is first opened (discovery takes a few seconds).
     scanners: Option<Vec<(String, String)>>,
     scanner: usize,
@@ -164,17 +193,21 @@ fn main() -> std::io::Result<()> {
         copies: 1,
         per_sheet: 0,
         scale: SCALES.iter().position(|s| *s == 100).unwrap_or(0),
+        tab: if std::env::args().any(|a| a == "--scan") { Tab::Scan } else { Tab::Print },
+        theme: 0,
+        mascot: true,
+        graphics_pref: 0,
+        scan_folder: String::new(),
         view: None,
         viewing: None,
         view_page: 0,
-        scan_tab: std::env::args().any(|a| a == "--scan"),
         scanners: None,
         scanner: 0,
         scanner_pref: String::new(),
         scan_mode: 0,
         scan_dpi: 1,
         scan_format: 0,
-        save_as: default_scan_name(),
+        save_as: String::new(),
         scans: Vec::new(),
         cur: 0,
         busy: None,
@@ -201,12 +234,14 @@ fn main() -> std::io::Result<()> {
         }
     }
     // set by the installer from the language picked in its menu
-    i18n::set(if app.lang.is_empty() { system_language() } else { app.lang.clone() }.as_str());
+    app.apply_settings();
+    app.save_as = default_scan_name(&app.scan_folder);
+    sound::play(Sound::Boot);
     if app.printers.is_empty() {
         app.status = t().no_printers.into();
     }
     // If launched with --scan, preload the most recent scanned page for preview testing
-    if app.scan_tab {
+    if app.tab == Tab::Scan {
         let dir = std::env::temp_dir().join("printertui-scan");
         if let Ok(rd) = std::fs::read_dir(&dir) {
             let mut paths: Vec<_> = rd
@@ -295,6 +330,7 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
             app.heard = app.status.clone();
             if app.status.starts_with(t().error) {
                 app.act = Act::Jam(Instant::now());
+                sound::play(Sound::Jam);
             }
         }
         POPUP.set(Default::default());
@@ -333,35 +369,38 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
             match &mut app.mode {
                 Mode::Main => match k.code {
                     // H/L browse the scanned pages from any row
-                    KeyCode::Char(c @ ('H' | 'L')) if app.scan_tab && !app.scans.is_empty() => {
+                    KeyCode::Char(c @ ('H' | 'L')) if app.tab == Tab::Scan && !app.scans.is_empty() => {
                         let n = app.scans.len();
                         app.cur = (app.cur + if c == 'L' { 1 } else { n - 1 }) % n;
                     }
                     // H/L browse the preview pages on the Print tab
-                    KeyCode::Char(c @ ('H' | 'L')) if !app.scan_tab => {
+                    KeyCode::Char(c @ ('H' | 'L')) if app.tab == Tab::Print => {
                         if let Some((_, Ok(v))) = &app.view {
                             app.view_page = (v.idx + if c == 'L' { 1 } else { v.count - 1 }) % v.count;
                         }
                     }
-                    KeyCode::Char(c) if app.scan_tab && app.sel == PAGE && !app.scans.is_empty() && app.page_key(c, dd) => {}
+                    KeyCode::Char(c) if app.tab == Tab::Scan && app.sel == PAGE && !app.scans.is_empty() && app.page_key(c, dd) => {}
                     KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
                     KeyCode::Up | KeyCode::Char('k') => app.sel = app.sel.checked_sub(1).unwrap_or(app.last()),
                     KeyCode::Down | KeyCode::Char('j') => app.sel = (app.sel + 1) % (app.last() + 1),
                     KeyCode::Char('g') if gg => app.sel = 0,
                     KeyCode::Char('G') => app.sel = app.last(),
                     KeyCode::Tab | KeyCode::BackTab => {
-                        app.scan_tab = !app.scan_tab;
+                        let i = TABS.iter().position(|t| *t == app.tab).unwrap_or(0);
+                        app.tab = TABS[(i + if k.code == KeyCode::Tab { 1 } else { TABS.len() - 1 }) % TABS.len()];
                         app.sent = None;
                         app.sel = 0;
                         app.status = String::new();
-                        if app.scan_tab && app.scanners.is_none() {
+                        if app.tab == Tab::Scan && app.scanners.is_none() {
                             app.find_scanners(false);
                         }
                     }
                     KeyCode::Left | KeyCode::Char('h') => app.cycle(false),
                     KeyCode::Right | KeyCode::Char('l') => app.cycle(true),
                     KeyCode::Char('i') | KeyCode::Char('a') if app.text().is_some() => app.mode = Mode::Insert,
-                    KeyCode::Enter if app.scan_tab => app.scan_enter(),
+                    KeyCode::Enter if app.tab == Tab::Scan => app.scan_enter(),
+                    KeyCode::Enter if app.tab == Tab::Settings && app.sel == FOLDER => app.mode = Mode::Insert,
+                    KeyCode::Enter if app.tab == Tab::Settings => app.cycle(true),
                     KeyCode::Enter if app.sel == ADD => app.spawn(t().searching_printers, || {
                         let found = discover();
                         Box::new(move |app: &mut App| {
@@ -393,7 +432,13 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     _ => {}
                 },
                 Mode::Insert => match k.code {
-                    KeyCode::Esc | KeyCode::Enter => app.mode = Mode::Main,
+                    KeyCode::Esc | KeyCode::Enter => {
+                        app.mode = Mode::Main;
+                        if app.tab == Tab::Settings {
+                            app.save_as = default_scan_name(&app.scan_folder);
+                            app.save_settings();
+                        }
+                    }
                     KeyCode::Backspace => {
                         app.text().map(String::pop);
                     }
@@ -543,15 +588,20 @@ impl App {
             Mode::Main => {}
         }
         let form = self.form_area.get();
-        // the tabs in the title: " PrinterTUI  " then " Print " and " Scan "
+        // the tabs in the title after " PrinterTUI  ": a click on one is as many Tab presses
         if y == form.y {
-            let tab = x.checked_sub(form.x + 14).map(|c| (c as usize) < width(t().tab_print) + 2);
-            return match tab {
-                Some(print) if print == self.scan_tab => key(KeyCode::Tab),
-                _ => Vec::new(),
-            };
+            let mut left = form.x + 14;
+            for (i, name) in [t().tab_print, t().tab_scan, t().tab_settings].iter().enumerate() {
+                let right = left + width(name) as u16 + 2;
+                if (left..right).contains(&x) {
+                    let now = TABS.iter().position(|t| *t == self.tab).unwrap_or(0);
+                    return vec![KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE); (i + TABS.len() - now) % TABS.len()];
+                }
+                left = right;
+            }
+            return Vec::new();
         }
-        let rows = if self.scan_tab { SCAN_ROWS } else { ROWS };
+        let rows = self.rows();
         let Some(row) = y.checked_sub(form.y + 1).map(usize::from).filter(|r| *r < rows && form.contains((x, y).into())) else {
             return Vec::new();
         };
@@ -562,8 +612,9 @@ impl App {
             '<' => key(KeyCode::Left),
             '>' => key(KeyCode::Right),
             _ if value.starts_with('[') => key(KeyCode::Enter),
-            _ if !self.scan_tab && (row == FILE || row == PAGES) => key(KeyCode::Enter),
-            '[' | 'x' | ']' if self.scan_tab && row == PAGE => key(KeyCode::Char('x')),
+            _ if self.tab == Tab::Print && (row == FILE || row == PAGES) => key(KeyCode::Enter),
+            _ if self.tab == Tab::Settings && row == FOLDER => key(KeyCode::Enter),
+            '[' | 'x' | ']' if self.tab == Tab::Scan && row == PAGE => key(KeyCode::Char('x')),
             _ => Vec::new(),
         }
     }
@@ -588,13 +639,23 @@ impl App {
         self.printers = printers;
     }
 
+    fn rows(&self) -> usize {
+        match self.tab {
+            Tab::Print => ROWS,
+            Tab::Scan => SCAN_ROWS,
+            Tab::Settings => SETTINGS_ROWS,
+        }
+    }
+
     fn last(&self) -> usize {
-        if self.scan_tab { DISCARD } else { QUEUE }
+        self.rows() - 1
     }
 
     fn text(&mut self) -> Option<&mut String> {
-        if self.scan_tab {
-            return (self.sel == SAVE_AS).then_some(&mut self.save_as);
+        match self.tab {
+            Tab::Scan => return (self.sel == SAVE_AS).then_some(&mut self.save_as),
+            Tab::Settings => return (self.sel == FOLDER).then_some(&mut self.scan_folder),
+            Tab::Print => {}
         }
         match self.sel {
             FILE => Some(&mut self.file),
@@ -609,12 +670,32 @@ impl App {
         self.step_value(fwd);
         if self.value(self.sel) != before {
             self.act = Act::Hop(Instant::now());
+            sound::play(Sound::Blip);
+            if self.tab == Tab::Settings {
+                self.save_settings();
+            }
         }
     }
 
     fn step_value(&mut self, fwd: bool) {
         let step = |i: usize, n: usize| if n == 0 { 0 } else if fwd { (i + 1) % n } else { (i + n - 1) % n };
-        if self.scan_tab {
+        if self.tab == Tab::Settings {
+            match self.sel {
+                LANG => {
+                    // 0 follows the system, then the ten languages
+                    let now = if self.lang.is_empty() { 0 } else { i18n::find(&self.lang).map_or(0, |i| i + 1) };
+                    let next = step(now, i18n::ALL.len() + 1);
+                    self.lang = if next == 0 { String::new() } else { i18n::ALL[next - 1].code.to_string() };
+                }
+                THEME => self.theme = step(self.theme, pet::THEMES.len()),
+                VOLUME => sound::set_volume(if fwd { sound::volume().saturating_add(10).min(100) } else { sound::volume().saturating_sub(10) }),
+                MASCOT => self.mascot = !self.mascot,
+                GRAPHICS => self.graphics_pref = step(self.graphics_pref, GRAPHICS_PREFS.len()),
+                _ => {}
+            }
+            return self.apply_settings();
+        }
+        if self.tab == Tab::Scan {
             match self.sel {
                 0 => self.scanner = step(self.scanner, self.scanners.as_ref().map_or(0, Vec::len)),
                 1 => self.scan_mode = step(self.scan_mode, SCAN_MODES.len()),
@@ -640,7 +721,23 @@ impl App {
 
     fn value(&self, row: usize) -> String {
         let pick = |s: &str| format!("< {s} >");
-        if self.scan_tab {
+        if self.tab == Tab::Settings {
+            return match row {
+                LANG if self.lang.is_empty() => {
+                    let system = i18n::find(&system_language()).unwrap_or(0);
+                    pick(&fill(t().system, &[("lang", &i18n::NAMES[system])]))
+                }
+                LANG => pick(i18n::find(&self.lang).map_or("?", |i| i18n::NAMES[i])),
+                THEME => pick(t().themes[self.theme]),
+                VOLUME if sound::volume() == 0 => pick(t().muted),
+                VOLUME => pick(&format!("{}%", sound::volume())),
+                MASCOT => pick(t().on_off[usize::from(!self.mascot)]),
+                GRAPHICS => pick(t().graphics[self.graphics_pref]),
+                FOLDER if self.scan_folder.is_empty() && !matches!(self.mode, Mode::Insert) => default_scan_folder(),
+                _ => self.scan_folder.clone(),
+            };
+        }
+        if self.tab == Tab::Scan {
             return match row {
                 0 => pick(self.scanners.as_ref().and_then(|l| l.get(self.scanner)).map_or(t().none, |(_, d)| d.as_str())),
                 1 => pick(t().scan_modes[self.scan_mode]),
@@ -732,6 +829,7 @@ impl App {
     fn show(&mut self, res: Result<String, String>) {
         if res.is_ok() {
             self.act = Act::Print(Instant::now(), self.copies.clamp(1, 3));
+            sound::play(Sound::Print);
         }
         self.status = match res {
             Ok(s) => match self.save() {
@@ -742,18 +840,21 @@ impl App {
         }
     }
 
-    /// Remembers the settings of the last successful print (not the file or page range).
+    /// Remembers the settings: the Print and Scan ones after a print or scan (not the file or
+    /// page range), the Settings tab's as they change.
     fn save(&self) -> std::io::Result<()> {
         let path = config_path().ok_or(std::io::Error::other("HOME is not set"))?;
         std::fs::create_dir_all(path.parent().unwrap_or(&path))?;
         std::fs::write(path, format!(
             "printer={}\ncolor={}\nduplex={}\nreverse_back={}\npaper={}\ncopies={}\nper_sheet={}\nscale={}\n\
-             scanner={}\nscan_mode={}\nscan_dpi={}\nscan_format={}\n{}",
+             scanner={}\nscan_mode={}\nscan_dpi={}\nscan_format={}\n\
+             lang={}\ntheme={}\nvolume={}\nmascot={}\ngraphics={}\nscan_folder={}\n",
             self.printers.get(self.printer).map_or("", String::as_str),
             self.color, self.duplex, self.reverse_back, PAPERS[self.paper], self.copies, PER_SHEET[self.per_sheet], SCALES[self.scale],
             self.scanners.as_ref().and_then(|l| l.get(self.scanner)).map_or(self.scanner_pref.as_str(), |(d, _)| d.as_str()),
             SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi], SCAN_FORMATS[self.scan_format],
-            if self.lang.is_empty() { String::new() } else { format!("lang={}\n", self.lang) },
+            // an empty language follows the system's
+            self.lang, pet::THEMES[self.theme].0, sound::volume(), self.mascot, GRAPHICS_PREFS[self.graphics_pref], self.scan_folder,
         ))
     }
 
@@ -769,6 +870,11 @@ impl App {
             "copies" => self.copies = v.parse().ok().filter(|n| *n > 0).unwrap_or(self.copies),
             "per_sheet" => self.per_sheet = PER_SHEET.iter().position(|n| n.to_string() == v).unwrap_or(self.per_sheet),
             "lang" => self.lang = v.to_string(),
+            "theme" => self.theme = pet::THEMES.iter().position(|(name, _)| *name == v).unwrap_or(self.theme),
+            "volume" => sound::set_volume(v.parse().unwrap_or(sound::volume())),
+            "mascot" => self.mascot = b.unwrap_or(self.mascot),
+            "graphics" => self.graphics_pref = GRAPHICS_PREFS.iter().position(|g| *g == v).unwrap_or(self.graphics_pref),
+            "scan_folder" => self.scan_folder = v.to_string(),
             "scale" => self.scale = SCALES.iter().position(|n| n.to_string() == v).unwrap_or(self.scale),
             "scanner" => self.scanner_pref = v.to_string(),
             "scan_mode" => self.scan_mode = SCAN_MODES.iter().position(|m| *m == v).unwrap_or(self.scan_mode),
@@ -937,7 +1043,18 @@ impl App {
     /// What the printer says about the selected row when there is no news.
     fn chat(&self) -> String {
         let n = |template: &str, n: &dyn std::fmt::Display| fill(template, &[("n", n)]);
-        if self.scan_tab {
+        if self.tab == Tab::Settings {
+            return match self.sel {
+                LANG => t().lang_chat.into(),
+                THEME => t().theme_chat.into(),
+                VOLUME if sound::volume() == 0 => t().muted_chat.into(),
+                VOLUME => t().volume_chat.into(),
+                MASCOT => t().mascot_chat.into(),
+                GRAPHICS => t().graphics_chat.into(),
+                _ => t().folder_chat.into(),
+            };
+        }
+        if self.tab == Tab::Scan {
             let kept = self.scans.iter().filter(|p| p.keep).count();
             return match self.sel {
                 0 if self.scanners.as_ref().is_some_and(Vec::is_empty) => t().no_scanner_yet.into(),
@@ -1045,18 +1162,43 @@ impl App {
 
     /// The image in the preview panel: its full-quality PNG and its thumbnail.
     fn shown(&self) -> Option<(String, &Thumb)> {
-        if self.scan_tab {
-            return self.scans.get(self.cur).map(|p| (format!("{}.preview.png", p.file), &p.thumb));
-        }
-        match &self.view {
-            Some((_, Ok(v))) => Some((format!("{}.preview.png", v.png), &v.thumb)),
+        match (self.tab, &self.view) {
+            (Tab::Scan, _) => self.scans.get(self.cur).map(|p| (format!("{}.preview.png", p.file), &p.thumb)),
+            (Tab::Print, Some((_, Ok(v)))) => Some((format!("{}.preview.png", v.png), &v.thumb)),
             _ => None,
+        }
+    }
+
+    /// Puts the language, theme, volume and image preview settings into effect.
+    fn apply_settings(&mut self) {
+        i18n::set(if self.lang.is_empty() { system_language() } else { self.lang.clone() }.as_str());
+        pet::set_theme(self.theme);
+        let graphics = match GRAPHICS_PREFS[self.graphics_pref] {
+            "kitty" => Graphics::Kitty(std::env::var_os("TMUX").is_some()),
+            "sixel" => Graphics::Sixel,
+            "blocks" => Graphics::None,
+            _ => detect_graphics(),
+        };
+        if graphics != self.graphics {
+            // the old image stays on screen otherwise
+            if let (Graphics::Kitty(tmux), Some(_)) = (self.graphics, &self.sent) {
+                emit(&kitty(&format!("a=d,d=I,i={},q=2", image_id()), "", tmux));
+            }
+            self.graphics = graphics;
+            self.sent = None;
+        }
+    }
+
+    /// Saves the settings right away, as the Settings tab changes them.
+    fn save_settings(&mut self) {
+        if let Err(e) = self.save() {
+            self.status = format!("{}", fill(t().settings_not_saved, &[("e", &e)]));
         }
     }
 
     /// Renders the Print tab preview in the background whenever what it should show changes.
     fn sync_view(&mut self) {
-        if self.scan_tab || matches!(self.mode, Mode::Insert) {
+        if self.tab != Tab::Print || matches!(self.mode, Mode::Insert) {
             return;
         }
         let Some(file) = split_files(&self.file).first().map(|f| expand_home(f)) else {
@@ -1176,6 +1318,7 @@ impl App {
         let path = dir.join(format!("page-{stamp}")).to_string_lossy().into_owned();
         let (mode, dpi) = (SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi]);
         self.scanning = true;
+        sound::play(Sound::Scan);
         self.spawn(fill(t().scanning, &[("n", &n)]), move || {
             let res = std::fs::create_dir_all(&dir)
                 .map_err(|e| e.to_string())
@@ -1187,6 +1330,7 @@ impl App {
                     Ok(thumb) => {
                         app.scans.push(ScannedPage { orig: path.clone(), file: path, rot: 0, filter: 0, keep: true, thumb });
                         app.cur = app.scans.len() - 1;
+                        sound::play(Sound::Done);
                         if then_copy {
                             return app.copy();
                         }
@@ -1244,8 +1388,9 @@ impl App {
                     Ok(written) => {
                         app.scans.clear();
                         app.cur = 0;
-                        app.save_as = default_scan_name();
+                        app.save_as = default_scan_name(&app.scan_folder);
                         let _ = app.save();
+                        sound::play(Sound::Done);
                         let written: Vec<String> = written.iter().map(|p| tilde(p)).collect();
                         fill(t().saved, &[("files", &written.join(", "))])
                     }
@@ -1323,10 +1468,16 @@ fn detect_graphics() -> Graphics {
     Graphics::None
 }
 
-/// `~/Documents/scan-2026-09-26_154200` (or in `~` when there is no Documents folder).
-fn default_scan_name() -> String {
+/// Where scans go unless the settings say otherwise: ~/Documents, or ~ without one.
+fn default_scan_folder() -> String {
     let docs = std::env::home_dir().is_some_and(|h| h.join("Documents").is_dir());
-    format!("~/{}scan-{}", if docs { "Documents/" } else { "" }, timestamp())
+    if docs { "~/Documents".into() } else { "~".into() }
+}
+
+/// `~/Documents/scan-2026-09-26_154200`, in the folder from the settings when there is one.
+fn default_scan_name(folder: &str) -> String {
+    let folder = if folder.trim().is_empty() { default_scan_folder() } else { folder.trim().trim_end_matches(['/', '\\']).to_string() };
+    format!("{folder}/scan-{}", timestamp())
 }
 
 /// The preview for a key: the file as it will print (a PDF, scaled), one sheet side of its range.
@@ -1383,18 +1534,21 @@ fn expand_home(p: &str) -> String {
 }
 
 fn draw(f: &mut Frame, app: &App) {
-    let rows = if app.scan_tab { SCAN_ROWS } else { ROWS };
+    if let (Some(bg), Some(fg)) = (theme().bg, theme().fg) {
+        f.render_widget(Block::default().style(Style::new().bg(bg).fg(fg)), f.area());
+    }
+    let rows = app.rows();
     let [main, help] = Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(f.area());
     let [left, preview] = Layout::horizontal([Constraint::Min(40), Constraint::Percentage(45)]).areas(main);
     let [form, status] =
         Layout::vertical([Constraint::Length(rows as u16 + 2), Constraint::Min(3)]).areas(left);
 
-    let lines: Vec<Line> = (0..rows).map(|i| form_row(app, label(app.scan_tab, i), i)).collect();
+    let lines: Vec<Line> = (0..rows).map(|i| form_row(app, label(app.tab, i), i)).collect();
     let tab = |name: &'static str, on: bool| {
-        Span::styled(format!(" {name} "), if on { Style::new().fg(WHITE).bg(ACCENT).bold() } else { Style::new().fg(DIM) })
+        Span::styled(format!(" {name} "), if on { Style::new().fg(WHITE).bg(ACCENT).bold() } else { Style::new().fg(theme().dim) })
     };
     // same widths as the mouse expects: " PrinterTUI  " then " Print " and " Scan "
-    let title = Line::from(vec![Span::styled(" PrinterTUI  ", Style::new().bold()), tab(t().tab_print, !app.scan_tab), tab(t().tab_scan, app.scan_tab), Span::raw(" ")]);
+    let title = Line::from(vec![Span::styled(" PrinterTUI  ", Style::new().bold()), tab(t().tab_print, app.tab == Tab::Print), tab(t().tab_scan, app.tab == Tab::Scan), tab(t().tab_settings, app.tab == Tab::Settings), Span::raw(" ")]);
     f.render_widget(Paragraph::new(lines).block(panel(title)), form);
     app.form_area.set(form);
     draw_preview(f, app, preview);
@@ -1404,15 +1558,17 @@ fn draw(f: &mut Frame, app: &App) {
     let keys: &[(&str, &str)] = match app.mode {
         Mode::Insert => &[("Esc", t.k_done), ("Enter", t.k_done)],
         Mode::Address(_) => &[("Enter", t.k_add), ("Esc", t.k_cancel)],
-        _ if app.sel == PAGE && app.scan_tab => &[("H/L", t.k_page), ("</>", t.k_move), ("r/R", t.k_rotate), ("f", t.k_filter), ("x", t.k_keep), ("dd", t.k_delete)],
-        _ if app.scan_tab && !app.scans.is_empty() => &[("j/k", t.k_move), ("h/l", t.k_change), ("H/L", t.k_page), ("Enter", t.k_select), ("Tab", t.k_print_scan), ("q", t.k_quit)],
-        _ if app.sel == PAGES && !app.scan_tab => &[("j/k", t.k_move), ("Enter", t.k_pick_pages), ("i", t.k_type_range), ("q", t.k_quit)],
-        _ if !app.scan_tab => &[("j/k", t.k_move), ("h/l", t.k_change), ("H/L", t.k_preview_page), ("i", t.k_edit_text), ("Enter", t.k_select), ("Tab", t.k_print_scan), ("q", t.k_quit)],
+        _ if app.tab == Tab::Settings && app.sel == FOLDER => &[("j/k", t.k_move), ("i", t.k_edit_text), ("Tab", t.k_print_scan), ("q", t.k_quit)],
+        _ if app.tab == Tab::Settings => &[("j/k", t.k_move), ("h/l", t.k_change), ("Tab", t.k_print_scan), ("q", t.k_quit)],
+        _ if app.sel == PAGE && app.tab == Tab::Scan => &[("H/L", t.k_page), ("</>", t.k_move), ("r/R", t.k_rotate), ("f", t.k_filter), ("x", t.k_keep), ("dd", t.k_delete)],
+        _ if app.tab == Tab::Scan && !app.scans.is_empty() => &[("j/k", t.k_move), ("h/l", t.k_change), ("H/L", t.k_page), ("Enter", t.k_select), ("Tab", t.k_print_scan), ("q", t.k_quit)],
+        _ if app.sel == PAGES && app.tab == Tab::Print => &[("j/k", t.k_move), ("Enter", t.k_pick_pages), ("i", t.k_type_range), ("q", t.k_quit)],
+        _ if app.tab == Tab::Print => &[("j/k", t.k_move), ("h/l", t.k_change), ("H/L", t.k_preview_page), ("i", t.k_edit_text), ("Enter", t.k_select), ("Tab", t.k_print_scan), ("q", t.k_quit)],
         _ => &[("j/k", t.k_move), ("h/l", t.k_change), ("i", t.k_edit_text), ("Enter", t.k_select), ("Tab", t.k_print_scan), ("q", t.k_quit)],
     };
     let chips: Vec<Span> = keys
         .iter()
-        .flat_map(|(k, what)| [Span::styled(format!(" {k} "), Style::new().fg(WHITE).bg(Color::Indexed(238))), Span::styled(format!(" {what}  "), Style::new().fg(DIM))])
+        .flat_map(|(k, what)| [Span::styled(format!(" {k} "), Style::new().fg(theme().chip.0).bg(theme().chip.1)), Span::styled(format!(" {what}  "), Style::new().fg(theme().dim))])
         .collect();
     f.render_widget(Line::from(chips), help);
     let tick = app.started.elapsed().as_millis() as usize;
@@ -1524,18 +1680,33 @@ fn char_at(s: &str, col: usize) -> Option<char> {
 }
 
 /// A form row's label: Print tab rows past Scale and Scan tab buttons have none.
-fn label(scan: bool, row: usize) -> &'static str {
-    match (scan, row) {
-        (false, 0..=9) => t().labels[row],
-        (true, 0..=4) => t().scan_labels[row],
-        (true, PAGE) => t().scan_labels[5],
+fn label(tab: Tab, row: usize) -> &'static str {
+    match (tab, row) {
+        (Tab::Print, 0..=9) => t().labels[row],
+        (Tab::Scan, 0..=4) => t().scan_labels[row],
+        (Tab::Scan, PAGE) => t().scan_labels[5],
+        (Tab::Settings, 0..SETTINGS_ROWS) => t().settings_labels[row],
         _ => "",
     }
 }
 
 /// Columns for the labels: the widest in this language, and a space.
 fn label_width() -> usize {
-    t().labels.iter().chain(&t().scan_labels).map(|l| width(l)).max().unwrap_or(0).max(11) + 1
+    t().labels.iter().chain(&t().scan_labels).chain(&t().settings_labels).map(|l| width(l)).max().unwrap_or(0).max(11) + 1
+}
+
+/// The Settings tab's right panel: the settings file as it is on disk, updated as it changes.
+fn draw_config(f: &mut Frame, _app: &App, area: ratatui::layout::Rect) {
+    let path = config_path().map(|p| tilde(&p.to_string_lossy())).unwrap_or_default();
+    let block = panel(format!(" {path} "));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let text = config_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let mut lines = vec![Line::styled(fill(t().saved_to, &[("path", &path)]), Style::new().fg(theme().dim)), Line::default()];
+    lines.extend(parse_config(&text).into_iter().map(|(k, v)| {
+        Line::from(vec![Span::styled(format!("{k}"), Style::new().fg(ACCENT)), Span::styled("=", Style::new().fg(theme().dim)), Span::raw(v.to_string())])
+    }));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 /// Column of the values in a form row: after the border, " ▶ " and the labels.
@@ -1547,7 +1718,7 @@ fn value_col() -> u16 {
 fn panel<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
     Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(DIM))
+        .border_style(Style::new().fg(theme().dim))
         .title(title.into().style(Style::new().fg(ACCENT).bold()))
 }
 
@@ -1558,15 +1729,15 @@ fn form_row<'a>(app: &App, label: &'a str, i: usize) -> Line<'a> {
     let value = app.value(i);
     let marker = if on { Span::styled(" ▶ ", Style::new().fg(ACCENT).bold()) } else { Span::raw("   ") };
     let pad = " ".repeat(label_width().saturating_sub(width(label)));
-    let label = Span::styled(format!("{label}{pad}"), if on { Style::new().bold() } else { Style::new().fg(DIM) });
+    let label = Span::styled(format!("{label}{pad}"), if on { Style::new().bold() } else { Style::new().fg(theme().dim) });
     let mut spans = vec![marker, label];
     if let Some(name) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
         let style = if on { Style::new().fg(WHITE).bg(ACCENT).bold() } else { Style::new().fg(ACCENT).bold() };
         spans.push(Span::styled(format!(" {name} "), style));
     } else if let Some(inner) = value.strip_prefix("< ").and_then(|v| v.strip_suffix(" >")) {
-        let arrows = Style::new().fg(if on { ACCENT } else { DIM });
+        let arrows = Style::new().fg(if on { ACCENT } else { theme().dim });
         let hop = on && matches!(app.act, Act::Hop(_)) && !app.act.done();
-        let v = if hop { Style::new().fg(YELLOW).bold() } else if on { Style::new().bold() } else { Style::new() };
+        let v = if hop { Style::new().fg(theme().hop).bold() } else if on { Style::new().bold() } else { Style::new() };
         spans.extend([Span::styled("‹ ", arrows), Span::styled(inner.to_string(), v), Span::styled(" ›", arrows)]);
     } else {
         let cursor = if on && matches!(app.mode, Mode::Insert) { "_" } else { "" };
@@ -1577,9 +1748,9 @@ fn form_row<'a>(app: &App, label: &'a str, i: usize) -> Line<'a> {
 
 /// The printer and what it says (the status, or a word about the selected row), and the ink tanks.
 fn draw_stage(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let inks = if app.scan_tab { &[][..] } else { app.printer_state().map_or(&[][..], |s| s.ink.as_slice()) };
+    let inks = if app.tab != Tab::Print { &[][..] } else { app.printer_state().map_or(&[][..], |s| s.ink.as_slice()) };
     // the printer needs 22 columns and goes last on a narrow screen, after the ink tanks
-    let pet_w = if area.width >= 22 + 24 { 22 } else { 0 };
+    let pet_w = if app.mascot && area.width >= 22 + 24 { 22 } else { 0 };
     let tanks_w = if inks.is_empty() || area.width < pet_w + 24 + inks.len() as u16 * 4 + 1 { 0 } else { inks.len() as u16 * 4 + 1 };
     let [pet, bubble, tanks] =
         Layout::horizontal([Constraint::Length(pet_w), Constraint::Min(10), Constraint::Length(tanks_w)]).areas(area);
@@ -1587,7 +1758,7 @@ fn draw_stage(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let (text, work) = match &app.busy {
         Some((msg, _)) => (format!("{msg}..."), if app.scanning { Work::Scan } else { Work::Busy }),
         None if app.editing.is_some() => (format!("{}...", t().editing_page), Work::Busy),
-        None if app.viewing.is_some() && !app.scan_tab && app.status.is_empty() => (format!("{}...", t().drawing_preview), Work::Busy),
+        None if app.viewing.is_some() && app.tab == Tab::Print && app.status.is_empty() => (format!("{}...", t().drawing_preview), Work::Busy),
         None if matches!(app.mode, Mode::Flip { .. }) => (t().flip_time.into(), Work::None),
         None if app.status.is_empty() => (app.complaint().unwrap_or_else(|| app.chat()), Work::None),
         None => (app.status.clone(), Work::None),
@@ -1612,7 +1783,7 @@ fn draw_stage(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         f.buffer_mut()[(bubble.x, bubble.y + 2)].set_symbol("◀").set_fg(edge);
     }
     if tanks_w > 0 {
-        let mut lines = vec![Line::styled(format!(" {}", t().ink), Style::new().fg(DIM))];
+        let mut lines = vec![Line::styled(format!(" {}", t().ink), Style::new().fg(theme().dim))];
         lines.extend(pet::tanks(inks).into_iter().map(|l| {
             let mut l = l;
             l.spans.insert(0, Span::raw(" "));
@@ -1624,7 +1795,10 @@ fn draw_stage(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 /// The scanned page or the page to print: as an image, or grayscale half-blocks (two pixels per cell).
 fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let title = match (app.scan_tab, app.scans.get(app.cur), &app.view) {
+    if app.tab == Tab::Settings {
+        return draw_config(f, app, area);
+    }
+    let title = match (app.tab == Tab::Scan, app.scans.get(app.cur), &app.view) {
         (true, Some(p), _) => format!(" {}{} ", fill(t().preview_scan, &[("n", &(app.cur + 1)), ("all", &app.scans.len())]), if p.keep { "" } else { t().not_saved }),
         (false, _, Some((_, Ok(v)))) => format!(" {}: {} ", t().preview, v.title),
         _ => format!(" {} ", t().preview),
@@ -1633,7 +1807,7 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.preview_area.set(inner);
-    if !app.scan_tab {
+    if app.tab == Tab::Print {
         let note = match &app.view {
             _ if app.viewing.is_some() => Some(t().rendering),
             Some((_, Err(e))) => Some(e.as_str()),
@@ -1680,7 +1854,7 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     // contrast stretch (30%..97%) so text blocks stand out from the paper
     let gray = |v: u8| {
         let v = ((v as i32 - 77) * 255 / 170).clamp(0, 255) as u8;
-        Color::Rgb(v, v, v)
+        pet::rgb(v, v, v)
     };
     let lines: Vec<Line> = (0..oh / 2)
         .map(|y| {
@@ -1704,6 +1878,9 @@ fn popup(f: &mut Frame, width: u16, height: u16) -> ratatui::layout::Rect {
     let h = height.min(a.height);
     let area = ratatui::layout::Rect::new(a.x + (a.width - w) / 2, a.y + (a.height - h) / 2, w, h);
     f.render_widget(Clear, area);
+    if let (Some(bg), Some(fg)) = (theme().bg, theme().fg) {
+        f.render_widget(Block::default().style(Style::new().bg(bg).fg(fg)), area);
+    }
     POPUP.set(area);
     area
 }

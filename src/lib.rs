@@ -167,16 +167,79 @@ fn photo_pdf(file: &str, paper: &str) -> Result<String, String> {
     Ok(out.to_string_lossy().into_owned())
 }
 
-/// The PDF that gets printed for a file: a photo or a document converted if it is not one, then scaled.
+/// The PDF that gets printed for a file: a photo, a text file or a document converted if it is
+/// not one (only documents need LibreOffice), then scaled.
 pub fn printable(file: &str, percent: u32, paper: &str) -> Result<String, String> {
     let pdf = if page_count(file).is_some() {
         file.to_string()
     } else if image::ImageReader::open(file).and_then(|r| r.with_guessed_format()).is_ok_and(|r| r.format().is_some()) {
         photo_pdf(file, paper)?
+    } else if let Some(text) = plain_text(file) {
+        // letters the built-in font has not got print through LibreOffice when it is there
+        if text.chars().all(|c| (c as u32) < 256 || c == '\n') { text_pdf(file, &text, paper)? } else { to_pdf(file).or_else(|_| text_pdf(file, &text, paper))? }
     } else {
         to_pdf(file)?
     };
     if percent == 100 { Ok(pdf) } else { scale_pdf(&pdf, percent) }
+}
+
+/// The file's text if it is plain text (not markup, which LibreOffice lays out better).
+fn plain_text(file: &str) -> Option<String> {
+    let ext = std::path::Path::new(file).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if matches!(ext.as_str(), "html" | "htm" | "xhtml" | "rtf" | "svg" | "xml") || std::fs::metadata(file).ok()?.len() > 20 << 20 {
+        return None;
+    }
+    String::from_utf8(std::fs::read(file).ok()?).ok().filter(|t| !t.contains('\0'))
+}
+
+/// Plain text on pages of the paper in Courier 10 pt, long lines wrapped.
+fn text_pdf(file: &str, text: &str, paper: &str) -> Result<String, String> {
+    const MARGIN: f32 = 56.0;
+    const SIZE: f32 = 10.0;
+    const LEADING: f32 = 12.0;
+    let (pw, ph) = paper_inches(paper);
+    let (pw, ph) = (pw * 72.0, ph * 72.0);
+    // Courier is monospaced: every letter is 0.6 of the font size wide
+    let cols = ((pw - 2.0 * MARGIN) / (0.6 * SIZE)) as usize;
+    let rows = ((ph - 2.0 * MARGIN) / LEADING) as usize;
+    let mut lines = Vec::new();
+    for line in text.replace('\t', "    ").replace('\r', "").lines() {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            lines.push(String::new());
+        }
+        lines.extend(chars.chunks(cols.max(1)).map(|c| c.iter().collect::<String>()));
+    }
+    let pages: Vec<&[String]> = if lines.is_empty() { vec![&[][..]] } else { lines.chunks(rows.max(1)).collect() };
+    let mut pdf = Pdf::new();
+    let (catalog, tree, font) = (Ref::new(1), Ref::new(2), Ref::new(3));
+    let mut kids = Vec::new();
+    for (i, page_lines) in pages.iter().enumerate() {
+        let (page_id, content_id) = (Ref::new(2 * i as i32 + 4), Ref::new(2 * i as i32 + 5));
+        let mut page = pdf.page(page_id);
+        page.media_box(Rect::new(0.0, 0.0, pw, ph)).parent(tree).contents(content_id);
+        page.resources().fonts().pair(Name(b"F0"), font);
+        page.finish();
+        let mut content = Content::new();
+        content.begin_text().set_font(Name(b"F0"), SIZE).set_leading(LEADING).next_line(MARGIN, ph - MARGIN - SIZE);
+        for line in page_lines.iter() {
+            content.show(Str(&win_ansi(line))).next_line_using_leading();
+        }
+        content.end_text();
+        pdf.stream(content_id, &content.finish());
+        kids.push(page_id);
+    }
+    pdf.type1_font(font).base_font(Name(b"Courier")).encoding_predefined(Name(b"WinAnsiEncoding"));
+    pdf.catalog(catalog).pages(tree);
+    pdf.pages(tree).count(kids.len() as i32).kids(kids);
+    let out = work_dir(file)?.join(format!("text-{paper}.pdf"));
+    write_atomic(&out, &pdf.finish())?;
+    Ok(out.to_string_lossy().into_owned())
+}
+
+/// Width and height of an image, whatever its file name.
+pub fn image_size(path: &str) -> Result<(u32, u32), String> {
+    image::ImageReader::open(path).and_then(|r| r.with_guessed_format()).map_err(|e| format!("{path}: {e}"))?.into_dimensions().map_err(|e| format!("{path}: {e}"))
 }
 
 /// Pages per sheet side as (columns, rows) on upright paper.
@@ -922,6 +985,28 @@ fn photo_fills_the_paper_and_sheets_hold_their_pages() {
     assert!(sh > sw);
     assert!(img.get_pixel(sw / 4, sh / 4)[0] < 50 && img.get_pixel(sw * 3 / 4, sh / 4)[0] < 50 && img.get_pixel(sw / 4, sh * 3 / 4)[0] < 50);
     assert!(img.get_pixel(sw * 3 / 4, sh * 3 / 4)[0] > 200);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn text_files_print_without_libreoffice() {
+    let dir = std::env::temp_dir().join(format!("printertui-plaintext-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let txt = dir.join("notes.txt").to_string_lossy().into_owned();
+    // 150 lines, one far longer than a line of paper: three A4 pages
+    let mut text: String = (1..=150).map(|i| format!("línea {i}\n")).collect();
+    text.push_str(&"x".repeat(300));
+    std::fs::write(&txt, &text).unwrap();
+    let pdf = printable(&txt, 100, "A4").unwrap();
+    assert_eq!(page_count(&pdf), Some(3));
+    let doc = lopdf::Document::load(&pdf).unwrap();
+    let first = String::from_utf8_lossy(&doc.get_page_content(doc.page_iter().next().unwrap())).into_owned();
+    // "línea 1" with the í in WinAnsi (0xED), as pdf-writer's hex string
+    assert!(first.contains("<6CED6E65612031> Tj"), "{first}");
+    // markup and binary files are left to LibreOffice
+    std::fs::write(dir.join("a.html"), "<p>hi</p>").unwrap();
+    assert!(plain_text(&dir.join("a.html").to_string_lossy()).is_none());
+    assert!(plain_text(&pdf).is_none());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

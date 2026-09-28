@@ -2,7 +2,7 @@
 //! `{name}` placeholders are filled in with `fill`.
 
 use std::fmt::Display;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct Texts {
     pub code: &'static str,
@@ -195,6 +195,27 @@ pub struct Texts {
     pub tray_missing: &'static str,
     pub problem: &'static str,
 
+    // Settings tab
+    pub tab_settings: &'static str,
+    /// Language, Theme, Volume, Mascot, Image preview, Scan folder.
+    pub settings_labels: [&'static str; 6],
+    /// "System (English)": follow the computer's language.
+    pub system: &'static str,
+    /// Auto (the terminal's colors), Dark, Light.
+    pub themes: [&'static str; 3],
+    pub on_off: [&'static str; 2],
+    /// Auto, kitty, Sixel, Blocks.
+    pub graphics: [&'static str; 4],
+    pub muted: &'static str,
+    pub lang_chat: &'static str,
+    pub theme_chat: &'static str,
+    pub volume_chat: &'static str,
+    pub muted_chat: &'static str,
+    pub mascot_chat: &'static str,
+    pub graphics_chat: &'static str,
+    pub folder_chat: &'static str,
+    pub saved_to: &'static str,
+
     /// Linux and macOS: the file pickers to install, other scanners, adding a printer.
     pub unix_hints: [&'static str; 3],
     /// Windows: the file dialog, USB scanners, adding a printer.
@@ -202,9 +223,13 @@ pub struct Texts {
 }
 
 impl Texts {
-    /// Pick-file, scanner and add-printer hints for this system.
+    /// Pick-file, scanner and add-printer hints for this system (macOS has a file dialog, like Windows).
     pub fn hints(&self) -> [&'static str; 3] {
-        if cfg!(windows) { self.win_hints } else { self.unix_hints }
+        match () {
+            _ if cfg!(windows) => self.win_hints,
+            _ if cfg!(target_os = "macos") => [self.win_hints[0], self.unix_hints[1], self.unix_hints[2]],
+            _ => self.unix_hints,
+        }
     }
 }
 
@@ -216,17 +241,25 @@ pub fn fill(template: &str, args: &[(&str, &dyn Display)]) -> String {
 /// In the installer's order.
 pub const ALL: [&Texts; 10] = [&EN, &ZH, &HI, &ES, &AR, &FR, &BN, &PT, &RU, &ID];
 
-static CURRENT: OnceLock<&'static Texts> = OnceLock::new();
+/// Each language's own name, in the order of `ALL`.
+pub const NAMES: [&str; 10] = ["English", "中文", "हिन्दी", "Español", "العربية", "Français", "বাংলা", "Português", "Русский", "Bahasa Indonesia"];
 
-/// Picks the language by its code or locale ("es", "pt_BR.UTF-8", "zh-Hans-CN"); English otherwise.
+static CURRENT: AtomicUsize = AtomicUsize::new(0);
+
+/// Index in `ALL` of a language code or locale ("es", "pt_BR.UTF-8", "zh-Hans-CN"); None if not one of ours.
+pub fn find(lang: &str) -> Option<usize> {
+    let code = lang.get(..2)?.to_ascii_lowercase();
+    ALL.iter().position(|t| t.code == code)
+}
+
+/// Switches the language (English when it is not one of ours); it can change while the app runs.
 pub fn set(lang: &str) {
-    let code = lang.get(..2).unwrap_or("").to_ascii_lowercase();
-    let _ = CURRENT.set(ALL.iter().copied().find(|t| t.code == code).unwrap_or(&EN));
+    CURRENT.store(find(lang).unwrap_or(0), Ordering::Relaxed);
 }
 
 /// The texts in the language picked with `set`.
 pub fn t() -> &'static Texts {
-    CURRENT.get().copied().unwrap_or(&EN)
+    ALL[CURRENT.load(Ordering::Relaxed)]
 }
 
 pub const EN: Texts = Texts {
@@ -400,6 +433,21 @@ pub const EN: Texts = Texts {
     tray_full: "The output tray is full, take the pages out.",
     tray_missing: "The paper tray is missing.",
     problem: "The printer reports a problem: {reason}",
+    tab_settings: "Settings",
+    settings_labels: ["Language", "Theme", "Volume", "Mascot", "Image preview", "Scan folder"],
+    system: "System ({lang})",
+    themes: ["Auto (terminal)", "Dark", "Light"],
+    on_off: ["On", "Off"],
+    graphics: ["Auto", "kitty", "Sixel", "Blocks"],
+    muted: "Muted",
+    lang_chat: "Pick my language. System follows your computer's.",
+    theme_chat: "Auto keeps your terminal's colors; Dark and Light paint their own.",
+    volume_chat: "How loud I am: I whirr when I print and grumble when I jam.",
+    muted_chat: "Muted. I'll print quietly.",
+    mascot_chat: "Hide me if you need the room. I won't take it personally.",
+    graphics_chat: "How pages are drawn. Auto picks the best your terminal can do.",
+    folder_chat: "Where scans are saved. i to type a folder.",
+    saved_to: "Settings are saved as you change them, in {path}",
     unix_hints: ["install yazi, lf, ranger, nnn or fzf", "for other scanners install SANE", "sudo may ask for your password"],
     win_hints: ["the file dialog was closed", "USB scanners need their Windows driver installed", "Windows will ask you to allow it"],
 };
@@ -569,6 +617,21 @@ pub const ZH: Texts = Texts {
     tray_full: "出纸盒满了，请把纸取走。",
     tray_missing: "纸盒不见了。",
     problem: "打印机报告了一个问题：{reason}",
+    tab_settings: "设置",
+    settings_labels: ["语言", "主题", "音量", "吉祥物", "图片预览", "扫描文件夹"],
+    system: "系统（{lang}）",
+    themes: ["自动（终端）", "深色", "浅色"],
+    on_off: ["开", "关"],
+    graphics: ["自动", "kitty", "Sixel", "色块"],
+    muted: "静音",
+    lang_chat: "选择我的语言。“系统”跟随你的电脑。",
+    theme_chat: "自动沿用终端的颜色；深色和浅色使用自己的配色。",
+    volume_chat: "我的音量：打印时嗡嗡响，卡纸时会抱怨。",
+    muted_chat: "静音。我会安静地打印。",
+    mascot_chat: "需要空间就把我藏起来吧，我不会介意的。",
+    graphics_chat: "页面的绘制方式。自动会选择终端支持的最佳方式。",
+    folder_chat: "扫描文件的保存位置。按 i 输入文件夹。",
+    saved_to: "设置在更改时即保存到 {path}",
     unix_hints: ["请安装 yazi、lf、ranger、nnn 或 fzf", "要使用其他扫描仪，请安装 SANE", "sudo 可能会要求输入密码"],
     win_hints: ["文件对话框已关闭", "USB 扫描仪需要安装其 Windows 驱动", "Windows 会请求你的许可"],
 };
@@ -738,6 +801,21 @@ pub const HI: Texts = Texts {
     tray_full: "आउटपुट ट्रे भर गई है, पेज निकाल लें।",
     tray_missing: "काग़ज़ की ट्रे नहीं है।",
     problem: "प्रिंटर ने एक समस्या बताई: {reason}",
+    tab_settings: "सेटिंग्स",
+    settings_labels: ["भाषा", "थीम", "आवाज़", "शुभंकर", "पूर्वावलोकन", "स्कैन फ़ोल्डर"],
+    system: "सिस्टम ({lang})",
+    themes: ["अपने आप (टर्मिनल)", "गहरा", "हल्का"],
+    on_off: ["चालू", "बंद"],
+    graphics: ["अपने आप", "kitty", "Sixel", "ब्लॉक"],
+    muted: "आवाज़ बंद",
+    lang_chat: "मेरी भाषा चुनें। सिस्टम आपके कंप्यूटर की भाषा अपनाता है।",
+    theme_chat: "अपने आप टर्मिनल के रंग रखता है; गहरा और हल्का अपने रंग लगाते हैं।",
+    volume_chat: "मैं कितना शोर करूँ: छापते समय गुनगुनाता हूँ, फँसने पर बड़बड़ाता हूँ।",
+    muted_chat: "आवाज़ बंद। मैं चुपचाप छापूँगा।",
+    mascot_chat: "जगह चाहिए तो मुझे छिपा दें। मुझे बुरा नहीं लगेगा।",
+    graphics_chat: "पेज कैसे बनें। अपने आप आपके टर्मिनल का सबसे अच्छा तरीका चुनता है।",
+    folder_chat: "स्कैन कहाँ सहेजें। फ़ोल्डर लिखने के लिए i।",
+    saved_to: "सेटिंग्स बदलते ही यहाँ सहेजी जाती हैं: {path}",
     unix_hints: ["yazi, lf, ranger, nnn या fzf इंस्टॉल करें", "दूसरे स्कैनरों के लिए SANE इंस्टॉल करें", "sudo आपका पासवर्ड माँग सकता है"],
     win_hints: ["फ़ाइल डायलॉग बंद कर दिया गया", "USB स्कैनरों को उनका Windows ड्राइवर चाहिए", "Windows आपसे अनुमति माँगेगा"],
 };
@@ -907,6 +985,21 @@ pub const ES: Texts = Texts {
     tray_full: "La bandeja de salida está llena, saca las hojas.",
     tray_missing: "Falta la bandeja del papel.",
     problem: "La impresora avisa de un problema: {reason}",
+    tab_settings: "Ajustes",
+    settings_labels: ["Idioma", "Tema", "Volumen", "Mascota", "Vista previa", "Carpeta escaneos"],
+    system: "Sistema ({lang})",
+    themes: ["Auto (terminal)", "Oscuro", "Claro"],
+    on_off: ["Sí", "No"],
+    graphics: ["Auto", "kitty", "Sixel", "Bloques"],
+    muted: "Silencio",
+    lang_chat: "Elige mi idioma. Sistema sigue al de tu ordenador.",
+    theme_chat: "Auto respeta los colores de tu terminal; Oscuro y Claro pintan los suyos.",
+    volume_chat: "Cuánto ruido hago: zumbo al imprimir y refunfuño si me atasco.",
+    muted_chat: "Silencio. Imprimiré sin hacer ruido.",
+    mascot_chat: "Escóndeme si necesitas sitio. No me lo tomaré a mal.",
+    graphics_chat: "Cómo se dibujan las páginas. Auto elige lo mejor que admite tu terminal.",
+    folder_chat: "Dónde se guardan los escaneos. i para escribir una carpeta.",
+    saved_to: "Los ajustes se guardan al cambiarlos, en {path}",
     unix_hints: ["instala yazi, lf, ranger, nnn o fzf", "para otros escáneres instala SANE", "sudo puede pedirte la contraseña"],
     win_hints: ["se cerró el diálogo de archivos", "los escáneres USB necesitan su driver de Windows", "Windows te pedirá permiso"],
 };
@@ -1076,6 +1169,21 @@ pub const AR: Texts = Texts {
     tray_full: "درج الإخراج ممتلئ، أخرج الصفحات.",
     tray_missing: "درج الورق مفقود.",
     problem: "تبلغ الطابعة عن مشكلة: {reason}",
+    tab_settings: "الإعدادات",
+    settings_labels: ["اللغة", "المظهر", "الصوت", "التميمة", "المعاينة", "مجلد المسح"],
+    system: "النظام ({lang})",
+    themes: ["تلقائي (الطرفية)", "داكن", "فاتح"],
+    on_off: ["تشغيل", "إيقاف"],
+    graphics: ["تلقائي", "kitty", "Sixel", "كتل"],
+    muted: "صامت",
+    lang_chat: "اختر لغتي. «النظام» يتبع لغة حاسوبك.",
+    theme_chat: "التلقائي يُبقي ألوان الطرفية؛ الداكن والفاتح يرسمان ألوانهما.",
+    volume_chat: "مدى ضجيجي: أطنّ عند الطباعة وأتذمّر عند الانحشار.",
+    muted_chat: "صامت. سأطبع بهدوء.",
+    mascot_chat: "أخفني إن احتجت المساحة. لن أنزعج.",
+    graphics_chat: "طريقة رسم الصفحات. التلقائي يختار الأفضل لطرفيتك.",
+    folder_chat: "مكان حفظ المسح. i لكتابة مجلد.",
+    saved_to: "تُحفظ الإعدادات فور تغييرها في {path}",
     unix_hints: ["ثبّت yazi أو lf أو ranger أو nnn أو fzf", "للماسحات الأخرى ثبّت SANE", "قد يطلب sudo كلمة المرور"],
     win_hints: ["أُغلقت نافذة الملفات", "ماسحات USB تحتاج تعريف Windows الخاص بها", "سيطلب Windows إذنك"],
 };
@@ -1245,6 +1353,21 @@ pub const FR: Texts = Texts {
     tray_full: "Le bac de sortie est plein, retirez les pages.",
     tray_missing: "Le bac à papier manque.",
     problem: "L'imprimante signale un problème : {reason}",
+    tab_settings: "Réglages",
+    settings_labels: ["Langue", "Thème", "Volume", "Mascotte", "Aperçu", "Dossier scans"],
+    system: "Système ({lang})",
+    themes: ["Auto (terminal)", "Sombre", "Clair"],
+    on_off: ["Oui", "Non"],
+    graphics: ["Auto", "kitty", "Sixel", "Blocs"],
+    muted: "Muet",
+    lang_chat: "Choisissez ma langue. Système suit celle de votre ordinateur.",
+    theme_chat: "Auto garde les couleurs du terminal ; Sombre et Clair peignent les leurs.",
+    volume_chat: "Mon volume : je ronronne en imprimant et je grogne en cas de bourrage.",
+    muted_chat: "Muet. J'imprimerai en silence.",
+    mascot_chat: "Cachez-moi s'il faut de la place. Je ne le prendrai pas mal.",
+    graphics_chat: "Comment les pages sont dessinées. Auto choisit le mieux pour votre terminal.",
+    folder_chat: "Où les numérisations sont enregistrées. i pour taper un dossier.",
+    saved_to: "Les réglages sont enregistrés dès qu'ils changent, dans {path}",
     unix_hints: ["installez yazi, lf, ranger, nnn ou fzf", "pour d'autres scanners installez SANE", "sudo peut demander votre mot de passe"],
     win_hints: ["la fenêtre de fichiers a été fermée", "les scanners USB ont besoin de leur pilote Windows", "Windows vous demandera l'autorisation"],
 };
@@ -1414,6 +1537,21 @@ pub const BN: Texts = Texts {
     tray_full: "আউটপুট ট্রে ভরে গেছে, পৃষ্ঠাগুলো বের করুন।",
     tray_missing: "কাগজের ট্রে নেই।",
     problem: "প্রিন্টার একটি সমস্যার কথা জানাচ্ছে: {reason}",
+    tab_settings: "সেটিংস",
+    settings_labels: ["ভাষা", "থিম", "ভলিউম", "মাসকট", "প্রিভিউ", "স্ক্যান ফোল্ডার"],
+    system: "সিস্টেম ({lang})",
+    themes: ["স্বয়ংক্রিয় (টার্মিনাল)", "গাঢ়", "হালকা"],
+    on_off: ["চালু", "বন্ধ"],
+    graphics: ["স্বয়ংক্রিয়", "kitty", "Sixel", "ব্লক"],
+    muted: "নিঃশব্দ",
+    lang_chat: "আমার ভাষা বাছুন। সিস্টেম আপনার কম্পিউটারের ভাষা মানে।",
+    theme_chat: "স্বয়ংক্রিয় টার্মিনালের রং রাখে; গাঢ় আর হালকা নিজেদের রং দেয়।",
+    volume_chat: "আমি কতটা শব্দ করব: ছাপার সময় গুনগুন করি, আটকে গেলে গজগজ করি।",
+    muted_chat: "নিঃশব্দ। আমি চুপচাপ ছাপব।",
+    mascot_chat: "জায়গা লাগলে আমাকে লুকিয়ে দিন। আমি কিছু মনে করব না।",
+    graphics_chat: "পৃষ্ঠা কীভাবে আঁকা হবে। স্বয়ংক্রিয় আপনার টার্মিনালের সেরাটা বাছে।",
+    folder_chat: "স্ক্যান কোথায় রাখা হবে। ফোল্ডার লিখতে i।",
+    saved_to: "সেটিংস বদলালেই এখানে রাখা হয়: {path}",
     unix_hints: ["yazi, lf, ranger, nnn বা fzf ইনস্টল করুন", "অন্য স্ক্যানারের জন্য SANE ইনস্টল করুন", "sudo আপনার পাসওয়ার্ড চাইতে পারে"],
     win_hints: ["ফাইল ডায়ালগ বন্ধ করা হয়েছে", "USB স্ক্যানারের জন্য তার Windows ড্রাইভার লাগে", "Windows আপনার অনুমতি চাইবে"],
 };
@@ -1583,6 +1721,21 @@ pub const PT: Texts = Texts {
     tray_full: "A bandeja de saída está cheia, tire as páginas.",
     tray_missing: "Falta a bandeja de papel.",
     problem: "A impressora relata um problema: {reason}",
+    tab_settings: "Ajustes",
+    settings_labels: ["Idioma", "Tema", "Volume", "Mascote", "Prévia", "Pasta scans"],
+    system: "Sistema ({lang})",
+    themes: ["Auto (terminal)", "Escuro", "Claro"],
+    on_off: ["Sim", "Não"],
+    graphics: ["Auto", "kitty", "Sixel", "Blocos"],
+    muted: "Mudo",
+    lang_chat: "Escolha meu idioma. Sistema segue o do seu computador.",
+    theme_chat: "Auto mantém as cores do terminal; Escuro e Claro pintam as suas.",
+    volume_chat: "O quanto faço barulho: zumbo ao imprimir e resmungo se atolar.",
+    muted_chat: "Mudo. Vou imprimir em silêncio.",
+    mascot_chat: "Me esconda se precisar de espaço. Não vou levar a mal.",
+    graphics_chat: "Como as páginas são desenhadas. Auto escolhe o melhor para o seu terminal.",
+    folder_chat: "Onde as digitalizações são salvas. i para digitar uma pasta.",
+    saved_to: "Os ajustes são salvos quando mudam, em {path}",
     unix_hints: ["instale yazi, lf, ranger, nnn ou fzf", "para outros scanners instale o SANE", "o sudo pode pedir sua senha"],
     win_hints: ["a janela de arquivos foi fechada", "scanners USB precisam do driver do Windows", "o Windows vai pedir sua permissão"],
 };
@@ -1752,6 +1905,21 @@ pub const RU: Texts = Texts {
     tray_full: "Выходной лоток полон, заберите страницы.",
     tray_missing: "Нет лотка для бумаги.",
     problem: "Принтер сообщает о проблеме: {reason}",
+    tab_settings: "Настройки",
+    settings_labels: ["Язык", "Тема", "Громкость", "Талисман", "Предпросмотр", "Папка сканов"],
+    system: "Системный ({lang})",
+    themes: ["Авто (терминал)", "Тёмная", "Светлая"],
+    on_off: ["Вкл", "Выкл"],
+    graphics: ["Авто", "kitty", "Sixel", "Блоки"],
+    muted: "Без звука",
+    lang_chat: "Выберите мой язык. «Системный» следует за компьютером.",
+    theme_chat: "Авто оставляет цвета терминала; Тёмная и Светлая рисуют свои.",
+    volume_chat: "Насколько я шумный: жужжу при печати и ворчу при замятии.",
+    muted_chat: "Без звука. Буду печатать тихо.",
+    mascot_chat: "Спрячьте меня, если нужно место. Я не обижусь.",
+    graphics_chat: "Как рисуются страницы. Авто выбирает лучшее для вашего терминала.",
+    folder_chat: "Куда сохранять сканы. i — ввести папку.",
+    saved_to: "Настройки сохраняются сразу, в {path}",
     unix_hints: ["установите yazi, lf, ranger, nnn или fzf", "для других сканеров установите SANE", "sudo может спросить пароль"],
     win_hints: ["окно выбора файла закрыто", "USB-сканерам нужен драйвер Windows", "Windows попросит разрешения"],
 };
@@ -1921,6 +2089,21 @@ pub const ID: Texts = Texts {
     tray_full: "Baki keluaran penuh, ambil kertasnya.",
     tray_missing: "Baki kertas tidak ada.",
     problem: "Printer melaporkan masalah: {reason}",
+    tab_settings: "Pengaturan",
+    settings_labels: ["Bahasa", "Tema", "Volume", "Maskot", "Pratinjau", "Folder pindai"],
+    system: "Sistem ({lang})",
+    themes: ["Otomatis (terminal)", "Gelap", "Terang"],
+    on_off: ["Ya", "Tidak"],
+    graphics: ["Otomatis", "kitty", "Sixel", "Blok"],
+    muted: "Senyap",
+    lang_chat: "Pilih bahasaku. Sistem mengikuti bahasa komputermu.",
+    theme_chat: "Otomatis memakai warna terminalmu; Gelap dan Terang punya warna sendiri.",
+    volume_chat: "Seberapa berisik aku: berdengung saat mencetak, menggerutu saat macet.",
+    muted_chat: "Senyap. Aku mencetak diam-diam.",
+    mascot_chat: "Sembunyikan aku kalau butuh ruang. Aku tidak tersinggung.",
+    graphics_chat: "Cara halaman digambar. Otomatis memilih yang terbaik untuk terminalmu.",
+    folder_chat: "Tempat hasil pindaian disimpan. i untuk mengetik folder.",
+    saved_to: "Pengaturan disimpan saat diubah, di {path}",
     unix_hints: ["pasang yazi, lf, ranger, nnn atau fzf", "untuk pemindai lain pasang SANE", "sudo mungkin meminta kata sandimu"],
     win_hints: ["jendela berkas ditutup", "pemindai USB perlu driver Windows-nya", "Windows akan meminta izinmu"],
 };
