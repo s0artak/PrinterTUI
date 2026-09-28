@@ -25,6 +25,8 @@ static JOBS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub const PAPERS: [&str; 5] = ["A4", "Letter", "Legal", "A5", "A3"];
 /// Pages per sheet side (`number-up`).
 pub const PER_SHEET: [u32; 6] = [1, 2, 4, 6, 9, 16];
+/// Content size in percent of the page, see `scale_pdf`.
+pub const SCALES: [u32; 9] = [25, 50, 75, 90, 100, 110, 125, 150, 200];
 
 fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
     let child = Command::new(cmd)
@@ -52,19 +54,171 @@ pub fn page_count(file: &str) -> Option<u32> {
     (n > 0).then_some(n)
 }
 
+/// A temp folder of its own for each source file, so same-named files never overwrite each other.
+pub fn work_dir(file: &str) -> Result<std::path::PathBuf, String> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    file.hash(&mut h);
+    let dir = std::env::temp_dir().join("printertui").join(format!("{:016x}", Hasher::finish(&h)));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// True when `out` was written after `src` last changed, so it can be reused.
+fn fresh(src: &str, out: &std::path::Path) -> bool {
+    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified());
+    matches!((modified(src.as_ref()), modified(out)), (Ok(s), Ok(o)) if o >= s)
+}
+
+/// Writes aside and renames, so a print reading the previous version never sees half a file.
+fn write_atomic(out: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    let tmp = out.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&tmp, data).and_then(|_| std::fs::rename(&tmp, out)).map_err(|e| format!("{}: {e}", out.display()))
+}
+
+/// Paper size in inches, portrait (width, height).
+pub fn paper_inches(paper: &str) -> (f32, f32) {
+    match paper {
+        "Letter" => (8.5, 11.0),
+        "Legal" => (8.5, 14.0),
+        "A5" => (5.83, 8.27),
+        "A3" => (11.69, 16.54),
+        _ => (8.27, 11.69),
+    }
+}
+
 /// Converts a document, text or image to PDF with LibreOffice, returns the PDF path.
+/// The PDF is reused while it is newer than the file, so the preview does not convert it again.
 pub fn to_pdf(file: &str) -> Result<String, String> {
-    let dir = std::env::temp_dir().join("printertui");
+    let dir = work_dir(file)?;
     let d = dir.to_str().ok_or("Bad temp dir")?;
     let stem = std::path::Path::new(file).file_stem().ok_or("Bad file name")?;
     let pdf = dir.join(stem).with_extension("pdf").to_string_lossy().into_owned();
+    if fresh(file, pdf.as_ref()) && page_count(&pdf).is_some() {
+        return Ok(pdf);
+    }
     let _ = std::fs::remove_file(&pdf);
     // own profile, so a running LibreOffice window does not swallow the conversion
     // (a file URL: file:///tmp/... or file:///C:/Users/...)
-    let profile = format!("-env:UserInstallation=file:///{}/profile", d.replace('\\', "/").trim_start_matches('/'));
+    let base = std::env::temp_dir().join("printertui");
+    let profile = format!("-env:UserInstallation=file:///{}/profile", base.to_string_lossy().replace('\\', "/").trim_start_matches('/'));
     run(&soffice(), &[&profile, "--headless", "--convert-to", "pdf", "--outdir", d, file])
         .map_err(|e| format!("Could not convert {file} to PDF (is libreoffice installed?): {e}"))?;
     page_count(&pdf).map(|_| pdf).ok_or(format!("LibreOffice could not convert {file} to PDF"))
+}
+
+/// A copy of the PDF with each page's content scaled by `percent` around the page centre; the
+/// paper size stays, so above 100 the edges are cut off. Returns the copy's path.
+// ponytail: links and form fields (annotations) keep their size and place; scale them too if a form ever prints wrong
+pub fn scale_pdf(file: &str, percent: u32) -> Result<String, String> {
+    use lopdf::{Dictionary, Object, Stream};
+    let err = |e: lopdf::Error| format!("{file}: {e}");
+    let mut doc = lopdf::Document::load(file).map_err(err)?;
+    let s = percent as f64 / 100.0;
+    let pages: Vec<_> = doc.page_iter().collect();
+    for id in pages {
+        let [x0, y0, x1, y1] = page_box(&doc, id).unwrap_or([0.0, 0.0, 612.0, 792.0]);
+        let (dx, dy) = ((x0 + x1) / 2.0 * (1.0 - s), (y0 + y1) / 2.0 * (1.0 - s));
+        let mut contents: Vec<Object> = doc.get_page_contents(id).into_iter().map(Object::Reference).collect();
+        let pre = doc.add_object(Stream::new(Dictionary::new(), format!("q {s:.4} 0 0 {s:.4} {dx:.4} {dy:.4} cm\n").into_bytes()));
+        let post = doc.add_object(Stream::new(Dictionary::new(), b"\nQ\n".to_vec()));
+        contents.insert(0, pre.into());
+        contents.push(post.into());
+        doc.get_dictionary_mut(id).map_err(err)?.set("Contents", contents);
+    }
+    let out = work_dir(file)?.join(format!("scaled-{percent}.pdf"));
+    let mut data = Vec::new();
+    doc.save_to(&mut data).map_err(|e| format!("{file}: {e}"))?;
+    write_atomic(&out, &data)?;
+    Ok(out.to_string_lossy().into_owned())
+}
+
+/// The visible area of a page (CropBox, else MediaBox), which pages may inherit from their parents.
+fn page_box(doc: &lopdf::Document, page: lopdf::ObjectId) -> Option<[f64; 4]> {
+    for key in [&b"CropBox"[..], b"MediaBox"] {
+        let mut dict = doc.get_dictionary(page).ok()?;
+        loop {
+            if let Ok(arr) = dict.get_deref(key, doc).and_then(lopdf::Object::as_array) {
+                let v: Vec<f64> = arr.iter().filter_map(|o| o.as_float().ok()).map(f64::from).collect();
+                if let [a, b, c, d] = v[..] {
+                    return Some([a.min(c), b.min(d), a.max(c), b.max(d)]);
+                }
+            }
+            match dict.get(b"Parent").and_then(lopdf::Object::as_reference).and_then(|p| doc.get_dictionary(p)) {
+                Ok(parent) => dict = parent,
+                Err(_) => break,
+            }
+        }
+    }
+    None
+}
+
+/// A photo (PNG or JPEG) as a one-page PDF that fills the paper, turned whichever way it prints
+/// larger: the print system shrinks big pages to the paper, but prints small ones as they are.
+// ponytail: only CUPS turns a sideways photo to fit; on Windows it prints upright and smaller
+fn photo_pdf(file: &str, paper: &str) -> Result<String, String> {
+    let out = work_dir(file)?.join(format!("photo-{paper}.pdf"));
+    if !fresh(file, &out) {
+        let (w, h) = { let img = open(file)?; (img.width() as f32, img.height() as f32) };
+        let (pw, ph) = paper_inches(paper);
+        let dpi = (w / pw).max(h / ph).min((w / ph).max(h / pw)).ceil().max(1.0);
+        write_atomic(&out, &images_to_pdf(&[file.to_string()], dpi as u32, &[])?)?;
+    }
+    Ok(out.to_string_lossy().into_owned())
+}
+
+/// The PDF that gets printed for a file: a photo or a document converted if it is not one, then scaled.
+pub fn printable(file: &str, percent: u32, paper: &str) -> Result<String, String> {
+    let pdf = if page_count(file).is_some() {
+        file.to_string()
+    } else if image::ImageReader::open(file).and_then(|r| r.with_guessed_format()).is_ok_and(|r| r.format().is_some()) {
+        photo_pdf(file, paper)?
+    } else {
+        to_pdf(file)?
+    };
+    if percent == 100 { Ok(pdf) } else { scale_pdf(&pdf, percent) }
+}
+
+/// Pages per sheet side as (columns, rows) on upright paper.
+pub fn grid(per_sheet: u32) -> (u32, u32) {
+    match per_sheet {
+        2 => (1, 2),
+        4 => (2, 2),
+        6 => (2, 3),
+        9 => (3, 3),
+        16 => (4, 4),
+        _ => (1, 1),
+    }
+}
+
+/// One sheet side for the preview: the page images in their grid, left to right and top to
+/// bottom. CUPS turns the sheet sideways for 2 and 6 per sheet; Windows keeps it upright.
+pub fn sheet_png(pages: &[String], paper: &str, per_sheet: u32, out: &str) -> Result<(), String> {
+    let (mut cols, mut rows) = grid(per_sheet);
+    let (mut pw, mut ph) = paper_inches(paper);
+    if cfg!(unix) && matches!(per_sheet, 2 | 6) {
+        (cols, rows, pw, ph) = (rows, cols, ph, pw);
+    }
+    let px = 1400.0 / pw.max(ph);
+    let (w, h) = ((pw * px) as u32, (ph * px) as u32);
+    let (cw, ch) = (w / cols, h / rows);
+    let mut sheet = image::RgbImage::from_pixel(w, h, image::Rgb([255, 255, 255]));
+    for (k, page) in pages.iter().enumerate() {
+        let img = open(page)?.resize(cw - 8, ch - 8, FilterType::Triangle).to_rgb8();
+        let (x, y) = ((k as u32 % cols) * cw + (cw - img.width()) / 2, (k as u32 / cols) * ch + (ch - img.height()) / 2);
+        image::imageops::overlay(&mut sheet, &img, x.into(), y.into());
+        // an outline, or white pages vanish into the white sheet
+        let edge = image::Rgb([170, 170, 170]);
+        for i in 0..img.width() {
+            sheet.put_pixel(x + i, y, edge);
+            sheet.put_pixel(x + i, y + img.height() - 1, edge);
+        }
+        for j in 0..img.height() {
+            sheet.put_pixel(x, y + j, edge);
+            sheet.put_pixel(x + img.width() - 1, y + j, edge);
+        }
+    }
+    save_png(&DynamicImage::ImageRgb8(sheet), out)
 }
 
 /// Paths in the File field are separated by ';'.
@@ -268,13 +422,22 @@ fn answer(res: Result<minreq::Response, minreq::Error>) -> Result<minreq::Respon
     }
 }
 
-/// Decodes a PNG or JPEG whatever its file name (scans have no extension).
+/// Decodes a PNG or JPEG whatever its file name (scans have no extension), turned upright as its
+/// EXIF orientation says (phone photos).
 fn open(path: &str) -> Result<DynamicImage, String> {
-    image::ImageReader::open(path)
-        .and_then(|r| r.with_guessed_format())
-        .map_err(|e| format!("{path}: {e}"))?
-        .decode()
-        .map_err(|e| format!("{path}: {e}"))
+    let reader = image::ImageReader::open(path).and_then(|r| r.with_guessed_format()).map_err(|e| format!("{path}: {e}"))?;
+    Ok(decode(reader, path)?.0)
+}
+
+/// The image and whether it had to be turned upright.
+fn decode<R: std::io::BufRead + std::io::Seek>(reader: image::ImageReader<R>, path: &str) -> Result<(DynamicImage, bool), String> {
+    use image::ImageDecoder;
+    let err = |e: image::ImageError| format!("{path}: {e}");
+    let mut dec = reader.into_decoder().map_err(err)?;
+    let orientation = dec.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(dec).map_err(err)?;
+    img.apply_orientation(orientation);
+    Ok((img, orientation != image::metadata::Orientation::NoTransforms))
 }
 
 fn save_png(img: &DynamicImage, path: &str) -> Result<(), String> {
@@ -333,10 +496,12 @@ fn black_and_white(mut g: GrayImage) -> GrayImage {
 /// The page as JPEG for a PDF: (width, height, grayscale, bytes). JPEG scans go in as they are.
 fn jpeg(path: &str) -> Result<(u32, u32, bool, Vec<u8>), String> {
     let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    let img = image::load_from_memory(&data).map_err(|e| format!("{path}: {e}"))?;
+    let reader = image::ImageReader::new(std::io::Cursor::new(&data)).with_guessed_format().map_err(|e| format!("{path}: {e}"))?;
+    let (img, turned) = decode(reader, path)?;
     let (w, h) = (img.width(), img.height());
     let gray = matches!(img.color(), ColorType::L8 | ColorType::La8 | ColorType::L16 | ColorType::La16);
-    if data.starts_with(&[0xFF, 0xD8]) && matches!(img.color(), ColorType::L8 | ColorType::Rgb8) {
+    // a JPEG goes in as it is, unless it had to be turned (PDF viewers ignore EXIF)
+    if !turned && data.starts_with(&[0xFF, 0xD8]) && matches!(img.color(), ColorType::L8 | ColorType::Rgb8) {
         return Ok((w, h, gray, data));
     }
     let img = if gray { DynamicImage::ImageLuma8(img.to_luma8()) } else { DynamicImage::ImageRgb8(img.to_rgb8()) };
@@ -571,6 +736,57 @@ fn pages_to_pdf_and_back() {
     assert_eq!((img.width(), img.height()), (150, 300));
     assert!(img.to_luma8().pixels().all(|v| v[0] == 0 || v[0] == 255));
     assert_eq!((w, px.len()), (400, w * h));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn scale_pdf_wraps_every_page() {
+    let dir = std::env::temp_dir().join(format!("printertui-scale-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("p.png").to_string_lossy().into_owned();
+    GrayImage::from_pixel(200, 100, Luma([0])).save(&img).unwrap();
+    let pdf = dir.join("in.pdf");
+    std::fs::write(&pdf, images_to_pdf(&[img.clone(), img], 100, &[]).unwrap()).unwrap();
+    let out = scale_pdf(&pdf.to_string_lossy(), 50).unwrap();
+    let doc = lopdf::Document::load(&out).unwrap();
+    assert_eq!(doc.get_pages().len(), 2);
+    for id in doc.page_iter() {
+        let content = String::from_utf8_lossy(&doc.get_page_content(id)).into_owned();
+        // 200x100 px at 100 dpi = 144x72 pt, centre (72, 36): moved by half of it
+        assert!(content.starts_with("q 0.5000 0 0 0.5000 36.0000 18.0000 cm"), "{content}");
+        assert!(content.trim_end().ends_with('Q'), "{content}");
+    }
+    // pdftoppm (poppler) draws it, when installed
+    if run("pdftoppm", &["-v"]).is_ok() {
+        let png = dir.join("p1.png").to_string_lossy().into_owned();
+        render_page(&out, 2, &png).unwrap();
+        let page = open(&png).unwrap().to_luma8();
+        // the black image now fills only the middle half: corners white, centre black
+        assert!(page.get_pixel(1, 1)[0] > 200 && page.get_pixel(page.width() / 2, page.height() / 2)[0] < 50);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn photo_fills_the_paper_and_sheets_hold_their_pages() {
+    let dir = std::env::temp_dir().join(format!("printertui-photo-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let wide = dir.join("wide.png").to_string_lossy().into_owned();
+    DynamicImage::ImageRgb8(image::RgbImage::from_pixel(3000, 1000, image::Rgb([0, 0, 0]))).save(&wide).unwrap();
+    let pdf = printable(&wide, 100, "A4").unwrap();
+    let doc = lopdf::Document::load(&pdf).unwrap();
+    let [_, _, w, h] = page_box(&doc, doc.page_iter().next().unwrap()).unwrap();
+    // turned sideways it fills the A4's long side (842 pt)
+    assert!((w - 842.0).abs() < 5.0 && h < 595.0, "{w} x {h}");
+
+    let sheet = dir.join("sheet.png").to_string_lossy().into_owned();
+    sheet_png(&[wide.clone(), wide.clone(), wide], "A4", 4, &sheet).unwrap();
+    let img = open(&sheet).unwrap().to_luma8();
+    // upright sheet, 2x2: three cells hold a black page, the bottom right one stays white
+    let (sw, sh) = img.dimensions();
+    assert!(sh > sw);
+    assert!(img.get_pixel(sw / 4, sh / 4)[0] < 50 && img.get_pixel(sw * 3 / 4, sh / 4)[0] < 50 && img.get_pixel(sw / 4, sh * 3 / 4)[0] < 50);
+    assert!(img.get_pixel(sw * 3 / 4, sh * 3 / 4)[0] > 200);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

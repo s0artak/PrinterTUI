@@ -31,14 +31,7 @@ pub fn printers() -> Vec<String> {
 /// Display name for a queue from its `lpoptions -p` output: the description if the user set one
 /// (`lpadmin -p QUEUE -D "Name"`), else the model, plus the network address.
 pub fn printer_label(queue: &str, lpoptions: &str) -> String {
-    let opt = |key: &str| {
-        let v = lpoptions.split(&format!("{key}=")).nth(1)?;
-        let v = match v.strip_prefix('\'') {
-            Some(q) => q.split('\'').next()?,
-            None => v.split(' ').next()?,
-        };
-        Some(v.replace("\\ ", " "))
-    };
+    let opt = |key| lpoption(lpoptions, key);
     let info = opt("printer-info").filter(|i| !i.is_empty() && i != queue);
     let model = opt("printer-make-and-model").map(|m| m.trim_end_matches(" - IPP Everywhere").to_string());
     let name = info.or(model).unwrap_or_else(|| queue.to_string());
@@ -46,6 +39,34 @@ pub fn printer_label(queue: &str, lpoptions: &str) -> String {
         Some((scheme, host)) if NETWORK.contains(&scheme) => format!("{name} ({host})"),
         _ => name,
     }
+}
+
+/// One value from `lpoptions -p` output: key=value, key='quoted value' or key=escaped\ value.
+fn lpoption(lpoptions: &str, key: &str) -> Option<String> {
+    let v = lpoptions.split(&format!(" {key}=")).nth(1).or_else(|| lpoptions.strip_prefix(&format!("{key}=")))?;
+    let v = match v.strip_prefix('\'') {
+        Some(q) => q.split('\'').next()?,
+        None => v.split(' ').next()?,
+    };
+    Some(v.replace("\\ ", " "))
+}
+
+/// Ink or toner left as (RGB color, percent, -1 when unknown) from the printer's IPP marker
+/// attributes; empty when it does not report them.
+pub fn ink(queue: &str) -> Vec<(u32, i32)> {
+    parse_ink(&run("lpoptions", &["-p", queue]).unwrap_or_default())
+}
+
+pub fn parse_ink(lpoptions: &str) -> Vec<(u32, i32)> {
+    let (Some(colors), Some(levels)) = (lpoption(lpoptions, "marker-colors"), lpoption(lpoptions, "marker-levels")) else {
+        return Vec::new();
+    };
+    colors
+        .split(',')
+        .zip(levels.split(','))
+        // a marker with several colors ("#00FFFF#FF00FF") shows the first
+        .map(|(c, l)| (c.get(1..7).and_then(|c| u32::from_str_radix(c, 16).ok()).unwrap_or(0x808080), l.parse().ok().filter(|l| *l >= 0).unwrap_or(-1)))
+        .collect()
 }
 
 pub fn printer_labels(queues: &[String]) -> Vec<String> {
@@ -175,6 +196,18 @@ pub fn lp_args(job: &Job) -> Vec<String> {
     a
 }
 
+/// One page of a PDF as a PNG for the preview: poppler's pdftoppm, or on macOS without it the
+/// system's sips, which only draws the first page.
+pub fn render_page(pdf: &str, page: u32, png: &str) -> Result<(), String> {
+    let n = page.to_string();
+    let prefix = png.trim_end_matches(".png");
+    match run("pdftoppm", &["-f", &n, "-l", &n, "-r", "100", "-png", "-singlefile", pdf, prefix]) {
+        Err(_) if cfg!(target_os = "macos") && page == 1 => run("sips", &["-s", "format", "png", pdf, "--out", png]).map(drop),
+        Err(e) if cfg!(target_os = "macos") => Err(format!("Previewing pages after the first needs poppler (brew install poppler): {e}")),
+        r => r.map(drop).map_err(|e| format!("Preview needs pdftoppm (poppler): {e}")),
+    }
+}
+
 /// Hosts of the network printers in CUPS, to try as eSCL scanners.
 pub fn printer_hosts() -> Vec<String> {
     run("lpstat", &["-v"])
@@ -238,6 +271,14 @@ pub fn ocr_pdf(pages: &[String], out: &str, dpi: u32) -> Result<Vec<String>, Str
         });
     let _ = std::fs::remove_dir_all(&tmp);
     res.map(|_| vec![format!("{out}.pdf")])
+}
+
+#[test]
+fn ink_levels() {
+    let out = "device-uri=ipp://192.168.1.46/ipp/print marker-colors=#00FFFF,#000000 marker-levels=80,-1 marker-names='cyan\\ ink,black\\ ink' printer-info=Tank";
+    assert_eq!(parse_ink(out), [(0x00FFFF, 80), (0, -1)]);
+    assert_eq!(printer_label("q", out), "Tank (192.168.1.46)");
+    assert!(parse_ink("printer-info=x").is_empty());
 }
 
 #[test]

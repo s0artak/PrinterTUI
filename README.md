@@ -51,8 +51,10 @@ printertui [file]
 | Enter | Pick files, pick pages, print, scan, save |
 | `q` | Quit |
 
+The page about to print is previewed on the right, converted and scaled as it will come out: `H`/`L` browse the pages (or the sheets, with several pages per sheet). **Scale** shrinks or enlarges the content (25-200%) on the same paper. Photos (JPEG, PNG) print without LibreOffice, filling the paper and turned upright. The printer's ink levels show under the form when it reports them (CUPS). The pixel-art printer from the installer keeps you company: it prints, scans and jams along with the app.
+
 Double-sided: the front pages print, then flip the stack and press Enter. An animation shows how to flip it. If the back pages come out in the wrong order, set **Back order** to *Reversed*.
 
-Scan: put a page on the glass, press Enter on **Scan page**, repeat for more pages, then **Save** them as one PDF or as PNG files. On the **Page** row: `h`/`l` browse pages, `r`/`R` rotate, `f` filter (gray, black & white), `x` keep or leave out, `H`/`L` reorder, `dd` delete. The last scanned page is previewed on the right: as the real image in kitty and Ghostty (also inside tmux with `set -g allow-passthrough on`), in grayscale blocks elsewhere.
+Scan: put a page on the glass, press Enter on **Scan page**, repeat for more pages, then **Save** them as one PDF or as PNG files, or **Copy** them: they print at their real size with the Print tab's settings (with nothing scanned yet, Copy scans a page and prints it, like a photocopier). On the **Page** row: `h`/`l` browse pages, `r`/`R` rotate, `f` filter (gray, black & white), `x` keep or leave out, `H`/`L` reorder, `dd` delete. The last scanned page is previewed on the right: as the real image in kitty and Ghostty (also inside tmux with `set -g allow-passthrough on`), in grayscale blocks elsewhere.
 
 Settings are remembered in `~/.config/printertui/config`.

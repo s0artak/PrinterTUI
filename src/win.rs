@@ -175,18 +175,6 @@ fn pdfium() -> Result<&'static Pdfium, String> {
     Ok(PDFIUM.get_or_init(|| Pdfium::new(bindings)))
 }
 
-/// Pages per sheet side as (columns, rows).
-fn grid(per_sheet: u32) -> (i32, i32) {
-    match per_sheet {
-        2 => (1, 2),
-        4 => (2, 2),
-        6 => (2, 3),
-        9 => (3, 3),
-        16 => (4, 4),
-        _ => (1, 1),
-    }
-}
-
 /// Printer settings for the job: paper, color, and always one-sided (double-sided is done by hand).
 fn devmode(printer: &str, job: &Job) -> Result<Vec<u64>, String> {
     let name = wide(printer);
@@ -270,6 +258,7 @@ fn draw_sheet(hdc: HDC, doc: &PdfDocument, sheet: &[u32], job: &Job) -> Result<(
     let cap = |i| unsafe { GetDeviceCaps(Some(hdc), i) };
     let (width, height, dpi) = (cap(HORZRES), cap(VERTRES), cap(LOGPIXELSX).max(72));
     let (cols, rows) = grid(job.per_sheet);
+    let (cols, rows) = (cols as i32, rows as i32);
     let (cell_w, cell_h) = (width / cols, height / rows);
     // rendering at the printer's full resolution would need hundreds of MB per page
     let scale = (300.0 / dpi as f32).min(1.0);
@@ -309,6 +298,24 @@ fn draw_sheet(hdc: HDC, doc: &PdfDocument, sheet: &[u32], job: &Job) -> Result<(
         return Err("The printer stopped accepting pages".into());
     }
     Ok(())
+}
+
+/// Ink levels are not read on Windows yet.
+// ponytail: the spooler has no ink API; ask the printer over IPP (marker-levels) like CUPS does if wanted
+pub fn ink(_queue: &str) -> Vec<(u32, i32)> {
+    Vec::new()
+}
+
+/// One page of a PDF as a PNG for the preview, drawn by pdfium.
+pub fn render_page(pdf: &str, page: u32, png: &str) -> Result<(), String> {
+    let doc = pdfium()?.load_pdf_from_file(pdf, None).map_err(|e| format!("{pdf}: {e}"))?;
+    let bitmap = doc
+        .pages()
+        .get((page - 1) as PdfPageIndex)
+        .and_then(|p| p.render_with_config(&PdfRenderConfig::new().set_target_width(1000).render_form_data(true)))
+        .map_err(|e| format!("page {page}: {e}"))?;
+    let img = image::RgbaImage::from_raw(bitmap.width() as u32, bitmap.height() as u32, bitmap.as_rgba_bytes()).ok_or("pdfium: bad bitmap")?;
+    img.save_with_format(png, image::ImageFormat::Png).map_err(|e| format!("{png}: {e}"))
 }
 
 /// Prints a job, returns "request id is <id> (<printer>)" like `lp` does.
