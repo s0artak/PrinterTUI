@@ -214,7 +214,8 @@ fn main() -> std::io::Result<()> {
                 .filter(|e| {
                     let n = e.file_name();
                     let s = n.to_string_lossy();
-                    s.starts_with("page-") && !s.ends_with(".preview.png")
+                    // scans have no extension; edited copies and previews are .png
+                    s.starts_with("page-") && !s.contains('.')
                 })
                 .collect();
             paths.sort_by_key(|e| e.file_name());

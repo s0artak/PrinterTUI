@@ -2,7 +2,9 @@
 
 Terminal UI for Linux, macOS and Windows to print and scan (CUPS and AirScan or SANE; the print spooler and the Windows scanner API on Windows), with manual double-sided printing for printers without a duplexer.
 
-![PrinterTUI demo](docs/demo.gif)
+[![PrinterTUI demo](docs/demo.gif)](docs/demo.mp4)
+
+Recorded in Ghostty; [watch it as a video](docs/demo.mp4).
 
 ## Install
 
