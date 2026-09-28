@@ -686,16 +686,18 @@ do_install() {
             bin_dir=/usr/local/bin
             os=linux ;;
         Darwin)
-            command -v brew >/dev/null || die "$T_e_brew"
-            if [ "$extras" != 000 ]; then
+            # PrinterTUI itself needs nothing: macOS has CUPS, PDFKit and Vision; only the extras come from Homebrew
+            if [ "$extras" != 000 ] && ! command -v brew >/dev/null; then
+                say "$T_e_brew"
+            elif [ "$extras" != 000 ]; then
                 say "$T_extras_inst"
                 checked=$extras
                 if marked 1; then run brew install --cask libreoffice; fi
                 if marked 2; then run brew install sane-backends; fi
-                if marked 3; then run brew install tesseract tesseract-lang; fi
                 checked=
             fi
-            bin_dir="$(brew --prefix)/bin"
+            # Homebrew's bin is the user's own; /usr/local/bin is on every macOS PATH
+            if command -v brew >/dev/null; then bin_dir="$(brew --prefix)/bin"; else bin_dir=/usr/local/bin; fi
             os=macos ;;
         *) die "$T_e_os" ;;
     esac
@@ -729,6 +731,8 @@ do_install() {
     esac
 
     say "$T_put $bin_dir"
+    # Apple silicon Macs may not have /usr/local/bin yet
+    [ -d "$bin_dir" ] || run sudo mkdir -p "$bin_dir"
     if [ -w "$bin_dir" ]; then
         run install -m 755 "$tmp" "$bin_dir/printertui"
     else
@@ -802,7 +806,14 @@ if [ -z "$action" ] && [ -n "$tty" ]; then
         for e in 1 2 3; do
             if has_extra $e; then checked=${checked}1; else checked=${checked}0; fi
         done
-        menu "$T_lo" "$T_sane" "$T_ocr"
+        if [ "$(uname -s)" = Darwin ]; then
+            # macOS reads text in scans itself (Vision): no Tesseract to offer
+            checked=${checked%?}
+            menu "$T_lo" "$T_sane"
+            checked=${checked}0
+        else
+            menu "$T_lo" "$T_sane" "$T_ocr"
+        fi
         if [ $sel -eq 0 ]; then action=quit; else extras=$checked; fi
         checked=
     fi

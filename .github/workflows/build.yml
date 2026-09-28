@@ -39,6 +39,9 @@ jobs:
           test "$(wrap '你好 ab' 20)" = "$(printf '7\t你好 ab')"
           test "$(wrap 'aaaa bbbbb' 9 | wc -l | tr -d ' ')" = 2
           test "$(wrap 'पेज स्कैन' 20 | cut -f1)" = 6
+      # the macOS install as it runs from curl | sh, without changing anything
+      - if: runner.os == 'macOS'
+        run: PRINTERTUI_PREVIEW=fresh sh install.sh install
       - if: runner.os == 'Windows'
         shell: powershell
         run: |

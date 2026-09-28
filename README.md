@@ -8,13 +8,13 @@ Recorded in Ghostty; [watch it as a video](docs/demo.mp4).
 
 ## Install
 
-Arch Linux or macOS (with [Homebrew](https://brew.sh)), one command and `printertui` is ready to run:
+Arch Linux or macOS, one command and `printertui` is ready to run:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.sh | sh
 ```
 
-It asks for a language (the app then speaks it too), offers the optional extras (LibreOffice, SANE, Tesseract) and checks the download against its SHA-256 before installing it to `/usr/local/bin` (`$(brew --prefix)/bin` on macOS), which is already on your PATH. Run it again to Update or Uninstall, or uninstall directly:
+It asks for a language (your system's comes first, and the app then speaks it too), offers the optional extras and checks the download against its SHA-256 before installing it to `/usr/local/bin` (Homebrew's `bin` when you have it), which is already on your PATH. Run it again to Update or Uninstall, or uninstall directly:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.sh | sh -s uninstall
@@ -26,7 +26,11 @@ Windows 10/11, in PowerShell (no administrator needed; puts `printertui` on your
 irm https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.ps1 | iex
 ```
 
-On Windows everything is built in: PDFs are drawn for the printer by an embedded pdfium, and searchable PDFs use Windows' own text recognition (add a language with "Optical character recognition" in Settings if it says none is installed). LibreOffice is optional, for non-PDF files.
+**Nothing else to install on macOS**: printing goes through the CUPS that macOS has, pages are drawn for the preview by the system's PDFKit, searchable PDFs use the system's text recognition (Vision), and files are picked in the system's file dialog. Homebrew is only needed for the optional extras.
+
+On Windows everything is built in too: PDFs are drawn for the printer by an embedded pdfium, and searchable PDFs use Windows' own text recognition (add a language with "Optical character recognition" in Settings if it says none is installed).
+
+PDFs, photos (JPEG, PNG) and text files print everywhere without anything else; LibreOffice is only for other documents (Word, spreadsheets, slides...).
 
 Development setup on Arch (dependencies, CUPS, build, link the build as `printertui-dev` so an installed `printertui` is left alone):
 
@@ -36,7 +40,7 @@ bash test/dev-setup-arch.sh
 
 `sh test/installer-preview.sh [fresh|jam|smudge]` plays the installer's menus and animations without changing anything.
 
-Optional: LibreOffice for non-PDF files (`libreoffice-fresh` / `brew install --cask libreoffice`), and SANE for scanners that are not part of a network printer (`sane sane-airscan` / `brew install sane-backends`). Network printers that can scan are used directly over AirScan (eSCL). For searchable PDFs (OCR) install Tesseract with the languages you scan (`tesseract tesseract-data-eng tesseract-data-spa` / `brew install tesseract tesseract-lang`).
+Optional: LibreOffice for documents (`libreoffice-fresh` / `brew install --cask libreoffice`), and SANE for scanners that are not part of a network printer (`sane sane-airscan` / `brew install sane-backends`). Network printers that can scan are used directly over AirScan (eSCL). On Linux, searchable PDFs (OCR) need Tesseract with the languages you scan (`tesseract tesseract-data-eng tesseract-data-spa`).
 
 ## Use
 
@@ -46,7 +50,7 @@ printertui [file]
 
 | Key | Action |
 | --- | --- |
-| Tab | Switch between Print and Scan |
+| Tab | Switch between Print, Scan and Settings |
 | `j` / `k`, `gg` / `G` | Move |
 | `h` / `l` | Change option |
 | `H` / `L` | Browse the preview's pages, or the scanned pages |
@@ -64,6 +68,8 @@ printertui [file]
 
 **Scan**: put a page on the glass, press Enter on **Scan page**, repeat for more pages, then **Save** them as one PDF (optionally searchable) or as PNG files, or **Copy** them: they print at their real size with the Print tab's settings (with nothing scanned yet, Copy scans a page and prints it, like a photocopier). On the **Page** row: `h`/`l` browse pages (`H`/`L` from any row), `r`/`R` rotate, `f` filter (gray, black & white), `x` keep or leave out, `<`/`>` reorder, `dd` delete.
 
-**Languages**: English, 中文, हिन्दी, Español, العربية, Français, বাংলা, Português, Русский and Bahasa Indonesia, the same as the installer. The app follows the language picked in the installer's menu, else the system's; set `lang=es` (or another code) in the settings to change it.
+**Settings** (the third tab): the language, the theme (Auto keeps your terminal's colors, or Dark and Light), the volume of the printer's sounds (it whirrs when it prints, hums when it scans, grumbles when it jams; 0 mutes it), the mascot, how pages are drawn (Auto, kitty, Sixel or colored blocks) and the folder scans are saved in. Changes are saved to the settings file right away, and the tab shows it as it is on disk.
+
+**Languages**: English, 中文, हिन्दी, Español, العربية, Français, বাংলা, Português, Русский and Bahasa Indonesia, the same as the installer. The app follows the language picked in the installer's menu, else the system's; change it any time in Settings.
 
 Settings are remembered in `~/.config/printertui/config` (`%APPDATA%\printertui\config` on Windows).

@@ -439,6 +439,11 @@ pub(crate) static SPAWNS: Mutex<()> = Mutex::new(());
 fn stop_all_kills_tools_and_their_children() {
     let _one = SPAWNS.lock().unwrap_or_else(|e| e.into_inner());
     let t = std::thread::spawn(|| run("sh", &["-c", "sleep 30 & wait"]));
+    // until the shell is running and has started its sleep (slow machines take a while)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while crate::CHILDREN.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     std::thread::sleep(std::time::Duration::from_millis(300));
     let start = std::time::Instant::now();
     stop_all();
