@@ -58,6 +58,8 @@ fn lpoption(lpoptions: &str, key: &str) -> Option<String> {
 pub fn printer_state(queue: &str) -> PrinterState {
     let opts = run("lpoptions", &["-p", queue]).unwrap_or_default();
     let uri = lpoption(&opts, "device-uri").unwrap_or_default();
+    // a printer macOS added has a Bonjour name: its address, to ask it directly
+    let uri = if uri.starts_with("dnssd://") { bonjour_uri(&uri).unwrap_or(uri) } else { uri };
     if !matches!(uri_host(&uri), Some(("ipp" | "ipps" | "http", _))) {
         return cups_state(&opts);
     }
@@ -323,12 +325,69 @@ pub fn render_page(pdf: &str, page: u32, png: &str) -> Result<(), String> {
 
 /// Hosts of the network printers in CUPS, to try as eSCL scanners.
 pub fn printer_hosts() -> Vec<String> {
-    run("lpstat", &["-v"])
+    let mut hosts: Vec<String> = run("lpstat", &["-v"])
         .unwrap_or_default()
         .lines()
-        .filter_map(|l| uri_host(l.rsplit(' ').next()?))
-        .filter(|(scheme, _)| NETWORK.contains(scheme))
-        .map(|(_, host)| host.to_string())
+        .filter_map(|l| {
+            let uri = l.rsplit(' ').next()?;
+            // printers macOS adds itself have a Bonjour name instead of an address
+            let uri = if uri.starts_with("dnssd://") { bonjour_uri(uri)? } else { uri.to_string() };
+            let (scheme, host) = uri_host(&uri)?;
+            NETWORK.contains(&scheme).then(|| host.to_string())
+        })
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// Bonjour names already looked up, and the printer address each has.
+static BONJOUR: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// The printer address (ipp://HP4A8B2C.local:631/ipp/print) of a Bonjour one
+/// (dnssd://Name._ipps._tcp.local./?uuid=...), as macOS adds printers: CUPS' ippfind looks up
+/// every printer on the network at once, and the answers are kept.
+fn bonjour_uri(uri: &str) -> Option<String> {
+    let name = dnssd_name(uri)?;
+    let known = |list: &[(String, String)]| list.iter().find(|(n, _)| *n == name).map(|(_, u)| u.clone());
+    if let Some(found) = known(&BONJOUR.lock().unwrap()) {
+        return Some(found);
+    }
+    let answer = run("ippfind", &["-T", "3", "_ipp._tcp,local.", "_ipps._tcp,local.", "--exec", "echo", "{service_name}|||{service_uri}", ";"]);
+    let mut list = BONJOUR.lock().unwrap();
+    list.extend(bonjour_answers(&answer.unwrap_or_default()));
+    known(&list)
+}
+
+/// The Bonjour service name in a dnssd:// printer address, with its %20-style escapes decoded.
+fn dnssd_name(uri: &str) -> Option<String> {
+    let service = uri.strip_prefix("dnssd://")?.split(['/', '?']).next()?;
+    let name = &service[..service.find("._ipp")?];
+    let bytes = name.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i], name.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// ippfind's "name|||uri" lines as (name, uri).
+fn bonjour_answers(found: &str) -> Vec<(String, String)> {
+    found
+        .lines()
+        .filter_map(|l| l.split_once("|||"))
+        .filter(|(_, uri)| uri.contains("://"))
+        .map(|(name, uri)| (name.to_string(), uri.trim().to_string()))
         .collect()
 }
 
@@ -467,6 +526,18 @@ fn macos_prints_heic_photos() {
     let pdf = printable(&heic, 100, "A4").unwrap();
     assert_eq!(page_count(&pdf), Some(1));
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Printers macOS adds itself: their Bonjour name, and the address ippfind finds for it.
+#[test]
+fn bonjour_printers() {
+    let uri = "dnssd://HP%20Smart%20Tank%205100%20series%20%5B4A8B2C%5D._ipps._tcp.local./?uuid=1234";
+    assert_eq!(dnssd_name(uri).as_deref(), Some("HP Smart Tank 5100 series [4A8B2C]"));
+    assert_eq!(dnssd_name("ipp://192.168.1.46/ipp/print"), None);
+    let found = "HP Smart Tank 5100 series [4A8B2C]|||ipps://HP4A8B2C.local:631/ipp/print\nbroken line\nx|||nothing";
+    let answers = bonjour_answers(found);
+    assert_eq!(answers, [("HP Smart Tank 5100 series [4A8B2C]".to_string(), "ipps://HP4A8B2C.local:631/ipp/print".to_string())]);
+    assert_eq!(uri_host(&answers[0].1), Some(("ipps", "HP4A8B2C.local")));
 }
 
 #[test]
