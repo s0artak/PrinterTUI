@@ -287,8 +287,17 @@ pub fn photo_to_jpeg(file: &str) -> Option<Result<String, String>> {
         return None;
     }
     Some(work_dir(file).and_then(|dir| {
-        let jpeg = dir.join("photo.jpg").to_string_lossy().into_owned();
-        run("sips", &["-s", "format", "jpeg", "-s", "formatOptions", "high", file, "--out", &jpeg]).map(|_| jpeg)
+        // sips can leave an empty file behind (seen on virtual Macs), so the result is checked,
+        // and made again as a PNG if it cannot be read
+        let mut last = String::new();
+        for (format, name) in [("jpeg", "photo.jpg"), ("png", "photo.png")] {
+            let out = dir.join(name).to_string_lossy().into_owned();
+            match run("sips", &["-s", "format", format, file, "--out", &out]).and_then(|_| image_size(&out)) {
+                Ok(_) => return Ok(out),
+                Err(e) => last = e,
+            }
+        }
+        Err(format!("{file}: macOS could not convert the photo ({last})"))
     }))
 }
 
