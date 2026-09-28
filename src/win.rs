@@ -334,6 +334,11 @@ pub fn printer_state(queue: &str) -> PrinterState {
     state
 }
 
+/// Photos in other formats than JPEG and PNG are not converted on Windows.
+pub fn photo_to_jpeg(_file: &str) -> Option<Result<String, String>> {
+    None
+}
+
 /// One page of a PDF as a PNG for the preview, drawn by pdfium.
 pub fn render_page(pdf: &str, page: u32, png: &str) -> Result<(), String> {
     let doc = pdfium()?.load_pdf_from_file(pdf, None).map_err(|e| format!("{pdf}: {e}"))?;

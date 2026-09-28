@@ -174,6 +174,9 @@ pub fn printable(file: &str, percent: u32, paper: &str) -> Result<String, String
         file.to_string()
     } else if image::ImageReader::open(file).and_then(|r| r.with_guessed_format()).is_ok_and(|r| r.format().is_some()) {
         photo_pdf(file, paper)?
+    } else if let Some(jpeg) = photo_to_jpeg(file) {
+        // iPhone photos (HEIC) and other image formats the system can read
+        photo_pdf(&jpeg?, paper)?
     } else if let Some(text) = plain_text(file) {
         // letters the built-in font has not got print through LibreOffice when it is there
         if text.chars().all(|c| (c as u32) < 256 || c == '\n') { text_pdf(file, &text, paper)? } else { to_pdf(file).or_else(|_| text_pdf(file, &text, paper))? }

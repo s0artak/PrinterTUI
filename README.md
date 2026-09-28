@@ -30,7 +30,7 @@ irm https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.ps1 | iex
 
 On Windows everything is built in too: PDFs are drawn for the printer by an embedded pdfium, and searchable PDFs use Windows' own text recognition (add a language with "Optical character recognition" in Settings if it says none is installed).
 
-PDFs, photos (JPEG, PNG) and text files print everywhere without anything else; LibreOffice is only for other documents (Word, spreadsheets, slides...).
+PDFs, photos (JPEG, PNG, and on macOS also iPhone HEIC photos, WebP, TIFF...) and text files print everywhere without anything else; LibreOffice is only for other documents (Word, spreadsheets, slides...).
 
 Development setup on Arch (dependencies, CUPS, build, link the build as `printertui-dev` so an installed `printertui` is left alone):
 
@@ -60,7 +60,7 @@ printertui [file]
 
 **Preview.** The page about to print is shown on the right as it will come out, converted and scaled: `H`/`L` browse the pages, or the sheets with several pages per sheet. Images show in full quality in kitty and Ghostty (also inside tmux with `set -g allow-passthrough on`) and in Sixel terminals (Windows Terminal, foot, WezTerm, mintty), in colored blocks elsewhere.
 
-**Scale** shrinks or enlarges the content (25-200%) on the same paper, centered; above 100% the edges are cut off. **Photos** (JPEG, PNG) print without LibreOffice, filling the paper and turned upright as the camera took them.
+**Scale** shrinks or enlarges the content (25-200%) on the same paper, centered; above 100% the edges are cut off. **Photos** (JPEG, PNG; on macOS also iPhone HEIC photos and the other formats the system reads) print without LibreOffice, filling the paper and turned upright as the camera took them.
 
 **The printer.** The pixel-art printer from the installer lives in the app: it prints the pages you send, scans with a sweeping light, hops when you change a setting and jams on errors. It also tells how the real printer is doing, asked over IPP every 20 seconds: its ink tanks fill up to the real levels (in red when low), its tray empties when the printer is out of paper, its lights go out when the printer is off or paused, and it says what to do about a jam or an open cover. On Windows the problems come from the print spooler and the ink over IPP, for printers added by IP address.
 

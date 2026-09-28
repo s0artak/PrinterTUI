@@ -276,6 +276,22 @@ function run(argv) {
   return out.join('\n');
 }"#;
 
+/// macOS: a photo in a format only the system reads (iPhone's HEIC, HEIF, AVIF, WebP, TIFF...)
+/// as a JPEG, converted by sips; None for other files.
+pub fn photo_to_jpeg(file: &str) -> Option<Result<String, String>> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let ext = std::path::Path::new(file).extension()?.to_string_lossy().to_lowercase();
+    if !matches!(ext.as_str(), "heic" | "heif" | "hif" | "avif" | "webp" | "tif" | "tiff" | "gif" | "bmp") {
+        return None;
+    }
+    Some(work_dir(file).and_then(|dir| {
+        let jpeg = dir.join("photo.jpg").to_string_lossy().into_owned();
+        run("sips", &["-s", "format", "jpeg", "-s", "formatOptions", "high", file, "--out", &jpeg]).map(|_| jpeg)
+    }))
+}
+
 /// One page of a PDF as a PNG for the preview: macOS draws it itself (PDFKit), elsewhere
 /// poppler's pdftoppm, which comes with CUPS.
 pub fn render_page(pdf: &str, page: u32, png: &str) -> Result<(), String> {
@@ -423,6 +439,22 @@ fn macos_draws_and_reads_pages() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// An iPhone photo (HEIC) prints as a photo.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_prints_heic_photos() {
+    let _one = SPAWNS.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("printertui-heic-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("photo.png").to_string_lossy().into_owned();
+    image::RgbImage::from_fn(400, 300, |x, _| image::Rgb([(x % 256) as u8, 90, 200])).save(&png).unwrap();
+    let heic = dir.join("IMG_0001.HEIC").to_string_lossy().into_owned();
+    run("sips", &["-s", "format", "heic", &png, "--out", &heic]).unwrap();
+    let pdf = printable(&heic, 100, "A4").unwrap();
+    assert_eq!(page_count(&pdf), Some(1));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn lpq_rows() {
     let out = "Rank    Owner   Job     File(s)                         Total Size\n\
@@ -440,11 +472,11 @@ fn stop_all_kills_tools_and_their_children() {
     let _one = SPAWNS.lock().unwrap_or_else(|e| e.into_inner());
     let t = std::thread::spawn(|| run("sh", &["-c", "sleep 30 & wait"]));
     // until the shell is running and has started its sleep (slow machines take a while)
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while crate::CHILDREN.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+    let sleeping = || !Command::new("pgrep").args(["-f", "^sleep 30$"]).output().unwrap().stdout.is_empty();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while (crate::CHILDREN.lock().unwrap().is_empty() || !sleeping()) && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    std::thread::sleep(std::time::Duration::from_millis(300));
     let start = std::time::Instant::now();
     stop_all();
     let _ = t.join();
