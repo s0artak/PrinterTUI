@@ -289,10 +289,15 @@ pub fn photo_to_jpeg(file: &str) -> Option<Result<String, String>> {
     Some(work_dir(file).and_then(|dir| {
         // sips can leave an empty file behind (seen on virtual Macs), so the result is checked,
         // and made again as a PNG if it cannot be read
+        // under Rosetta (an Intel build on Apple silicon) sips would run as Intel code too, and
+        // then cannot decode HEIC: run the native one
+        let rosetta = run("sysctl", &["-n", "sysctl.proc_translated"]).is_ok_and(|v| v == "1");
+        let sips: &[&str] = if rosetta { &["arch", "-arm64", "sips"] } else { &["sips"] };
         let mut last = String::new();
         for (format, name) in [("jpeg", "photo.jpg"), ("png", "photo.png")] {
             let out = dir.join(name).to_string_lossy().into_owned();
-            match run("sips", &["-s", "format", format, file, "--out", &out]).and_then(|_| image_size(&out)) {
+            let args: Vec<&str> = sips[1..].iter().copied().chain(["-s", "format", format, file, "--out", &out]).collect();
+            match run(sips[0], &args).and_then(|_| image_size(&out)) {
                 Ok(_) => return Ok(out),
                 Err(e) => last = e,
             }
