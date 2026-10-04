@@ -254,29 +254,16 @@ fn main() -> std::io::Result<()> {
     if app.printers.is_empty() {
         app.status = t().no_printers.into();
     }
-    // If launched with --scan, preload the most recent scanned page for preview testing
-    if app.tab == Tab::Scan {
-        let dir = std::env::temp_dir().join("printertui-scan");
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            let mut paths: Vec<_> = rd
-                .flatten()
-                .filter(|e| {
-                    let n = e.file_name();
-                    let s = n.to_string_lossy();
-                    // scans have no extension; edited copies and previews are .png
-                    s.starts_with("page-") && !s.contains('.')
-                })
-                .collect();
-            paths.sort_by_key(|e| e.file_name());
-            if let Some(entry) = paths.last() {
-                let path = entry.path().to_string_lossy().into_owned();
-                if let Ok(thumb) = thumbnail(&path) {
-                    app.scans.push(ScannedPage { orig: path.clone(), file: path, rot: 0, filter: 0, keep: true, thumb });
-                    app.status = t().loaded_last.into();
-                }
-            }
-        }
+    // With --scan, the last page a session that did not quit (it crashed, or was killed) scanned
+    // comes back, before the temp folder is tidied
+    if app.tab == Tab::Scan
+        && let Some(path) = last_scan()
+        && let Ok(thumb) = thumbnail(&path)
+    {
+        app.scans.push(ScannedPage { orig: path.clone(), file: path, rot: 0, filter: 0, keep: true, thumb });
+        app.status = t().loaded_last.into();
     }
+    std::thread::spawn(clean_temp);
 
     let mut term = init();
     let res = run(&mut term, &mut app);
@@ -286,6 +273,20 @@ fn main() -> std::io::Result<()> {
     restore();
     stop_all();
     res
+}
+
+/// The newest scanned page left in any session's scan folder.
+fn last_scan() -> Option<String> {
+    let sessions = std::fs::read_dir(scan_dir().parent()?).ok()?;
+    sessions
+        .flatten()
+        .filter_map(|s| std::fs::read_dir(s.path()).ok())
+        .flatten()
+        .flatten()
+        // scans are page-<milliseconds>, with no extension; edited copies and previews are .png
+        .filter_map(|e| e.file_name().to_string_lossy().strip_prefix("page-")?.parse::<u128>().ok().map(|ms| (ms, e.path())))
+        .max()
+        .map(|(_, p)| p.to_string_lossy().into_owned())
 }
 
 /// Mouse clicks on Windows, where people expect them; elsewhere the terminal keeps its own text selection.
@@ -1340,7 +1341,7 @@ impl App {
                 return true;
             }
             'd' if dd => {
-                self.scans.remove(i);
+                forget_scan(&self.scans.remove(i).orig);
                 self.cur = i.min(self.scans.len().saturating_sub(1));
                 self.status = fill(t().page_deleted, &[("n", &(i + 1))]);
                 return true;
@@ -1367,7 +1368,9 @@ impl App {
                         p.thumb = thumb;
                     }
                 }
-                Err(e) => app.status = failed(e),
+                // a page deleted meanwhile has nothing left to edit
+                Err(e) if app.scans.iter().any(|p| p.orig == orig) => app.status = failed(e),
+                Err(_) => {}
             })
         }));
     }
@@ -1394,7 +1397,7 @@ impl App {
             SAVE => self.save_scans(),
             COPY => self.copy(),
             DISCARD => {
-                self.scans.clear();
+                self.scans.drain(..).for_each(|p| forget_scan(&p.orig));
                 self.cur = 0;
                 self.status = t().discarded.into();
             }
@@ -1407,7 +1410,7 @@ impl App {
         let Some((device, _)) = self.scanners.as_ref().and_then(|l| l.get(self.scanner)).cloned() else {
             return self.status = failed(t().no_scanner_selected);
         };
-        let dir = std::env::temp_dir().join("printertui-scan");
+        let dir = scan_dir();
         let n = self.scans.len() + 1;
         // unique name: pages can be deleted and reordered, and old edits must not be reused
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
@@ -1454,7 +1457,7 @@ impl App {
         if self.editing.is_some() {
             return self.status = t().edit_running.into();
         }
-        let pdf = std::env::temp_dir().join("printertui-scan").join("copy.pdf");
+        let pdf = scan_dir().join("copy.pdf");
         let (dpi, scale, paper) = (SCAN_DPI[self.scan_dpi], SCALES[self.scale], PAPERS[self.paper]);
         let job = self.print_settings().job;
         self.send(t().printing_copy, move || {
@@ -1482,7 +1485,8 @@ impl App {
             Box::new(move |app: &mut App| {
                 app.status = match res {
                     Ok(written) => {
-                        app.scans.clear();
+                        // saved where they belong, so the scans in the temp folder can go
+                        app.scans.drain(..).for_each(|p| forget_scan(&p.orig));
                         app.cur = 0;
                         app.save_as = default_scan_name(&app.scan_folder);
                         let _ = app.save();
@@ -1564,10 +1568,11 @@ fn detect_graphics() -> Graphics {
     Graphics::None
 }
 
-/// Where scans go unless the settings say otherwise: ~/Documents, or ~ without one.
+/// Where scans go unless the settings say otherwise: the Documents folder wherever the system
+/// keeps it (OneDrive on many Windows PCs, ~/Documentos on a Spanish Linux desktop), else home.
 fn default_scan_folder() -> String {
-    let docs = std::env::home_dir().is_some_and(|h| h.join("Documents").is_dir());
-    if docs { "~/Documents".into() } else { "~".into() }
+    let folder = documents_dir().filter(|d| d.is_dir()).or_else(std::env::home_dir);
+    folder.map_or("~".into(), |d| tilde(&d.to_string_lossy()))
 }
 
 /// `~/Documents/scan-2026-09-26_154200`, in the folder from the settings when there is one.

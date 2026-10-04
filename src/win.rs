@@ -334,9 +334,64 @@ pub fn printer_state(queue: &str) -> PrinterState {
     state
 }
 
-/// Photos in other formats than JPEG and PNG are not converted on Windows.
-pub fn photo_to_jpeg(_file: &str) -> Option<Result<String, String>> {
-    None
+/// A photo in a format Windows reads but this app does not (iPhone's HEIC, AVIF, JPEG XR, camera
+/// raw) as a PNG, converted by Windows' own decoders; None for other files. HEIC and AVIF need
+/// the free HEIF and AV1 extensions from the Microsoft Store, which Windows 11 usually has.
+pub fn convert_photo(file: &str) -> Option<Result<String, String>> {
+    let ext = std::path::Path::new(file).extension()?.to_string_lossy().to_lowercase();
+    let raw = ["dng", "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf"];
+    if !matches!(ext.as_str(), "heic" | "heif" | "hif" | "avif" | "jxr" | "wdp" | "hdp") && !raw.contains(&ext.as_str()) {
+        return None;
+    }
+    Some(work_dir(file).and_then(|dir| {
+        let out = dir.join("photo.png");
+        if !fresh(file, &out) {
+            decode_with_windows(file, &out.to_string_lossy())
+                .map_err(|e| format!("{file}: Windows could not read the photo ({e}). HEIC and AVIF photos need the HEIF and AV1 extensions from the Microsoft Store"))?;
+        }
+        Ok(out.to_string_lossy().into_owned())
+    }))
+}
+
+/// Decodes an image with Windows Imaging Component, turned upright as its EXIF says, into a PNG.
+fn decode_with_windows(file: &str, png: &str) -> Result<(), String> {
+    use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapDecoder, BitmapTransform, ColorManagementMode, ExifOrientationMode};
+    use windows::Storage::{FileAccessMode, StorageFile, Streams::Buffer};
+    let path = std::path::absolute(file).map_err(|e| e.to_string())?;
+    let decode = || -> windows::core::Result<(u32, u32, Vec<u8>)> {
+        let f = StorageFile::GetFileFromPathAsync(&HSTRING::from(path.as_os_str()))?.join()?;
+        let decoder = BitmapDecoder::CreateAsync(&f.OpenAsync(FileAccessMode::Read)?.join()?)?.join()?;
+        let bitmap = decoder
+            .GetSoftwareBitmapTransformedAsync(
+                BitmapPixelFormat::Rgba8,
+                BitmapAlphaMode::Ignore,
+                &BitmapTransform::new()?,
+                ExifOrientationMode::RespectExifOrientation,
+                ColorManagementMode::DoNotColorManage,
+            )?
+            .join()?;
+        let (w, h) = (bitmap.PixelWidth()? as u32, bitmap.PixelHeight()? as u32);
+        let buffer = Buffer::Create(w * h * 4)?;
+        bitmap.CopyToBuffer(&buffer)?;
+        let mut bytes = windows::core::Array::new();
+        CryptographicBuffer::CopyToByteArray(&buffer, &mut bytes)?;
+        Ok((w, h, bytes.to_vec()))
+    };
+    let (w, h, rgba) = decode().map_err(|e| e.message())?;
+    let img = image::RgbaImage::from_raw(w, h, rgba).ok_or("bad bitmap")?;
+    // the alpha channel was ignored, so it may hold anything
+    image::DynamicImage::ImageRgba8(img).to_rgb8().save_with_format(png, image::ImageFormat::Png).map_err(|e| format!("{png}: {e}"))
+}
+
+/// The Documents folder wherever Windows keeps it (in OneDrive when its backup is on).
+pub fn documents_dir() -> Option<std::path::PathBuf> {
+    use windows::Win32::UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    unsafe {
+        let p = SHGetKnownFolderPath(&FOLDERID_Documents, KF_FLAG_DEFAULT, None).ok()?;
+        let path = p.to_string().ok().map(std::path::PathBuf::from);
+        windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as *const _));
+        path
+    }
 }
 
 /// One page of a PDF as a PNG for the preview, drawn by pdfium.
@@ -584,10 +639,28 @@ fn prints_to_microsoft_print_to_pdf() {
 }
 
 #[test]
+fn windows_decodes_photos() {
+    let dir = std::env::temp_dir().join(format!("printertui-wic-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (src, out) = (dir.join("in.png"), dir.join("out.png"));
+    image::RgbImage::from_fn(30, 20, |x, _| image::Rgb([if x < 15 { 255 } else { 0 }, 0, 200])).save(&src).unwrap();
+    decode_with_windows(&src.to_string_lossy(), &out.to_string_lossy()).unwrap();
+    let img = image::open(&out).unwrap().to_rgb8();
+    assert_eq!(img.dimensions(), (30, 20));
+    assert_eq!(img.get_pixel(2, 2).0, [255, 0, 200]);
+    assert_eq!(img.get_pixel(28, 2).0, [0, 0, 200]);
+    // a HEIC photo goes to Windows; a missing one fails with a reason
+    assert!(convert_photo(&dir.join("IMG_0001.HEIC").to_string_lossy()).unwrap().is_err());
+    assert!(convert_photo(&src.to_string_lossy()).is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn system_bits() {
     let t = timestamp();
     assert_eq!(t.len(), 17, "{t}");
     assert!(config_path().unwrap().ends_with(r"printertui\config"));
+    assert!(documents_dir().unwrap().is_absolute());
     let _ = queue();
     let _ = local_scanners();
 }

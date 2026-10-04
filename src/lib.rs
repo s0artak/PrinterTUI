@@ -100,6 +100,47 @@ pub fn work_dir(file: &str) -> Result<std::path::PathBuf, String> {
     Ok(dir)
 }
 
+/// This session's folder for scanned pages, edits and copies; quitting removes it.
+pub fn scan_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("printertui-scan").join(std::process::id().to_string())
+}
+
+/// Deletes a scanned page's files: the scan, its edited copies and their previews.
+pub fn forget_scan(orig: &str) {
+    let path = std::path::Path::new(orig);
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().map(|n| n.to_string_lossy().into_owned())) else { return };
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let n = entry.file_name().to_string_lossy().into_owned();
+        // page-17 and its page-17-r90-f0.png, page-17.preview.png; not page-170
+        if n == name || n.strip_prefix(&name).is_some_and(|rest| rest.starts_with(['-', '.'])) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Removes what earlier sessions left in the temp folder a day after it was last written: scans
+/// (often private papers) and documents converted for printing. Sounds and LibreOffice's
+/// profile stay, as they are only slow to make again.
+pub fn clean_temp() {
+    let day = std::time::Duration::from_secs(24 * 3600);
+    let age = |p: &std::path::Path| p.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+    let tmp = std::env::temp_dir();
+    let mine = scan_dir();
+    for entry in [tmp.join("printertui-scan"), tmp.join("printertui")].iter().filter_map(|d| std::fs::read_dir(d).ok()).flatten().flatten() {
+        let (path, name) = (entry.path(), entry.file_name().to_string_lossy().into_owned());
+        // session folders (a pid) and work folders (16 hex digits), and pages older versions left loose
+        if !(name.chars().all(|c| c.is_ascii_hexdigit()) || name.starts_with("page-") || name == "copy.pdf") || path == mine {
+            continue;
+        }
+        // a folder counts as written when its newest file was
+        let files: Vec<_> = std::fs::read_dir(&path).into_iter().flatten().flatten().filter_map(|e| age(&e.path())).collect();
+        let newest = if files.is_empty() { age(&path) } else { files.into_iter().min() };
+        if newest.is_some_and(|a| a > day) {
+            let _ = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        }
+    }
+}
+
 /// True when `out` was written after `src` last changed, so it can be reused.
 fn fresh(src: &str, out: &std::path::Path) -> bool {
     let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified());
@@ -208,11 +249,12 @@ fn photo_pdf(file: &str, paper: &str) -> Result<String, String> {
 pub fn printable(file: &str, percent: u32, paper: &str) -> Result<String, String> {
     let pdf = if page_count(file).is_some() {
         file.to_string()
-    } else if image::ImageReader::open(file).and_then(|r| r.with_guessed_format()).is_ok_and(|r| r.format().is_some()) {
+    } else if image_size(file).is_ok() {
+        // a photo this app decodes itself (JPEG, PNG, BMP, GIF, TIFF, WebP)
         photo_pdf(file, paper)?
-    } else if let Some(jpeg) = photo_to_jpeg(file) {
+    } else if let Some(photo) = convert_photo(file) {
         // iPhone photos (HEIC) and other image formats the system can read
-        photo_pdf(&jpeg?, paper)?
+        photo_pdf(&photo?, paper)?
     } else if let Some(text) = plain_text(file) {
         // letters the built-in font has not got print through LibreOffice when it is there
         if text.chars().all(|c| (c as u32) < 256 || c == '\n') { text_pdf(file, &text, paper)? } else { to_pdf(file).or_else(|_| text_pdf(file, &text, paper))? }
@@ -323,9 +365,36 @@ pub fn sheet_png(pages: &[String], paper: &str, per_sheet: u32, out: &str) -> Re
     save_png(&DynamicImage::ImageRgb8(sheet), out)
 }
 
-/// Paths in the File field are separated by ';'.
+/// Paths in the File field, separated by ';'. A path may be in quotes, as Windows copies it
+/// ("Copy as path") and terminals paste dragged files: "C:\My files\a.pdf" "C:\b.pdf".
 pub fn split_files(field: &str) -> Vec<String> {
-    field.split(';').map(str::trim).filter(|f| !f.is_empty()).map(String::from).collect()
+    let mut files = Vec::new();
+    let mut path = String::new();
+    let mut quote = None;
+    let mut done = |path: &mut String| {
+        if !path.trim().is_empty() {
+            files.push(path.trim().to_string());
+        }
+        path.clear();
+    };
+    for c in field.chars() {
+        match quote {
+            Some(q) if c == q => {
+                quote = None;
+                done(&mut path);
+            }
+            Some(_) => path.push(c),
+            // a quote opens a path only at its start, so "Ana's notes.txt" stays as it is
+            None if matches!(c, '"' | '\'') && path.trim().is_empty() => {
+                path.clear();
+                quote = Some(c);
+            }
+            None if c == ';' => done(&mut path),
+            None => path.push(c),
+        }
+    }
+    done(&mut path);
+    files
 }
 
 /// Expands "1-3,7,9-" into a sorted page list. Empty or "all" means every page.
@@ -415,6 +484,7 @@ pub fn stop_all() {
     for job in std::mem::take(&mut *SCAN_JOBS.lock().unwrap()) {
         let _ = minreq::delete(job).with_timeout(2).send();
     }
+    let _ = std::fs::remove_dir_all(scan_dir());
 }
 
 /// "request id is P-12 (1 file(s))" -> "P-12".
@@ -1047,6 +1117,55 @@ fn text_files_print_without_libreoffice() {
     std::fs::write(dir.join("a.html"), "<p>hi</p>").unwrap();
     assert!(plain_text(&dir.join("a.html").to_string_lossy()).is_none());
     assert!(plain_text(&pdf).is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn old_temp_files_go() {
+    let tmp = std::env::temp_dir().join("printertui");
+    let (old, new, sounds) = (tmp.join("00000000000000aa"), tmp.join("00000000000000bb"), tmp.join("sounds"));
+    for d in [&old, &new] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(d.join("doc.pdf"), "x").unwrap();
+    }
+    std::fs::create_dir_all(&sounds).unwrap();
+    let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+    std::fs::File::options().write(true).open(old.join("doc.pdf")).unwrap().set_modified(two_days_ago).unwrap();
+    clean_temp();
+    assert!(!old.exists() && new.exists() && sounds.exists());
+    std::fs::remove_dir_all(&new).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("printertui-forget-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in ["page-1", "page-1-r90-f0.png", "page-1-r90-f0.png.preview.png", "page-12"] {
+        std::fs::write(dir.join(f), "x").unwrap();
+    }
+    forget_scan(&dir.join("page-1").to_string_lossy());
+    let left: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    // page-12 starts with "page-1" too, but is another page
+    assert_eq!(left, ["page-12"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn file_field_paths() {
+    assert_eq!(split_files(" a.pdf; b.pdf ;"), ["a.pdf", "b.pdf"]);
+    assert_eq!(split_files("\"C:\\Users\\Ana Pérez\\doc.pdf\""), ["C:\\Users\\Ana Pérez\\doc.pdf"]);
+    assert_eq!(split_files("\"C:\\a b.pdf\" \"C:\\c.pdf\"; d.txt"), ["C:\\a b.pdf", "C:\\c.pdf", "d.txt"]);
+    assert_eq!(split_files("'/home/ana/my file.pdf'"), ["/home/ana/my file.pdf"]);
+    assert_eq!(split_files("Ana's notes.txt"), ["Ana's notes.txt"]);
+}
+
+#[test]
+fn photos_in_more_formats() {
+    let dir = std::env::temp_dir().join(format!("printertui-formats-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, format) in [("a.bmp", ImageFormat::Bmp), ("b.gif", ImageFormat::Gif), ("c.tiff", ImageFormat::Tiff), ("d.webp", ImageFormat::WebP)] {
+        let path = dir.join(name).to_string_lossy().into_owned();
+        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(60, 40, image::Rgb([10, 20, 200]))).save_with_format(&path, format).unwrap();
+        let pdf = printable(&path, 100, "A4").unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(page_count(&pdf), Some(1), "{name}");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

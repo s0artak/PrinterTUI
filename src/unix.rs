@@ -271,9 +271,9 @@ function run(argv) {
   return out.join('\n');
 }"#;
 
-/// macOS: a photo in a format only the system reads (iPhone's HEIC, HEIF, AVIF, WebP, TIFF...)
-/// as a JPEG, converted by sips; None for other files.
-pub fn photo_to_jpeg(file: &str) -> Option<Result<String, String>> {
+/// macOS: a photo in a format only the system reads (iPhone's HEIC, HEIF, AVIF...) as a JPEG,
+/// converted by sips; None for other files.
+pub fn convert_photo(file: &str) -> Option<Result<String, String>> {
     if !cfg!(target_os = "macos") {
         return None;
     }
@@ -400,6 +400,31 @@ pub fn kill_tree(pids: &[u32]) {
     let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
     let _ = Command::new("pkill").args(["-TERM", "-P", &pids.join(",")]).status();
     let _ = Command::new("kill").arg("-TERM").args(&pids).status();
+}
+
+/// The Documents folder: ~/Documents on macOS; on Linux the one in ~/.config/user-dirs.dirs,
+/// which desktops name in their language (~/Documentos, ~/Dokumente...).
+pub fn documents_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::home_dir()?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let config = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()).map_or_else(|| home.join(".config"), std::path::PathBuf::from);
+        if let Some(docs) = std::fs::read_to_string(config.join("user-dirs.dirs")).ok().and_then(|dirs| xdg_documents(&dirs, &home)) {
+            return Some(docs);
+        }
+    }
+    Some(home.join("Documents"))
+}
+
+/// XDG_DOCUMENTS_DIR="$HOME/Documentos" in user-dirs.dirs as a path; "$HOME/" alone turns it off.
+#[cfg(any(not(target_os = "macos"), test))]
+fn xdg_documents(dirs: &str, home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let value = dirs.lines().find_map(|l| l.trim().strip_prefix("XDG_DOCUMENTS_DIR="))?.trim().trim_matches('"');
+    let path = match value.strip_prefix("$HOME") {
+        Some(rest) => home.join(rest.trim_start_matches('/')),
+        None => std::path::PathBuf::from(value),
+    };
+    (path != home).then_some(path)
 }
 
 /// LibreOffice; macOS does not put it on the PATH.
@@ -531,6 +556,16 @@ fn bonjour_printers() {
     let answers = bonjour_answers(found);
     assert_eq!(answers, [("HP Smart Tank 5100 series [4A8B2C]".to_string(), "ipps://HP4A8B2C.local:631/ipp/print".to_string())]);
     assert_eq!(uri_host(&answers[0].1), Some(("ipps", "HP4A8B2C.local")));
+}
+
+#[test]
+fn documents_folder_in_the_desktop_language() {
+    let home = std::path::Path::new("/home/ana");
+    let dirs = "# written by xdg-user-dirs-update\nXDG_DESKTOP_DIR=\"$HOME/Escritorio\"\nXDG_DOCUMENTS_DIR=\"$HOME/Documentos\"\n";
+    assert_eq!(xdg_documents(dirs, home), Some(home.join("Documentos")));
+    assert_eq!(xdg_documents("XDG_DOCUMENTS_DIR=\"/srv/docs\"", home), Some("/srv/docs".into()));
+    assert_eq!(xdg_documents("XDG_DOCUMENTS_DIR=\"$HOME/\"", home), None);
+    assert_eq!(xdg_documents("", home), None);
 }
 
 #[test]
