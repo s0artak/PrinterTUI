@@ -71,8 +71,13 @@ vol=${vol:-50}
 # Plays sound $1 (boot blip print done jam bye) in the background, when a person is listening.
 play() {
     [ -n "$tty" ] && [ "$vol" -gt 0 ] || return 0
+    # in the user's own temp folder, as the app's: one someone else made first (a link in it could
+    # send the sound over another file) means no sounds
+    d="${TMPDIR:-/tmp}/printertui-$(id -u)"
+    mkdir -m 700 "$d" 2>/dev/null || :
+    [ -d "$d" ] && [ ! -L "$d" ] && [ -O "$d" ] && chmod 700 "$d" 2>/dev/null || return 0
     # v2: the sounds' version, as in src/sound.rs
-    f="${TMPDIR:-/tmp}/printertui-sounds/$1-$vol-v2.wav"
+    f="$d/install-sounds/$1-$vol-v2.wav"
     if [ ! -s "$f" ]; then
         mkdir -p "${f%/*}" 2>/dev/null || return 0
         # shellcheck disable=SC2059 # the format is the sound's bytes, as octal escapes
@@ -192,8 +197,9 @@ run() {
 }
 
 # Runs a command as root: as it is when we are root, else with sudo or doas. Without them (or when
-# sudo refuses the password) only this step fails, with a message.
-asked= noroot=
+# sudo refuses the password) only this step fails, with a message (none with $quiet set, when the
+# caller has another way).
+asked= noroot= quiet=
 as_root() {
     if [ "$(id -u)" = 0 ]; then
         run "$@"
@@ -211,7 +217,7 @@ as_root() {
     elif command -v doas >/dev/null; then
         run doas "$@"
     else
-        warn "$T_no_root" "$*"
+        [ -n "$quiet" ] || warn "$T_no_root" "$*"
         return 1
     fi
 }
@@ -815,7 +821,14 @@ ocr_code() {
 # already installed start marked, and are not installed again
 has_extra() {
     case $1 in
-        1) command -v soffice >/dev/null || command -v libreoffice >/dev/null || [ -d /Applications/LibreOffice.app ] ;;
+        1) command -v soffice >/dev/null || command -v libreoffice >/dev/null || [ -d /Applications/LibreOffice.app ] || {
+            # where the app finds it too: LibreOffice's own packages in /opt, the Flatpak
+            for d in /opt/libreoffice*/program/soffice /var/lib/flatpak/app/org.libreoffice.LibreOffice \
+                "$HOME/.local/share/flatpak/app/org.libreoffice.LibreOffice"; do
+                [ ! -e "$d" ] || return 0
+            done
+            return 1
+        } ;;
         2) command -v scanimage >/dev/null ;;
         3) command -v tesseract >/dev/null && tesseract --list-langs 2>&1 | grep -qx eng &&
             tesseract --list-langs 2>&1 | grep -qx "$(ocr_code)" ;;
@@ -823,11 +836,13 @@ has_extra() {
 }
 
 # Printing's tools are there already: CUPS's lp, lpstat and lpq (the queue), poppler's pdftoppm (the
-# preview), and on Arch Avahi with nss-mdns (printers on the network).
+# preview); where packages come from here ($pm) also CUPS's scheduler, which the client tools come
+# without on Debian, Fedora and openSUSE, and on Arch Avahi with nss-mdns (printers on the network).
 have_base() {
     for c in lp lpstat lpq pdftoppm; do
         command -v $c >/dev/null || return 1
     done
+    [ -z "$pm" ] || [ -e /usr/sbin/cupsd ] || [ -e /usr/bin/cupsd ] || return 1
     [ "$pm" != pacman ] || { command -v avahi-daemon >/dev/null && [ -e /usr/lib/libnss_mdns_minimal.so.2 ]; }
 }
 
@@ -920,6 +935,7 @@ own_line() {
         command -v $c >/dev/null || cups=1
     done
     command -v pdftoppm >/dev/null || pdf=1
+    # shellcheck disable=SC2046
     case $sys in
         ostree) set -- rpm-ostree install ${cups:+cups-client} ${pdf:+poppler-utils} $(packages dnf extras "$want" "$(ocr_code)") ;;
         ro) command -v transactional-update >/dev/null || return 0
@@ -987,8 +1003,13 @@ do_uninstall() {
 $(bins)
 EOF
     say "$T_rm_cfg"
-    # the app's temporary files: per user now, in one folder for everyone before
-    run rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/printertui" "${TMPDIR:-/tmp}/printertui-$(id -u)" "${TMPDIR:-/tmp}/printertui" "${TMPDIR:-/tmp}/printertui-scan" "${TMPDIR:-/tmp}/printertui-sounds"
+    # the app's temporary files: per user now (in the cache folder when /tmp has someone else's), and
+    # the copies LibreOffice's snap or Flatpak reads
+    run rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/printertui" "${XDG_CACHE_HOME:-$HOME/.cache}/printertui" \
+        "${TMPDIR:-/tmp}/printertui-$(id -u)" "$HOME/snap/libreoffice/common/printertui" \
+        "$HOME/.var/app/org.libreoffice.LibreOffice/cache/printertui"
+    # in one folder for everyone before, which may be another user's
+    run rm -rf "${TMPDIR:-/tmp}/printertui" "${TMPDIR:-/tmp}/printertui-scan" "${TMPDIR:-/tmp}/printertui-sounds" 2>/dev/null || true
     # installed from source by an earlier run
     if [ -f "$HOME/.local/.crates.toml" ] && command -v cargo >/dev/null; then
         run cargo uninstall --root "$HOME/.local" printertui 2>/dev/null || true
@@ -1112,16 +1133,20 @@ EOF
     esac
 
     say "$T_put $bin_dir"
-    # (Apple silicon Macs may not have /usr/local/bin yet.) When root is refused after all, the user's own folder.
+    # (Apple silicon Macs may not have /usr/local/bin yet.) When root is refused after all, the user's own
+    # folder, quietly: the skipped command names the download, which is gone when this ends.
+    [ "$bin_dir" = "$HOME/.local/bin" ] || quiet=1
     if ! put "$bin_dir"; then
+        quiet=
         [ "$bin_dir" != "$HOME/.local/bin" ] || exit 1
         bin_dir=$HOME/.local/bin
         say "$T_put $bin_dir"
         put "$bin_dir"
     fi
-    # an older install in ~/.local/bin would shadow this one
+    quiet=
+    # an older install in ~/.local/bin would shadow this one (one that stays does not undo the install)
     if [ "$(cd "$bin_dir" 2>/dev/null && pwd -P)" != "$(cd "$HOME/.local/bin" 2>/dev/null && pwd -P)" ]; then
-        run rm -f "$HOME/.local/bin/printertui"
+        run rm -f "$HOME/.local/bin/printertui" 2>/dev/null || as_root rm -f "$HOME/.local/bin/printertui" || true
     fi
     # a folder that is not on PATH (~/.local/bin on some systems): the line that puts it there
     case ":$PATH:" in
