@@ -647,6 +647,11 @@ pub fn soffice() -> Office {
     Office { cmd, pre: Vec::new(), sandbox: None }
 }
 
+/// A folder; the temp folder is the user's own on Windows.
+pub fn own_dir(path: &std::path::Path) -> bool {
+    path.is_dir()
+}
+
 /// The temp folder is the user's own on Windows.
 pub fn private_temp() -> std::path::PathBuf {
     std::env::temp_dir().join("printertui")

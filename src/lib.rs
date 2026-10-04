@@ -147,13 +147,17 @@ pub fn clean_temp() {
     let age = |p: &std::path::Path| p.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
     let (root, tmp) = (temp_root(), std::env::temp_dir());
     let mine = scan_dir();
-    // and what older versions left straight in the temp folder
-    let legacy = [tmp.join("printertui-scan"), tmp.join("printertui")].into_iter().filter(|d| *d != root);
-    let dirs: Vec<_> = [root.join("scan"), root.clone()].into_iter().chain(legacy).collect();
+    // and what older versions left straight in the shared temp folder, if the user made it (not
+    // a link someone else put there to have the user's files deleted), and the copies sandboxed
+    // LibreOffice converted that a quit or crash left
+    let others = [tmp.join("printertui-scan"), tmp.join("printertui")].into_iter().filter(|d| *d != root).chain(soffice().sandbox).filter(|d| own_dir(d));
+    let dirs: Vec<_> = [root.join("scan"), root.clone()].into_iter().chain(others).collect();
     for entry in dirs.iter().filter_map(|d| std::fs::read_dir(d).ok()).flatten().flatten() {
         let (path, name) = (entry.path(), entry.file_name().to_string_lossy().into_owned());
-        // session folders (a pid) and work folders (16 hex digits), and pages older versions left loose
-        if !(name.chars().all(|c| c.is_ascii_hexdigit()) || name.starts_with("page-") || name == "copy.pdf") || path == mine {
+        // session folders (a pid), work folders (16 hex digits), conversions (pid-n), and pages
+        // older versions left loose
+        let conversion = name.split_once('-').is_some_and(|(pid, n)| [pid, n].iter().all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())));
+        if !(name.chars().all(|c| c.is_ascii_hexdigit()) || conversion || name.starts_with("page-") || name == "copy.pdf") || path == mine {
             continue;
         }
         // a folder counts as written when its newest file was
@@ -216,7 +220,10 @@ pub fn to_pdf(file: &str) -> Result<String, String> {
             let job = sandbox.join(format!("{}-{n}", std::process::id()));
             std::fs::create_dir_all(&job).map_err(|e| format!("{}: {e}", job.display()))?;
             let input = job.join(name);
-            std::fs::copy(file, &input).map_err(|e| format!("{file}: {e}"))?;
+            if let Err(e) = std::fs::copy(file, &input) {
+                let _ = std::fs::remove_dir_all(&job);
+                return Err(format!("{file}: {e}"));
+            }
             (input, job, sandbox.clone())
         }
         None => (file.into(), dir.clone(), temp_root()),
@@ -508,6 +515,7 @@ pub fn join_files(files: &[String]) -> String {
 /// file:// URIs with %20 escapes (copied files), one or several per line.
 pub fn dropped_paths(text: &str) -> Vec<String> {
     let is_file = |p: &str| std::path::Path::new(p).is_file();
+    let text = one_newline(text);
     let text = text.trim();
     if is_file(text) {
         return vec![text.to_string()];
@@ -521,6 +529,11 @@ pub fn dropped_paths(text: &str) -> Vec<String> {
         paths.extend(shell_words(line).into_iter().map(|w| file_uri_path(&w).unwrap_or(w)));
     }
     paths
+}
+
+/// Pasted text with its line ends as \n: VTE terminals (GNOME's and others) paste them as \r.
+pub fn one_newline(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// A line split into words as a shell reads it: quotes group, a backslash escapes the next
@@ -1674,6 +1687,8 @@ fn files_dropped_into_the_terminal() {
     assert_eq!(dropped_paths(&uri), [path.as_str()]);
     // several files, one URI per line
     assert_eq!(dropped_paths(&format!("{uri}\r\n{uri}\n")), [path.as_str(), path.as_str()]);
+    // GNOME Terminal and the other VTE ones paste line ends as \r
+    assert_eq!(dropped_paths(&format!("{path}\r{path}")), [path.as_str(), path.as_str()]);
     #[cfg(unix)]
     {
         // WezTerm and Ghostty escape the spaces, and drop several files on one line

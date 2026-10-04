@@ -281,24 +281,29 @@ const MOUSE: bool = cfg!(windows);
 /// only reports it apart on Unix (on Windows it would arrive as keys starting with Esc).
 const PASTE: bool = cfg!(unix);
 
+/// ratatui::init without its panic hook, which would put the terminal back when any thread
+/// panics: a background task that crashes is reported in the app, which goes on.
 fn init() -> DefaultTerminal {
-    let term = ratatui::init();
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let main = std::thread::current().id();
+        let next = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().id() == main {
+                restore();
+            }
+            next(info);
+        }));
+    });
+    let _ = ratatui::crossterm::terminal::enable_raw_mode();
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::EnterAlternateScreen);
     if MOUSE {
         let _ = ratatui::crossterm::execute!(std::io::stdout(), event::EnableMouseCapture);
     }
     if PASTE {
         let _ = ratatui::crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste);
     }
-    // ratatui's own hook puts the screen back after a crash, but not the mouse or the paste mode
-    static HOOK: std::sync::Once = std::sync::Once::new();
-    HOOK.call_once(|| {
-        let next = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            terminal_modes_off();
-            next(info);
-        }));
-    });
-    term
+    ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).expect("failed to initialize terminal")
 }
 
 fn terminal_modes_off() {
@@ -431,7 +436,11 @@ fn task(work: impl FnOnce() -> Done + Send + 'static) -> mpsc::Receiver<Done> {
 fn finished(rx: &mpsc::Receiver<Done>) -> Option<Done> {
     match rx.try_recv() {
         Ok(done) => Some(done),
-        Err(mpsc::TryRecvError::Disconnected) => Some(Box::new(|app: &mut App| app.status = failed(t().task_crashed))),
+        // its panic message went over the screen, which is drawn again
+        Err(mpsc::TryRecvError::Disconnected) => Some(Box::new(|app: &mut App| {
+            app.status = failed(t().task_crashed);
+            app.clear = true;
+        })),
         Err(mpsc::TryRecvError::Empty) => None,
     }
 }
@@ -705,7 +714,7 @@ impl App {
     fn paste(&mut self, text: &str) {
         let files = || dropped_paths(text).into_iter().filter(|f| std::path::Path::new(f).is_file()).collect::<Vec<_>>();
         // a field holds one line
-        let line: String = text.trim().lines().collect::<Vec<_>>().join(" ").chars().filter(|c| !c.is_control()).collect();
+        let line: String = one_newline(text).trim().lines().collect::<Vec<_>>().join(" ").chars().filter(|c| !c.is_control()).collect();
         match &mut self.mode {
             Mode::Main if self.tab == Tab::Print => {
                 let files = files();
@@ -1381,6 +1390,9 @@ mod tests {
         assert_eq!(app.file, "");
         app.paste("/nowhere/x.pdf\n");
         assert_eq!(app.file, "/nowhere/x.pdf");
+        app.sel = PAGES;
+        app.paste("1-2\r3");
+        assert_eq!(app.pages, "1-2 3");
     }
 
     #[test]

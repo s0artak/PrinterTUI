@@ -50,7 +50,7 @@ impl App {
                     let max_h = (area.height as usize) * cell_h;
                     if max_w > 0 && max_h > 0 && *w > 0 && *h > 0 {
                         let scale = (max_w as f32 / *w as f32).min(max_h as f32 / *h as f32);
-                        let ow = ((*w as f32 * scale) as usize).clamp(10, max_w);
+                        let ow = ((*w as f32 * scale) as usize).max(10).min(max_w);
                         let oh = (((*h as f32 * scale) as usize).div_ceil(6) * 6).max(6).min(max_h / 6 * 6);
                         if ow > 0 && oh > 0 {
                             let small = downscale(*w, *h, px, ow, oh);

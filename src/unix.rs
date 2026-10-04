@@ -666,8 +666,11 @@ pub fn soffice() -> Office {
         return Office { cmd: found.to_string_lossy().into_owned(), pre: Vec::new(), sandbox };
     }
     // /opt/libreoffice25.8: the newest when there are several
-    let opt = std::fs::read_dir("/opt").into_iter().flatten().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("libreoffice"));
-    if let Some(soffice) = opt.map(|e| e.path().join("program/soffice")).filter(|p| p.is_file()).max() {
+    let opt = std::fs::read_dir("/opt").into_iter().flatten().flatten().filter_map(|e| {
+        let version = e.file_name().to_string_lossy().strip_prefix("libreoffice")?.split('.').map(|n| n.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>();
+        Some((version, e.path().join("program/soffice")))
+    });
+    if let Some((_, soffice)) = opt.filter(|(_, p)| p.is_file()).max() {
         return plain(soffice.to_string_lossy().into_owned());
     }
     const FLATPAK: &str = "org.libreoffice.LibreOffice";
@@ -681,6 +684,13 @@ pub fn soffice() -> Office {
     }
     // not installed: the error names it
     plain("libreoffice".into())
+}
+
+/// A real folder of this user's, not a link or someone else's.
+pub fn own_dir(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid has no preconditions and cannot fail
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && m.uid() == unsafe { libc::getuid() })
 }
 
 /// /tmp/printertui-<uid>, made by this user and open only to them; a folder or link someone
