@@ -9,15 +9,20 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
     let rows = app.rows();
     let [main, help] = Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(f.area());
     let [left, preview] = Layout::horizontal([Constraint::Min(40), Constraint::Percentage(45)]).areas(main);
-    let [form, status] =
-        Layout::vertical([Constraint::Length(rows as u16 + 2), Constraint::Min(3)]).areas(left);
+    let [form, status] = Layout::vertical([Constraint::Length(rows as u16 + 2), Constraint::Min(3)]).areas(left);
 
     let lines: Vec<Line> = (0..rows).map(|i| form_row(app, label(app.tab, i), i)).collect();
     let tab = |name: &'static str, on: bool| {
         Span::styled(format!(" {name} "), if on { Style::new().fg(WHITE).bg(ACCENT).bold() } else { Style::new().fg(theme().dim) })
     };
     // same widths as the mouse expects: " PrinterTUI  " then " Print " and " Scan "
-    let title = Line::from(vec![Span::styled(" PrinterTUI  ", Style::new().bold()), tab(t().tab_print, app.tab == Tab::Print), tab(t().tab_scan, app.tab == Tab::Scan), tab(t().tab_settings, app.tab == Tab::Settings), Span::raw(" ")]);
+    let title = Line::from(vec![
+        Span::styled(" PrinterTUI  ", Style::new().bold()),
+        tab(t().tab_print, app.tab == Tab::Print),
+        tab(t().tab_scan, app.tab == Tab::Scan),
+        tab(t().tab_settings, app.tab == Tab::Settings),
+        Span::raw(" "),
+    ]);
     f.render_widget(Paragraph::new(lines).block(panel(title)), form);
     app.form_area.set(form);
     draw_preview(f, app, preview);
@@ -29,15 +34,32 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
         Mode::Address(_) => &[("Enter", t.k_add), ("Esc", t.k_cancel)],
         _ if app.tab == Tab::Settings && app.sel == FOLDER => &[("j/k", t.k_move), ("i", t.k_edit_text), ("Tab", t.k_print_scan), ("q", t.k_quit)],
         _ if app.tab == Tab::Settings => &[("j/k", t.k_move), ("h/l", t.k_change), ("Tab", t.k_print_scan), ("q", t.k_quit)],
-        _ if app.sel == PAGE && app.tab == Tab::Scan => &[("H/L", t.k_page), ("</>", t.k_move), ("r/R", t.k_rotate), ("f", t.k_filter), ("x", t.k_keep), ("dd", t.k_delete)],
-        _ if app.tab == Tab::Scan && !app.scans.is_empty() => &[("j/k", t.k_move), ("h/l", t.k_change), ("H/L", t.k_page), ("Enter", t.k_select), ("Tab", t.k_print_scan), ("q", t.k_quit)],
+        _ if app.sel == PAGE && app.tab == Tab::Scan => {
+            &[("H/L", t.k_page), ("</>", t.k_move), ("r/R", t.k_rotate), ("f", t.k_filter), ("x", t.k_keep), ("dd", t.k_delete)]
+        }
+        _ if app.tab == Tab::Scan && !app.scans.is_empty() => {
+            &[("j/k", t.k_move), ("h/l", t.k_change), ("H/L", t.k_page), ("Enter", t.k_select), ("Tab", t.k_print_scan), ("q", t.k_quit)]
+        }
         _ if app.sel == PAGES && app.tab == Tab::Print => &[("j/k", t.k_move), ("Enter", t.k_pick_pages), ("i", t.k_type_range), ("q", t.k_quit)],
-        _ if app.tab == Tab::Print => &[("j/k", t.k_move), ("h/l", t.k_change), ("H/L", t.k_preview_page), ("i", t.k_edit_text), ("Enter", t.k_select), ("Tab", t.k_print_scan), ("q", t.k_quit)],
+        _ if app.tab == Tab::Print => &[
+            ("j/k", t.k_move),
+            ("h/l", t.k_change),
+            ("H/L", t.k_preview_page),
+            ("i", t.k_edit_text),
+            ("Enter", t.k_select),
+            ("Tab", t.k_print_scan),
+            ("q", t.k_quit),
+        ],
         _ => &[("j/k", t.k_move), ("h/l", t.k_change), ("i", t.k_edit_text), ("Enter", t.k_select), ("Tab", t.k_print_scan), ("q", t.k_quit)],
     };
     let chips: Vec<Span> = keys
         .iter()
-        .flat_map(|(k, what)| [Span::styled(format!(" {k} "), Style::new().fg(theme().chip.0).bg(theme().chip.1)), Span::styled(format!(" {what}  "), Style::new().fg(theme().dim))])
+        .flat_map(|(k, what)| {
+            [
+                Span::styled(format!(" {k} "), Style::new().fg(theme().chip.0).bg(theme().chip.1)),
+                Span::styled(format!(" {what}  "), Style::new().fg(theme().dim)),
+            ]
+        })
         .collect();
     f.render_widget(Line::from(chips), help);
     let tick = app.started.elapsed().as_millis() as usize;
@@ -46,7 +68,8 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
         Mode::Main | Mode::Insert => {}
         Mode::Address(addr) => {
             let area = popup(f, 76, 4);
-            let text = vec![Line::from(format!(" {}: {addr}_", t.address)), Line::from(format!(" {}", t.address_eg)).style(Style::new().add_modifier(Modifier::DIM))];
+            let text =
+                vec![Line::from(format!(" {}: {addr}_", t.address)), Line::from(format!(" {}", t.address_eg)).style(Style::new().add_modifier(Modifier::DIM))];
             f.render_widget(Paragraph::new(text).block(panel(format!(" {} ", t.add_by_address)).border_style(Style::new().fg(ACCENT))), area);
         }
         Mode::Pick(found, state) => {
@@ -59,8 +82,11 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
         }
         Mode::Pages(on, state) => {
             let area = popup(f, 76, on.len() as u16 + 2);
-            let items: Vec<ListItem> =
-                on.iter().enumerate().map(|(i, b)| ListItem::new(format!(" [{}] {}", if *b { "x" } else { " " }, fill(t.page_item, &[("n", &(i + 1))])))).collect();
+            let items: Vec<ListItem> = on
+                .iter()
+                .enumerate()
+                .map(|(i, b)| ListItem::new(format!(" [{}] {}", if *b { "x" } else { " " }, fill(t.page_item, &[("n", &(i + 1))]))))
+                .collect();
             let n = on.iter().filter(|b| **b).count();
             let list = List::new(items)
                 .block(panel(format!(" {} ", fill(t.pages_title, &[("n", &n), ("all", &on.len())]))).border_style(Style::new().fg(ACCENT)))
@@ -180,10 +206,7 @@ pub(crate) fn value_col() -> u16 {
 
 /// A rounded panel with a title in the accent color.
 pub(crate) fn panel<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
-    Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(theme().dim))
-        .title(title.into().style(Style::new().fg(ACCENT).bold()))
+    Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(theme().dim)).title(title.into().style(Style::new().fg(ACCENT).bold()))
 }
 
 /// A form row: " ▶ " on the selected one, the label, then the value: `< x >` as ‹ x ›, a
@@ -201,7 +224,13 @@ pub(crate) fn form_row<'a>(app: &App, label: &'a str, i: usize) -> Line<'a> {
     } else if let Some(inner) = value.strip_prefix("< ").and_then(|v| v.strip_suffix(" >")) {
         let arrows = Style::new().fg(if on { ACCENT } else { theme().dim });
         let hop = on && matches!(app.act, Act::Hop(_)) && !app.act.done();
-        let v = if hop { Style::new().fg(theme().hop).bold() } else if on { Style::new().bold() } else { Style::new() };
+        let v = if hop {
+            Style::new().fg(theme().hop).bold()
+        } else if on {
+            Style::new().bold()
+        } else {
+            Style::new()
+        };
         spans.extend([Span::styled("‹ ", arrows), Span::styled(inner.to_string(), v), Span::styled(" ›", arrows)]);
     } else {
         let cursor = if on && matches!(app.mode, Mode::Insert) { "_" } else { "" };
@@ -216,8 +245,7 @@ pub(crate) fn draw_stage(f: &mut Frame, app: &App, area: ratatui::layout::Rect) 
     // the printer needs 22 columns and goes last on a narrow screen, after the ink tanks
     let pet_w = if app.mascot && area.width >= 22 + 24 { 22 } else { 0 };
     let tanks_w = if inks.is_empty() || area.width < pet_w + 24 + inks.len() as u16 * 4 + 1 { 0 } else { inks.len() as u16 * 4 + 1 };
-    let [pet, bubble, tanks] =
-        Layout::horizontal([Constraint::Length(pet_w), Constraint::Min(10), Constraint::Length(tanks_w)]).areas(area);
+    let [pet, bubble, tanks] = Layout::horizontal([Constraint::Length(pet_w), Constraint::Min(10), Constraint::Length(tanks_w)]).areas(area);
     let tick = app.started.elapsed().as_millis();
     let (text, work) = match &app.busy {
         Some((msg, _)) => (format!("{msg}..."), if app.scanning { Work::Scan } else { Work::Busy }),
@@ -233,11 +261,14 @@ pub(crate) fn draw_stage(f: &mut Frame, app: &App, area: ratatui::layout::Rect) 
     let error = text.starts_with(t().error);
     let worried = !error && app.complaint().is_some_and(|c| c == text);
     let style = if error { Style::new().fg(RED) } else { Style::new() };
-    let edge = if error { RED } else if worried { YELLOW } else { ACCENT };
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(edge))
-        .padding(ratatui::widgets::Padding::horizontal(1));
+    let edge = if error {
+        RED
+    } else if worried {
+        YELLOW
+    } else {
+        ACCENT
+    };
+    let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(edge)).padding(ratatui::widgets::Padding::horizontal(1));
     // as tall as its text
     let rows = wrapped_rows(&text, bubble.width.saturating_sub(4).max(1) as usize);
     let bubble = ratatui::layout::Rect { height: (rows as u16 + 2).clamp(3, bubble.height), ..bubble };
@@ -263,7 +294,9 @@ pub(crate) fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect
         return draw_config(f, app, area);
     }
     let title = match (app.tab == Tab::Scan, app.scans.get(app.cur), &app.view) {
-        (true, Some(p), _) => format!(" {}{} ", fill(t().preview_scan, &[("n", &(app.cur + 1)), ("all", &app.scans.len())]), if p.keep { "" } else { t().not_saved }),
+        (true, Some(p), _) => {
+            format!(" {}{} ", fill(t().preview_scan, &[("n", &(app.cur + 1)), ("all", &app.scans.len())]), if p.keep { "" } else { t().not_saved })
+        }
         (false, _, Some((_, Ok(v)))) => format!(" {}: {} ", t().preview, v.title),
         _ => format!(" {} ", t().preview),
     };
@@ -322,9 +355,8 @@ pub(crate) fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect
     };
     let lines: Vec<Line> = (0..oh / 2)
         .map(|y| {
-            let spans: Vec<Span> = (0..ow)
-                .map(|x| Span::styled("▀", Style::new().fg(gray(small[2 * y * ow + x])).bg(gray(small[(2 * y + 1) * ow + x]))))
-                .collect();
+            let spans: Vec<Span> =
+                (0..ow).map(|x| Span::styled("▀", Style::new().fg(gray(small[2 * y * ow + x])).bg(gray(small[(2 * y + 1) * ow + x])))).collect();
             Line::from(spans).centered()
         })
         .collect();

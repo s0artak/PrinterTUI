@@ -8,23 +8,23 @@ mod ui;
 
 use graphics::*;
 use i18n::{fill, t};
-use ui::*;
-use pet::{theme, Act, Mood, Work, ACCENT, RED, WHITE, YELLOW};
+use pet::{ACCENT, Act, Mood, RED, WHITE, Work, YELLOW, theme};
 use print::*;
 use printertui::*;
-use sound::Sound;
 use ratatui::{
+    DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap},
-    DefaultTerminal, Frame,
 };
+use sound::Sound;
 use std::cell::Cell;
 use std::io::Write;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use ui::*;
 
 /// Result of a background task, applied to the app on the UI thread.
 type Done = Box<dyn FnOnce(&mut App) + Send>;
@@ -126,7 +126,14 @@ enum Mode {
     /// Manual duplex: `job` is the front job while it is still printing, `steps` the flip
     /// instructions shown after it, `back` the back-side job, `files[next..]` the files still to
     /// print with `print`'s settings.
-    Flip { job: Option<String>, steps: String, back: Job, files: Vec<String>, next: usize, print: PrintSettings },
+    Flip {
+        job: Option<String>,
+        steps: String,
+        back: Job,
+        files: Vec<String>,
+        next: usize,
+        print: PrintSettings,
+    },
     /// Print queue popup: (job number, description), refreshed every second.
     Queue(Vec<(String, String)>, ListState),
 }
@@ -777,7 +784,15 @@ impl App {
     }
 
     fn step_value(&mut self, fwd: bool) {
-        let step = |i: usize, n: usize| if n == 0 { 0 } else if fwd { (i + 1) % n } else { (i + n - 1) % n };
+        let step = |i: usize, n: usize| {
+            if n == 0 {
+                0
+            } else if fwd {
+                (i + 1) % n
+            } else {
+                (i + n - 1) % n
+            }
+        };
         if self.tab == Tab::Settings {
             match self.sel {
                 LANG => {
@@ -924,17 +939,33 @@ impl App {
     fn save(&self) -> std::io::Result<()> {
         let path = config_path().ok_or(std::io::Error::other("HOME is not set"))?;
         std::fs::create_dir_all(path.parent().unwrap_or(&path))?;
-        std::fs::write(path, format!(
-            "printer={}\ncolor={}\nduplex={}\nreverse_back={}\npaper={}\ncopies={}\nper_sheet={}\nscale={}\n\
+        std::fs::write(
+            path,
+            format!(
+                "printer={}\ncolor={}\nduplex={}\nreverse_back={}\npaper={}\ncopies={}\nper_sheet={}\nscale={}\n\
              scanner={}\nscan_mode={}\nscan_dpi={}\nscan_format={}\n\
              lang={}\ntheme={}\nvolume={}\nmascot={}\ngraphics={}\nscan_folder={}\n",
-            self.printers.get(self.printer).map_or("", String::as_str),
-            self.color, self.duplex, self.reverse_back, PAPERS[self.paper], self.copies, PER_SHEET[self.per_sheet], SCALES[self.scale],
-            self.scanners.as_ref().and_then(|l| l.get(self.scanner)).map_or(self.scanner_pref.as_str(), |(d, _)| d.as_str()),
-            SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi], SCAN_FORMATS[self.scan_format],
-            // an empty language follows the system's
-            self.lang, pet::THEMES[self.theme].0, sound::volume(), self.mascot, GRAPHICS_PREFS[self.graphics_pref], self.scan_folder,
-        ))
+                self.printers.get(self.printer).map_or("", String::as_str),
+                self.color,
+                self.duplex,
+                self.reverse_back,
+                PAPERS[self.paper],
+                self.copies,
+                PER_SHEET[self.per_sheet],
+                SCALES[self.scale],
+                self.scanners.as_ref().and_then(|l| l.get(self.scanner)).map_or(self.scanner_pref.as_str(), |(d, _)| d.as_str()),
+                SCAN_MODES[self.scan_mode],
+                SCAN_DPI[self.scan_dpi],
+                SCAN_FORMATS[self.scan_format],
+                // an empty language follows the system's
+                self.lang,
+                pet::THEMES[self.theme].0,
+                sound::volume(),
+                self.mascot,
+                GRAPHICS_PREFS[self.graphics_pref],
+                self.scan_folder,
+            ),
+        )
     }
 
     /// Applies one saved setting; unknown keys and invalid values are ignored.
@@ -962,7 +993,6 @@ impl App {
             _ => {}
         }
     }
-
 }
 
 impl App {
@@ -1123,7 +1153,6 @@ impl App {
             self.status = fill(t().settings_not_saved, &[("e", &e)]);
         }
     }
-
 }
 
 /// Where scans go unless the settings say otherwise: the Documents folder wherever the system
@@ -1169,7 +1198,7 @@ fn failed(e: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{Terminal, backend::TestBackend};
 
     /// The app with two printers, and no scanner search when the Scan tab opens.
     fn app() -> App {

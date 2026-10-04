@@ -5,28 +5,24 @@ use crate::*;
 use pdfium_render::prelude::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Devices::Enumeration::DeviceInformation;
-use windows::Win32::Devices::DeviceAndDriverInstallation::*;
-use windows::Win32::Devices::Properties::DEVPROPTYPE;
-use windows::Win32::Foundation::DEVPROPKEY;
 use windows::Devices::Scanners::{ImageScanner, ImageScannerColorMode, ImageScannerFormat, ImageScannerResolution, ImageScannerScanSource};
 use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Ocr::OcrEngine;
 use windows::Security::Cryptography::CryptographicBuffer;
 use windows::Storage::StorageFolder;
+use windows::Win32::Devices::DeviceAndDriverInstallation::*;
+use windows::Win32::Devices::Properties::DEVPROPTYPE;
+use windows::Win32::Foundation::DEVPROPKEY;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Graphics::Printing::*;
-use windows::Win32::Storage::Xps::{AbortDoc, EndDoc, EndPage, StartDocW, StartPage, DOCINFOW};
+use windows::Win32::Storage::Xps::{AbortDoc, DOCINFOW, EndDoc, EndPage, StartDocW, StartPage};
 use windows::Win32::System::SystemInformation::GetLocalTime;
-
+use windows::core::{HSTRING, PCWSTR, PWSTR};
 
 /// The user's first display language, like "es-ES".
 pub fn system_language() -> String {
-    windows::Globalization::ApplicationLanguages::Languages()
-        .and_then(|l| l.GetAt(0))
-        .map(|l| l.to_string())
-        .unwrap_or_default()
+    windows::Globalization::ApplicationLanguages::Languages().and_then(|l| l.GetAt(0)).map(|l| l.to_string()).unwrap_or_default()
 }
 
 /// Printer of each job id seen, since winspool needs the printer to look a job up.
@@ -77,9 +73,8 @@ fn enum_buffer(call: impl Fn(Option<&mut [u8]>, &mut u32, &mut u32) -> bool) -> 
 
 /// Installed printers as (name, port, attributes, status).
 fn installed() -> Vec<(String, String, u32, u32)> {
-    let (buf, n) = enum_buffer(|b, need, count| unsafe {
-        EnumPrintersW(PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS, PCWSTR::null(), 2, b, need, count).is_ok()
-    });
+    let (buf, n) =
+        enum_buffer(|b, need, count| unsafe { EnumPrintersW(PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS, PCWSTR::null(), 2, b, need, count).is_ok() });
     let infos = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const PRINTER_INFO_2W, n) };
     infos.iter().map(|p| (text(p.pPrinterName), text(p.pPortName), p.Attributes, p.Status)).collect()
 }
@@ -300,7 +295,11 @@ fn print_pdf(job: &Job, output: Option<&str>) -> Result<u32, String> {
         remember(id as u32, &job.printer);
         let res = order.iter().try_for_each(|sheet| draw_sheet(hdc, &doc, sheet, job));
         unsafe {
-            if res.is_ok() { EndDoc(hdc) } else { AbortDoc(hdc) };
+            if res.is_ok() {
+                EndDoc(hdc)
+            } else {
+                AbortDoc(hdc)
+            };
         }
         res.map(|_| id as u32)
     };
@@ -314,10 +313,7 @@ fn draw_sheet(hdc: HDC, doc: &PdfDocument, sheet: &[u32], job: &Job) -> Result<(
     let dpi = (cap(LOGPIXELSX).max(72) as f32, cap(LOGPIXELSY).max(72) as f32);
     // rendering at the printer's full resolution would need hundreds of MB per page
     let render_dpi = dpi.0.max(dpi.1).min(300.0);
-    let pages = sheet
-        .iter()
-        .map(|&n| doc.pages().get((n - 1) as PdfPageIndex).map_err(|e| format!("page {n}: {e}")))
-        .collect::<Result<Vec<_>, _>>()?;
+    let pages = sheet.iter().map(|&n| doc.pages().get((n - 1) as PdfPageIndex).map_err(|e| format!("page {n}: {e}"))).collect::<Result<Vec<_>, _>>()?;
     let sizes: Vec<(f32, f32)> = pages.iter().map(|p| (p.width().value, p.height().value)).collect();
     let places = place_pages(&sizes, job.per_sheet, (cap(HORZRES), cap(VERTRES)), dpi);
     if unsafe { StartPage(hdc) } <= 0 {
@@ -401,8 +397,9 @@ pub fn convert_photo(file: &str) -> Option<Result<String, String>> {
     Some(work_dir(file).and_then(|dir| {
         let out = dir.join("photo.png");
         if !fresh(file, &out) {
-            decode_with_windows(file, &out.to_string_lossy())
-                .map_err(|e| format!("{file}: Windows could not read the photo ({e}). HEIC and AVIF photos need the HEIF and AV1 extensions from the Microsoft Store"))?;
+            decode_with_windows(file, &out.to_string_lossy()).map_err(|e| {
+                format!("{file}: Windows could not read the photo ({e}). HEIC and AVIF photos need the HEIF and AV1 extensions from the Microsoft Store")
+            })?;
         }
         Ok(out.to_string_lossy().into_owned())
     }))
@@ -440,7 +437,7 @@ fn decode_with_windows(file: &str, png: &str) -> Result<(), String> {
 
 /// The Documents folder wherever Windows keeps it (in OneDrive when its backup is on).
 pub fn documents_dir() -> Option<std::path::PathBuf> {
-    use windows::Win32::UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    use windows::Win32::UI::Shell::{FOLDERID_Documents, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
     unsafe {
         let p = SHGetKnownFolderPath(&FOLDERID_Documents, KF_FLAG_DEFAULT, None).ok()?;
         let path = p.to_string().ok().map(std::path::PathBuf::from);
@@ -656,12 +653,7 @@ pub fn ocr_pdf(pages: &[String], out: &str, dpi: u32) -> Result<Vec<String>, Str
 }
 
 fn ocr_page(engine: &OcrEngine, page: &str) -> Result<Vec<Word>, String> {
-    let img = image::ImageReader::open(page)
-        .and_then(|r| r.with_guessed_format())
-        .map_err(|e| e.to_string())?
-        .decode()
-        .map_err(|e| e.to_string())?
-        .to_luma8();
+    let img = image::ImageReader::open(page).and_then(|r| r.with_guessed_format()).map_err(|e| e.to_string())?.decode().map_err(|e| e.to_string())?.to_luma8();
     // the engine has a size limit; shrink big scans and scale the boxes back
     let max = OcrEngine::MaxImageDimension().unwrap_or(10000).max(1);
     let scale = (max as f32 / img.width().max(img.height()) as f32).min(1.0);
@@ -700,8 +692,15 @@ fn prints_to_microsoft_print_to_pdf() {
     let img = img.to_string_lossy().into_owned();
     std::fs::write(&src, images_to_pdf(&[img.clone(), img.clone(), img.clone(), img], 100, &[]).unwrap()).unwrap();
     let job = Job {
-        printer: PRINTER.into(), file: src.to_string_lossy().into_owned(), color: false, paper: "A4",
-        pages: Some("1-4".into()), reverse: true, copies: 1, collate: true, per_sheet: 2,
+        printer: PRINTER.into(),
+        file: src.to_string_lossy().into_owned(),
+        color: false,
+        paper: "A4",
+        pages: Some("1-4".into()),
+        reverse: true,
+        copies: 1,
+        collate: true,
+        per_sheet: 2,
     };
     // the spooler writes the file after EndDoc returns; returns how the first sheet looks
     let print = |job: &Job, out: &std::path::Path| {

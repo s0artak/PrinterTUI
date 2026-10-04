@@ -62,11 +62,7 @@ impl App {
             let list = scanners(full);
             Box::new(move |app: &mut App| {
                 app.scanner = list.iter().position(|(d, _)| *d == app.scanner_pref).unwrap_or(0);
-                app.status = if list.is_empty() {
-                    fill(t().no_scanners, &[("hint", &t().hints()[1])])
-                } else {
-                    String::new()
-                };
+                app.status = if list.is_empty() { fill(t().no_scanners, &[("hint", &t().hints()[1])]) } else { String::new() };
                 app.scanners = Some(list);
             })
         });
@@ -101,10 +97,7 @@ impl App {
         self.scanning = true;
         sound::play(Sound::Scan);
         self.spawn(fill(t().scanning, &[("n", &n)]), move || {
-            let res = std::fs::create_dir_all(&dir)
-                .map_err(|e| e.to_string())
-                .and_then(|_| scan(&device, mode, dpi, &path))
-                .and_then(|_| thumbnail(&path));
+            let res = std::fs::create_dir_all(&dir).map_err(|e| e.to_string()).and_then(|_| scan(&device, mode, dpi, &path)).and_then(|_| thumbnail(&path));
             Box::new(move |app: &mut App| {
                 app.scanning = false;
                 app.status = match res {

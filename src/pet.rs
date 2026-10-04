@@ -27,7 +27,16 @@ pub struct Theme {
 pub const THEMES: [(&str, Theme); 3] = [
     ("auto", Theme { bg: None, fg: None, dim: Color::Indexed(245), chip: (WHITE, Color::Indexed(238)), hop: YELLOW }),
     ("dark", Theme { bg: Some(Color::Indexed(235)), fg: Some(Color::Indexed(252)), dim: Color::Indexed(245), chip: (WHITE, Color::Indexed(238)), hop: YELLOW }),
-    ("light", Theme { bg: Some(Color::Indexed(255)), fg: Some(Color::Indexed(236)), dim: Color::Indexed(242), chip: (Color::Indexed(236), Color::Indexed(252)), hop: Color::Indexed(166) }),
+    (
+        "light",
+        Theme {
+            bg: Some(Color::Indexed(255)),
+            fg: Some(Color::Indexed(236)),
+            dim: Color::Indexed(242),
+            chip: (Color::Indexed(236), Color::Indexed(252)),
+            hop: Color::Indexed(166),
+        },
+    ),
 ];
 
 static THEME: AtomicUsize = AtomicUsize::new(0);
@@ -59,7 +68,15 @@ fn to_256(r: u8, g: u8, b: u8) -> u8 {
             v => 232 + (v - 8) / 10,
         };
     }
-    let q = |v: u8| if v < 48 { 0 } else if v < 115 { 1 } else { (v - 35) / 40 };
+    let q = |v: u8| {
+        if v < 48 {
+            0
+        } else if v < 115 {
+            1
+        } else {
+            (v - 35) / 40
+        }
+    };
     16 + 36 * q(r) + 6 * q(g) + q(b)
 }
 
@@ -90,13 +107,7 @@ const PAPER: [&str; 10] = [
     "...oooooooooooooo...",
 ];
 /// Crumpled page stuck in the slot, with a red smudge.
-const JAM: [&str; 5] = [
-    "...wwkwwwwwkwwww....",
-    "..w.wwwrrwwww.ww....",
-    "...ww.wwwkww.w.w....",
-    "....w.wwkw..w.......",
-    "......w..w..........",
-];
+const JAM: [&str; 5] = ["...wwkwwwwwkwwww....", "..w.wwwrrwwww.ww....", "...ww.wwwkww.w.w....", "....w.wwkw..w.......", "......w..w.........."];
 
 /// One animation frame.
 const FRAME: u128 = 90;
@@ -228,11 +239,15 @@ pub fn printer(act: Act, work: Work, mood: Mood, ms: u128) -> Vec<Line<'static>>
     }
     let mut rows: Vec<Vec<char>> = PRINTER
         .iter()
-        .map(|r| r.chars().map(|c| match c {
-            'L' => lights.0,
-            'M' => lights.1,
-            c => c,
-        }).collect())
+        .map(|r| {
+            r.chars()
+                .map(|c| match c {
+                    'L' => lights.0,
+                    'M' => lights.1,
+                    c => c,
+                })
+                .collect()
+        })
         .collect();
     if work == Work::Scan {
         let col = 2 + (t % 16) as usize;
@@ -345,7 +360,13 @@ pub fn tanks(inks: &[(u32, i32, bool)]) -> Vec<Line<'static>> {
                 .flat_map(|&(rgb, level, _)| {
                     let full = y > 0 && y < H - 1 && (H - 1 - y) * 100 / (H - 2) <= level;
                     let ink = self::rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
-                    let fill = if y == 0 || y == H - 1 { dark } else if full { Some(ink) } else { None };
+                    let fill = if y == 0 || y == H - 1 {
+                        dark
+                    } else if full {
+                        Some(ink)
+                    } else {
+                        None
+                    };
                     [dark, fill, dark, None]
                 })
                 .collect()

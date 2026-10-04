@@ -26,10 +26,13 @@ impl App {
         }
         let k = key.clone();
         // a newer render replaces a running one: dropping its receiver discards the result
-        self.viewing = Some((key, task(move || {
-            let res = render_view(&k);
-            Box::new(move |app: &mut App| app.view = Some((k, res)))
-        })));
+        self.viewing = Some((
+            key,
+            task(move || {
+                let res = render_view(&k);
+                Box::new(move |app: &mut App| app.view = Some((k, res)))
+            }),
+        ));
     }
 
     /// Opens the page selector for the first file, pre-checking the current range.

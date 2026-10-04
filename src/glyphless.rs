@@ -141,12 +141,13 @@ pub fn glyphless_font(glyphs: u16) -> Vec<u8> {
         (b"post", post),
     ];
     let checksum = |data: &[u8]| -> u32 {
-        data.chunks(4).map(|c| {
-            let mut w = [0; 4];
-            w[..c.len()].copy_from_slice(c);
-            u32::from_be_bytes(w)
-        })
-        .fold(0u32, u32::wrapping_add)
+        data.chunks(4)
+            .map(|c| {
+                let mut w = [0; 4];
+                w[..c.len()].copy_from_slice(c);
+                u32::from_be_bytes(w)
+            })
+            .fold(0u32, u32::wrapping_add)
     };
     let count = tables.len() as u16;
     let level = 15 - count.leading_zeros() as u16;

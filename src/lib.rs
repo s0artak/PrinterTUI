@@ -5,9 +5,9 @@
 mod unix;
 #[cfg(unix)]
 pub use unix::*;
+mod glyphless;
 #[cfg(windows)]
 mod win;
-mod glyphless;
 #[cfg(windows)]
 pub use win::*;
 
@@ -30,13 +30,7 @@ pub const PER_SHEET: [u32; 6] = [1, 2, 4, 6, 9, 16];
 pub const SCALES: [u32; 9] = [25, 50, 75, 90, 100, 110, 125, 150, 200];
 
 fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
-    let child = Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{cmd}: {e}"))?;
+    let child = Command::new(cmd).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("{cmd}: {e}"))?;
     let pid = child.id();
     CHILDREN.lock().unwrap().push(pid);
     let out = child.wait_with_output();
@@ -78,11 +72,7 @@ fn ps_encoded(script: &str) -> String {
 #[cfg(any(windows, test))]
 fn check_uri(uri: &str) -> Result<(), String> {
     let scheme = matches!(uri_host(uri), Some(("ipp" | "ipps" | "http" | "https", _)));
-    if scheme && uri.chars().all(|c| c.is_ascii_graphic() && !matches!(c, '\'' | '"' | '`')) {
-        Ok(())
-    } else {
-        Err(format!("Not a printer address: {uri}"))
-    }
+    if scheme && uri.chars().all(|c| c.is_ascii_graphic() && !matches!(c, '\'' | '"' | '`')) { Ok(()) } else { Err(format!("Not a printer address: {uri}")) }
 }
 
 /// Page count of a PDF, None for anything that is not one.
@@ -236,7 +226,10 @@ fn page_box(doc: &lopdf::Document, page: lopdf::ObjectId) -> Option<[f64; 4]> {
 fn photo_pdf(file: &str, paper: &str) -> Result<String, String> {
     let out = work_dir(file)?.join(format!("photo-{paper}.pdf"));
     if !fresh(file, &out) {
-        let (w, h) = { let img = open(file)?; (img.width() as f32, img.height() as f32) };
+        let (w, h) = {
+            let img = open(file)?;
+            (img.width() as f32, img.height() as f32)
+        };
         let (pw, ph) = paper_inches(paper);
         let dpi = (w / pw).max(h / ph).min((w / ph).max(h / pw)).ceil().max(1.0);
         write_atomic(&out, &images_to_pdf(&[file.to_string()], dpi as u32, &[])?)?;
@@ -257,7 +250,11 @@ pub fn printable(file: &str, percent: u32, paper: &str) -> Result<String, String
         photo_pdf(&photo?, paper)?
     } else if let Some(text) = plain_text(file) {
         // letters the built-in font has not got print through LibreOffice when it is there
-        if text.chars().all(|c| (c as u32) < 256 || c == '\n') { text_pdf(file, &text, paper)? } else { to_pdf(file).or_else(|_| text_pdf(file, &text, paper))? }
+        if text.chars().all(|c| (c as u32) < 256 || c == '\n') {
+            text_pdf(file, &text, paper)?
+        } else {
+            to_pdf(file).or_else(|_| text_pdf(file, &text, paper))?
+        }
     } else {
         to_pdf(file)?
     };
@@ -320,7 +317,11 @@ fn text_pdf(file: &str, text: &str, paper: &str) -> Result<String, String> {
 
 /// Width and height of an image, whatever its file name.
 pub fn image_size(path: &str) -> Result<(u32, u32), String> {
-    image::ImageReader::open(path).and_then(|r| r.with_guessed_format()).map_err(|e| format!("{path}: {e}"))?.into_dimensions().map_err(|e| format!("{path}: {e}"))
+    image::ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| format!("{path}: {e}"))?
+        .into_dimensions()
+        .map_err(|e| format!("{path}: {e}"))
 }
 
 /// Pages per sheet side as (columns, rows, sideways): 2 and 6 go on a sheet turned sideways,
@@ -432,14 +433,15 @@ pub fn parse_ranges(spec: &str, total: u32) -> Result<Vec<u32>, String> {
         return Ok((1..=total).collect());
     }
     let bad = || format!("Invalid page range: {spec}");
-    let num = |s: &str, dflt: u32| -> Result<u32, String> {
-        if s.is_empty() { Ok(dflt) } else { s.parse().map_err(|_| bad()) }
-    };
+    let num = |s: &str, dflt: u32| -> Result<u32, String> { if s.is_empty() { Ok(dflt) } else { s.parse().map_err(|_| bad()) } };
     let mut pages = Vec::new();
     for part in spec.split(',').map(str::trim) {
         let (a, b) = match part.split_once('-') {
             Some((a, b)) => (num(a.trim(), 1)?, num(b.trim(), total)?),
-            None => { let n = num(part, 0)?; (n, n) }
+            None => {
+                let n = num(part, 0)?;
+                (n, n)
+            }
         };
         if a == 0 || a > b || b > total {
             return Err(format!("Pages must be within 1-{total}: {part}"));
@@ -624,16 +626,26 @@ impl PrinterState {
     /// From IPP attributes, or from CUPS' copy of them (see `STATE_ATTRIBUTES`).
     pub fn from(attrs: &IppAttributes) -> PrinterState {
         let ints = |key: &str| -> Vec<i32> {
-            attrs.get(key).into_iter().flatten().map(|v| match v {
-                IppValue::Int(n) => *n,
-                IppValue::Text(t) => t.trim().parse().unwrap_or(-1),
-            }).collect()
+            attrs
+                .get(key)
+                .into_iter()
+                .flatten()
+                .map(|v| match v {
+                    IppValue::Int(n) => *n,
+                    IppValue::Text(t) => t.trim().parse().unwrap_or(-1),
+                })
+                .collect()
         };
         let texts = |key: &str| -> Vec<String> {
-            attrs.get(key).into_iter().flatten().filter_map(|v| match v {
-                IppValue::Text(t) => Some(t.clone()),
-                IppValue::Int(_) => None,
-            }).collect()
+            attrs
+                .get(key)
+                .into_iter()
+                .flatten()
+                .filter_map(|v| match v {
+                    IppValue::Text(t) => Some(t.clone()),
+                    IppValue::Int(_) => None,
+                })
+                .collect()
         };
         let (levels, lows) = (ints("marker-levels"), ints("marker-low-levels"));
         let ink = texts("marker-colors")
@@ -721,8 +733,9 @@ fn escl_scan(url: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
 </scan:ScanSettings>"#
     );
     // right after a page the scanner answers 503 for a few seconds while the head returns
-    let res = retry_busy(15, || minreq::post(format!("{url}/ScanJobs")).with_header("Content-Type", "text/xml").with_body(settings.as_str()).with_timeout(30).send())
-        .map_err(|e| format!("The scanner refused the scan job (busy?) {e}"))?;
+    let res =
+        retry_busy(15, || minreq::post(format!("{url}/ScanJobs")).with_header("Content-Type", "text/xml").with_body(settings.as_str()).with_timeout(30).send())
+            .map_err(|e| format!("The scanner refused the scan job (busy?) {e}"))?;
     let job = res.header("location").map(str::trim).ok_or("The scanner did not return a scan job")?;
     // Location may be relative to the scanner ("/eSCL/ScanJobs/..."), keep scheme://host from the url
     let job = if job.starts_with('/') { format!("{}{job}", url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/")) } else { job.to_string() };
@@ -814,10 +827,12 @@ fn black_and_white(mut g: GrayImage) -> GrayImage {
     let total = (g.width() as u64 * g.height() as u64) as f64;
     let level = |share: f64| {
         let mut seen = 0;
-        (0..256).find(|&v| {
-            seen += hist[v];
-            seen as f64 >= share * total
-        }).unwrap_or(255) as f64
+        (0..256)
+            .find(|&v| {
+                seen += hist[v];
+                seen as f64 >= share * total
+            })
+            .unwrap_or(255) as f64
     };
     let (lo, hi) = (level(0.02), level(0.99));
     let cut = lo + 0.6 * (hi - lo).max(1.0);
@@ -880,7 +895,11 @@ pub fn images_to_pdf(pages: &[String], dpi: u32, words: &[Vec<Word>]) -> Result<
         let mut image = pdf.image_xobject(image_id, &data);
         image.filter(Filter::DctDecode);
         image.width(w as i32).height(h as i32).bits_per_component(8);
-        if gray { image.color_space().device_gray() } else { image.color_space().device_rgb() };
+        if gray {
+            image.color_space().device_gray()
+        } else {
+            image.color_space().device_rgb()
+        };
         image.finish();
         let mut content = Content::new();
         content.save_state().transform([pw, 0.0, 0.0, ph, 0.0, 0.0]).x_object(Name(b"Im0")).restore_state();
@@ -1311,7 +1330,8 @@ fn searchable_pdf_text_layer() {
     DynamicImage::ImageLuma8(GrayImage::from_pixel(1200, 300, Luma([255]))).save_with_format(&img, ImageFormat::Png).unwrap();
     // Latin, Chinese, Russian, Hindi and Arabic, as the OCR of the app's languages finds them
     let texts = ["Hola", "cañón", "你好", "Привет", "नमस्ते", "مرحبا"];
-    let words: Vec<Word> = texts.iter().enumerate().map(|(i, t)| Word { text: t.to_string(), x: 20.0 + 190.0 * i as f32, y: 100.0, w: 170.0, h: 60.0 }).collect();
+    let words: Vec<Word> =
+        texts.iter().enumerate().map(|(i, t)| Word { text: t.to_string(), x: 20.0 + 190.0 * i as f32, y: 100.0, w: 170.0, h: 60.0 }).collect();
     let pdf = dir.join("out.pdf");
     std::fs::write(&pdf, images_to_pdf(&[img], 150, &[words]).unwrap()).unwrap();
     assert_eq!(page_count(&pdf.to_string_lossy()), Some(1));

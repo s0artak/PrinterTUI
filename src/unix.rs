@@ -3,7 +3,6 @@
 use crate::*;
 use std::process::Command;
 
-
 /// The user's language from the locale: "es_ES.UTF-8", "C" when unset.
 pub fn system_language() -> String {
     ["LC_ALL", "LC_MESSAGES", "LANG"].iter().filter_map(|k| std::env::var(k).ok()).find(|v| !v.is_empty()).unwrap_or_default()
@@ -14,11 +13,7 @@ const NETWORK: [&str; 6] = ["ipp", "ipps", "socket", "lpd", "http", "https"];
 
 /// Configured printers, default printer first.
 pub fn printers() -> Vec<String> {
-    let mut list: Vec<String> = run("lpstat", &["-e"])
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_string)
-        .collect();
+    let mut list: Vec<String> = run("lpstat", &["-e"]).unwrap_or_default().lines().map(str::to_string).collect();
     if let Some(def) = run("lpstat", &["-d"]).ok().and_then(|s| s.rsplit(": ").next().map(str::to_string))
         && let Some(i) = list.iter().position(|p| *p == def)
     {
@@ -92,8 +87,7 @@ pub fn submit(job: &Job) -> Result<String, String> {
 
 /// True while the job is still pending, held or printing.
 pub fn job_active(id: &str) -> bool {
-    run("lpstat", &["-W", "not-completed", "-o"])
-        .is_ok_and(|s| s.lines().any(|l| l.split_whitespace().next() == Some(id)))
+    run("lpstat", &["-W", "not-completed", "-o"]).is_ok_and(|s| s.lines().any(|l| l.split_whitespace().next() == Some(id)))
 }
 
 /// Unfinished jobs on all printers as (job number, "file  size  position") for the queue popup.
@@ -119,12 +113,8 @@ pub fn cancel_job(id: &str) -> Result<(), String> {
 
 /// Network printers found by `lpinfo -v`, as (queue name, IPP uri) ready for `lpadmin -m everywhere`.
 pub fn discover() -> Vec<(String, String)> {
-    let mut found: Vec<(String, String)> = run("lpinfo", &["-v"])
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.split_whitespace().nth(1))
-        .filter_map(to_ipp)
-        .collect();
+    let mut found: Vec<(String, String)> =
+        run("lpinfo", &["-v"]).unwrap_or_default().lines().filter_map(|l| l.split_whitespace().nth(1)).filter_map(to_ipp).collect();
     found.sort();
     found.dedup_by(|a, b| a.0 == b.0);
     found
@@ -143,11 +133,7 @@ fn to_ipp(uri: &str) -> Option<(String, String)> {
 
 /// Interactive: sudo may ask for a password, so the terminal must be in normal mode.
 pub fn add_printer(name: &str, uri: &str) -> Result<(), String> {
-    let ok = Command::new("sudo")
-        .args(["lpadmin", "-p", name, "-E", "-v", uri, "-m", "everywhere"])
-        .status()
-        .map_err(|e| e.to_string())?
-        .success();
+    let ok = Command::new("sudo").args(["lpadmin", "-p", name, "-E", "-v", uri, "-m", "everywhere"]).status().map_err(|e| e.to_string())?.success();
     if ok { Ok(()) } else { Err(format!("lpadmin failed for {uri}")) }
 }
 
@@ -187,8 +173,7 @@ pub fn pick_files() -> Vec<String> {
         }
     }
     // fzf draws on the tty and prints the choices on stdout
-    Command::new("fzf").arg("-m").stdout(std::process::Stdio::piped()).output()
-        .map_or(Vec::new(), |out| lines(&String::from_utf8_lossy(&out.stdout)))
+    Command::new("fzf").arg("-m").stdout(std::process::Stdio::piped()).output().map_or(Vec::new(), |out| lines(&String::from_utf8_lossy(&out.stdout)))
 }
 
 /// One path per line (nnn may separate them with NUL).
@@ -196,12 +181,14 @@ fn lines(s: &str) -> Vec<String> {
     s.split(['\n', '\0']).filter(|l| !l.is_empty()).map(String::from).collect()
 }
 
-
 pub fn lp_args(job: &Job) -> Vec<String> {
     let mut a = vec![
-        "-d".into(), job.printer.clone(),
-        "-o".into(), format!("media={}", job.paper),
-        "-o".into(), format!("print-color-mode={}", if job.color { "color" } else { "monochrome" }),
+        "-d".into(),
+        job.printer.clone(),
+        "-o".into(),
+        format!("media={}", job.paper),
+        "-o".into(),
+        format!("print-color-mode={}", if job.color { "color" } else { "monochrome" }),
     ];
     if let Some(p) = &job.pages {
         a.extend(["-o".into(), format!("page-ranges={p}")]);
@@ -459,7 +446,9 @@ fn vision_words(pages: &[String]) -> Result<Vec<Vec<Word>>, String> {
     for line in found.lines() {
         let f: Vec<&str> = line.splitn(6, '\t').collect();
         let [n, x, y, w, h, text] = f[..] else { continue };
-        let (Ok(n), Ok(x), Ok(y), Ok(w), Ok(h)) = (n.parse::<usize>(), x.parse::<f32>(), y.parse::<f32>(), w.parse::<f32>(), h.parse::<f32>()) else { continue };
+        let (Ok(n), Ok(x), Ok(y), Ok(w), Ok(h)) = (n.parse::<usize>(), x.parse::<f32>(), y.parse::<f32>(), w.parse::<f32>(), h.parse::<f32>()) else {
+            continue;
+        };
         let Some(&(iw, ih)) = sizes.get(n) else { continue };
         let (iw, ih) = (iw as f32, ih as f32);
         // Vision's boxes start at the bottom left; images at the top left
@@ -519,7 +508,7 @@ fn macos_draws_and_reads_pages() {
     let (w, h) = image_size(&png).unwrap();
     // A4 at 100 dpi
     assert!((820..=830).contains(&w) && (1165..=1175).contains(&h), "{w}x{h}");
-    let words = vision_words(&[png.clone()]).unwrap();
+    let words = vision_words(std::slice::from_ref(&png)).unwrap();
     let text: Vec<&str> = words[0].iter().map(|w| w.text.as_str()).collect();
     assert!(text.iter().any(|t| t.contains("HELLO PRINTER")), "{text:?}");
     // the box is near the top left of the page, where the text is
@@ -613,4 +602,3 @@ fn ocr_pdf_has_text() {
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(text.contains("Hello printer"), "{text}");
 }
-
