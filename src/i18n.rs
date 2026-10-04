@@ -2124,8 +2124,9 @@ pub const ID: Texts = Texts {
 fn fill_and_pick() {
     assert_eq!(fill(EN.save_some, &[("n", &2), ("all", &5)]), "Save 2 of 5 pages");
     assert_eq!(fill("{a}{a}", &[("a", &"x")]), "xx");
-    set("pt_BR.UTF-8");
-    assert_eq!(t().code, "pt");
+    // (not through set: other tests draw the screen in the language they started with)
+    assert_eq!(ALL[find("pt_BR.UTF-8").unwrap()].code, "pt");
+    assert_eq!(find("C"), None);
 }
 
 #[test]
