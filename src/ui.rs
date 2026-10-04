@@ -32,6 +32,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
     let keys: &[(&str, &str)] = match app.mode {
         Mode::Insert => &[("Esc", t.k_done), ("Enter", t.k_done)],
         Mode::Address(_) => &[("Enter", t.k_add), ("Esc", t.k_cancel)],
+        _ if app.scanning => &[("Esc", t.k_cancel), ("q", t.k_quit)],
         _ if app.tab == Tab::Settings && app.sel == FOLDER => &[("j/k", t.k_move), ("i", t.k_edit_text), ("Tab", t.k_print_scan), ("q", t.k_quit)],
         _ if app.tab == Tab::Settings => &[("j/k", t.k_move), ("h/l", t.k_change), ("Tab", t.k_print_scan), ("q", t.k_quit)],
         _ if app.sel == PAGE && app.tab == Tab::Scan => {

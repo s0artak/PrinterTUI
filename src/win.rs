@@ -652,13 +652,13 @@ pub fn timestamp() -> String {
 }
 
 /// Searchable PDF with Windows' built-in OCR in the user's language, laid invisibly over the pages.
-pub fn ocr_pdf(pages: &[String], out: &str, dpi: u32) -> Result<Vec<String>, String> {
+pub fn ocr_pdf(pages: &[(String, u32)], out: &str) -> Result<Vec<String>, String> {
     let engine = OcrEngine::TryCreateFromUserProfileLanguages().map_err(|_| {
         "Searchable PDF needs a Windows OCR language: Settings > Time & language > Language, add your language with 'Optical character recognition'".to_string()
     })?;
-    let words = pages.iter().map(|p| ocr_page(&engine, p)).collect::<Result<Vec<_>, _>>()?;
+    let words = pages.iter().map(|(p, _)| ocr_page(&engine, p)).collect::<Result<Vec<_>, _>>()?;
     let path = format!("{out}.pdf");
-    std::fs::write(&path, images_to_pdf(pages, dpi, &words)?).map_err(|e| format!("{path}: {e}"))?;
+    std::fs::write(&path, pages_to_pdf(pages, &words)?).map_err(|e| format!("{path}: {e}"))?;
     Ok(vec![path])
 }
 

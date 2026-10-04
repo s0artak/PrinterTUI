@@ -59,8 +59,14 @@ impl App {
 
     pub(crate) fn find_scanners(&mut self, full: bool) {
         self.spawn(t().searching_scanners, move || {
-            let list = scanners(full);
+            let mut list = scanners(full);
             Box::new(move |app: &mut App| {
+                // the quick search only looks for network scanners by address: the scanner chosen
+                // before (a USB one, say) stays the one selected, rather than the first one found
+                let pref = &app.scanner_pref;
+                if !full && !pref.is_empty() && !list.iter().any(|(d, _)| d == pref) {
+                    list.insert(0, (pref.clone(), pref.clone()));
+                }
                 app.scanner = list.iter().position(|(d, _)| *d == app.scanner_pref).unwrap_or(0);
                 app.status = if list.is_empty() { fill(t().no_scanners, &[("hint", &t().hints()[1])]) } else { String::new() };
                 app.scanners = Some(list);
@@ -93,16 +99,19 @@ impl App {
         // unique name: pages can be deleted and reordered, and old edits must not be reused
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
         let path = dir.join(format!("page-{stamp}")).to_string_lossy().into_owned();
-        let (mode, dpi) = (SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi]);
+        let (mode, dpi, paper) = (SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi], PAPERS[self.paper]);
         self.scanning = true;
         sound::play(Sound::Scan);
         self.spawn(fill(t().scanning, &[("n", &n)]), move || {
-            let res = std::fs::create_dir_all(&dir).map_err(|e| e.to_string()).and_then(|_| scan(&device, mode, dpi, &path)).and_then(|_| thumbnail(&path));
+            let res = std::fs::create_dir_all(&dir)
+                .map_err(|e| e.to_string())
+                .and_then(|_| scan(&device, mode, dpi, paper, &path))
+                .and_then(|dpi| thumbnail(&path).map(|thumb| (thumb, dpi)));
             Box::new(move |app: &mut App| {
                 app.scanning = false;
                 app.status = match res {
-                    Ok(thumb) => {
-                        app.scans.push(ScannedPage { orig: path.clone(), file: path, rot: 0, filter: 0, keep: true, thumb });
+                    Ok((thumb, dpi)) => {
+                        app.scans.push(ScannedPage { orig: path.clone(), file: path, rot: 0, filter: 0, keep: true, thumb, dpi });
                         app.cur = app.scans.len() - 1;
                         sound::play(Sound::Done);
                         if then_copy {
@@ -116,6 +125,14 @@ impl App {
         });
     }
 
+    /// Stops the scan running; its page, if one still arrives, is dropped with the task.
+    pub(crate) fn cancel_scan(&mut self) {
+        cancel_scan();
+        self.busy = None;
+        self.scanning = false;
+        self.status = t().scan_cancelled.into();
+    }
+
     /// Photocopy: prints the kept pages at their real size with the Print tab's printer, color,
     /// paper, copies and scale; with nothing scanned yet it scans a page first.
     pub(crate) fn copy(&mut self) {
@@ -125,7 +142,7 @@ impl App {
         if self.scans.is_empty() {
             return self.scan_page(true);
         }
-        let files: Vec<String> = self.scans.iter().filter(|p| p.keep).map(|p| p.file.clone()).collect();
+        let files: Vec<(String, u32)> = self.scans.iter().filter(|p| p.keep).map(|p| (p.file.clone(), p.dpi)).collect();
         if files.is_empty() {
             return self.status = failed(t().no_pages_copy);
         }
@@ -133,10 +150,10 @@ impl App {
             return self.status = t().edit_running.into();
         }
         let pdf = scan_dir().join("copy.pdf");
-        let (dpi, scale, paper) = (SCAN_DPI[self.scan_dpi], SCALES[self.scale], PAPERS[self.paper]);
+        let (scale, paper) = (SCALES[self.scale], PAPERS[self.paper]);
         let job = self.print_settings().job;
         self.send(t().printing_copy, move || {
-            let res = images_to_pdf(&files, dpi, &[])
+            let res = pages_to_pdf(&files, &[])
                 .and_then(|data| std::fs::write(&pdf, data).map_err(|e| format!("{}: {e}", pdf.display())))
                 .and_then(|_| printable(&pdf.to_string_lossy(), scale, paper))
                 .and_then(|file| submit(&Job { file, ..job }));
@@ -145,7 +162,7 @@ impl App {
     }
 
     pub(crate) fn save_scans(&mut self) {
-        let files: Vec<String> = self.scans.iter().filter(|p| p.keep).map(|p| p.file.clone()).collect();
+        let files: Vec<(String, u32)> = self.scans.iter().filter(|p| p.keep).map(|p| (p.file.clone(), p.dpi)).collect();
         if files.is_empty() {
             return self.status = failed(t().no_pages_save);
         }
@@ -154,9 +171,9 @@ impl App {
         }
         let out = expand_home(self.save_as.trim());
         let out = out.trim_end_matches(".pdf").trim_end_matches(".png").to_string();
-        let (format, dpi) = (SCAN_FORMATS[self.scan_format], SCAN_DPI[self.scan_dpi]);
+        let format = SCAN_FORMATS[self.scan_format];
         self.spawn(t().saving, move || {
-            let res = save_scans(&files, &out, format, dpi);
+            let res = save_scans(&files, &out, format);
             Box::new(move |app: &mut App| {
                 app.status = match res {
                     Ok(written) => {

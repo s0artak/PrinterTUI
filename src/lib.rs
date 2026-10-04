@@ -730,10 +730,9 @@ pub fn scanners(full: bool) -> Vec<(String, String)> {
     let mut found: Vec<(String, String)> = printer_hosts()
         .iter()
         .filter_map(|host| {
-            let caps = minreq::get(format!("http://{host}/eSCL/ScannerCapabilities")).with_timeout(2).send().ok()?;
-            let caps = caps.as_str().ok().filter(|_| caps.status_code == 200)?;
-            let model = caps.split("<pwg:MakeAndModel>").nth(1)?.split('<').next()?.to_string();
-            Some((format!("escl:http://{host}/eSCL"), model))
+            let url = format!("http://{host}/eSCL");
+            let caps = escl_capabilities(&url)?;
+            Some((format!("escl:{url}"), caps.model))
         })
         .collect();
     if full || found.is_empty() {
@@ -747,37 +746,143 @@ pub fn scanners(full: bool) -> Vec<(String, String)> {
     found
 }
 
-/// Scans one page from the flatbed into an image file (PNG or JPEG). `escl:<url>` devices are
-/// driven directly over HTTP, which also works on macOS where there is no SANE AirScan backend;
-/// any other device goes through the system (SANE's `scanimage`, or Windows' scanner API).
-pub fn scan(device: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
-    match device.strip_prefix("escl:") {
-        Some(url) => escl_scan(url, mode, dpi, out),
-        None => scan_local(device, mode, dpi, out),
+/// Scans one page into an image file (PNG or JPEG) and returns the dpi it was scanned at. The
+/// app's own `escl:<url>/eSCL` devices are driven directly over HTTP, which also works on macOS
+/// where there is no SANE AirScan backend; any other device goes through the system (SANE's
+/// `scanimage`, whose own escl backend also names devices escl:http://..., or Windows' scanner API).
+pub fn scan(device: &str, mode: &str, dpi: u32, paper: &str, out: &str) -> Result<u32, String> {
+    match device.strip_prefix("escl:").filter(|url| url.ends_with("/eSCL")) {
+        Some(url) => escl_scan(url, mode, dpi, paper, out),
+        None => scan_local(device, mode, dpi, out).map(|_| image_dpi(out).unwrap_or(dpi)),
+    }
+}
+
+/// What an eSCL scanner can do, from its ScannerCapabilities: its model, the largest area its
+/// glass (or feeder) takes in 1/300 inch, its resolutions and color modes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EsclCaps {
+    pub model: String,
+    /// "Platen", or "Feeder" for scanners without glass.
+    pub source: &'static str,
+    pub max: (u32, u32),
+    /// Discrete resolutions, or (min, max) of a range.
+    pub resolutions: Vec<u32>,
+    pub range: Option<(u32, u32)>,
+    pub modes: Vec<String>,
+}
+
+/// Every value of an XML element, whatever its namespace prefix: <scan:MaxWidth>2550</scan:MaxWidth>.
+fn xml_values<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
+    xml.split('<')
+        .filter_map(|tag| {
+            let (head, text) = tag.split_once('>')?;
+            let local = head.rsplit(':').next()?;
+            (local == name && !head.starts_with('/')).then_some(text.trim())
+        })
+        .collect()
+}
+
+/// What is inside the first <...:name> element, whatever its namespace prefix.
+fn xml_section<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    let local = |tag: &str| tag.split_whitespace().next().unwrap_or("").rsplit(':').next().unwrap_or("") == name;
+    let mut start = None;
+    for (i, _) in xml.match_indices('<') {
+        let tag = xml[i + 1..].split('>').next()?;
+        match (start, tag.strip_prefix('/')) {
+            (Some(s), Some(closing)) if local(closing) => return Some(&xml[s..i]),
+            (None, None) if local(tag) => start = Some(i + tag.len() + 2),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Reads ScannerCapabilities (see EsclCaps).
+pub fn parse_escl_caps(xml: &str) -> Option<EsclCaps> {
+    let model = xml_values(xml, "MakeAndModel").first()?.to_string();
+    let (source, caps) = match xml_section(xml, "PlatenInputCaps") {
+        Some(c) => ("Platen", c),
+        None => ("Feeder", xml_section(xml, "AdfSimplexInputCaps")?),
+    };
+    let num = |name: &str| xml_values(caps, name).first().and_then(|v| v.parse::<u32>().ok());
+    let mut resolutions: Vec<u32> =
+        xml_section(caps, "DiscreteResolutions").map_or(Vec::new(), |d| xml_values(d, "XResolution").iter().filter_map(|v| v.parse().ok()).collect());
+    resolutions.sort_unstable();
+    resolutions.dedup();
+    let range =
+        xml_section(caps, "XResolutionRange").and_then(|r| Some((xml_values(r, "Min").first()?.parse().ok()?, xml_values(r, "Max").first()?.parse().ok()?)));
+    let mut modes: Vec<String> = xml_values(caps, "ColorMode").iter().map(|m| m.to_string()).collect();
+    modes.dedup();
+    Some(EsclCaps { model, source, max: (num("MaxWidth").unwrap_or(2550), num("MaxHeight").unwrap_or(3508)), resolutions, range, modes })
+}
+
+/// A scanner's capabilities, asked once and kept.
+fn escl_capabilities(url: &str) -> Option<EsclCaps> {
+    static KNOWN: Mutex<Vec<(String, EsclCaps)>> = Mutex::new(Vec::new());
+    if let Some((_, caps)) = KNOWN.lock().unwrap().iter().find(|(u, _)| u == url) {
+        return Some(caps.clone());
+    }
+    let res = minreq::get(format!("{}/ScannerCapabilities", reachable_url(url).ok()?)).with_timeout(2).send().ok()?;
+    let caps = parse_escl_caps(res.as_str().ok().filter(|_| res.status_code == 200)?)?;
+    KNOWN.lock().unwrap().push((url.to_string(), caps.clone()));
+    Some(caps)
+}
+
+impl EsclCaps {
+    /// The supported resolution nearest to `dpi`.
+    pub fn resolution(&self, dpi: u32) -> u32 {
+        match (self.resolutions.iter().min_by_key(|r| r.abs_diff(dpi)), self.range) {
+            (Some(&r), _) => r,
+            (None, Some((lo, hi))) => dpi.clamp(lo, hi),
+            (None, None) => dpi,
+        }
+    }
+
+    /// The color mode for "Color" or "Gray" that the scanner offers.
+    pub fn mode(&self, mode: &str) -> &str {
+        let want = if mode == "Gray" { "Grayscale8" } else { "RGB24" };
+        if self.modes.is_empty() || self.modes.iter().any(|m| m == want) {
+            return want;
+        }
+        let kind = if mode == "Gray" { "Grayscale" } else { "RGB" };
+        self.modes.iter().find(|m| m.starts_with(kind)).unwrap_or(&self.modes[0])
     }
 }
 
 /// eSCL (AirScan): POST the settings to ScanJobs, then download the page from the job's NextDocument.
-fn escl_scan(url: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
-    let color = if mode == "Gray" { "Grayscale8" } else { "RGB24" };
-    // A4 in 1/300 inch
+/// The area is the Print tab's paper (Letter is wider than A4) within what the glass takes, at
+/// the resolution nearest the one asked for that the scanner has; returns that resolution.
+fn escl_scan(url: &str, mode: &str, dpi: u32, paper: &str, out: &str) -> Result<u32, String> {
+    let caps = escl_capabilities(url).unwrap_or(EsclCaps { source: "Platen", max: (2550, 3508), ..Default::default() });
+    let dpi = caps.resolution(dpi);
+    let color = caps.mode(mode);
+    let (pw, ph) = paper_inches(paper);
+    let (w, h) = (((pw * 300.0) as u32).min(caps.max.0), ((ph * 300.0) as u32).min(caps.max.1));
+    let source = caps.source;
     let settings = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
 <pwg:Version>2.0</pwg:Version>
 <scan:Intent>Document</scan:Intent>
-<pwg:ScanRegions><pwg:ScanRegion><pwg:Height>3508</pwg:Height><pwg:Width>2480</pwg:Width><pwg:XOffset>0</pwg:XOffset><pwg:YOffset>0</pwg:YOffset><pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits></pwg:ScanRegion></pwg:ScanRegions>
-<pwg:InputSource>Platen</pwg:InputSource>
+<pwg:ScanRegions><pwg:ScanRegion><pwg:Height>{h}</pwg:Height><pwg:Width>{w}</pwg:Width><pwg:XOffset>0</pwg:XOffset><pwg:YOffset>0</pwg:YOffset><pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits></pwg:ScanRegion></pwg:ScanRegions>
+<pwg:InputSource>{source}</pwg:InputSource>
 <scan:ColorMode>{color}</scan:ColorMode>
 <scan:XResolution>{dpi}</scan:XResolution>
 <scan:YResolution>{dpi}</scan:YResolution>
 <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>
 </scan:ScanSettings>"#
     );
+    let url = &reachable_url(url)?;
     // right after a page the scanner answers 503 for a few seconds while the head returns
-    let res =
-        retry_busy(15, || minreq::post(format!("{url}/ScanJobs")).with_header("Content-Type", "text/xml").with_body(settings.as_str()).with_timeout(30).send())
-            .map_err(|e| format!("The scanner refused the scan job (busy?) {e}"))?;
+    let res = match minreq::post(format!("{url}/ScanJobs")).with_header("Content-Type", "text/xml").with_body(settings.as_str()).with_timeout(30).send() {
+        Ok(r) if r.status_code == 503 => retry_busy(15, || {
+            minreq::post(format!("{url}/ScanJobs")).with_header("Content-Type", "text/xml").with_body(settings.as_str()).with_timeout(30).send()
+        })
+        .map_err(|e| format!("The scanner is busy: {e}")),
+        Ok(r) if r.status_code == 409 => Err(format!("The scanner does not take these settings ({dpi} dpi, {color})")),
+        Ok(r) => answer(Ok(r)).map_err(|e| format!("The scanner refused the scan job: {e}")),
+        Err(e) => Err(format!("The scanner cannot be reached: {e}")),
+    }?;
     let job = res.header("location").map(str::trim).ok_or("The scanner did not return a scan job")?;
     // Location may be relative to the scanner ("/eSCL/ScanJobs/..."), keep scheme://host from the url
     let job = if job.starts_with('/') { format!("{}{job}", url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/")) } else { job.to_string() };
@@ -786,7 +891,18 @@ fn escl_scan(url: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
     let res = retry_busy(30, || minreq::get(format!("{job}/NextDocument")).with_timeout(600).send())
         .and_then(|page| std::fs::write(out, page.as_bytes()).map_err(|e| e.to_string()));
     SCAN_JOBS.lock().unwrap().retain(|j| *j != job);
-    res.map_err(|e| format!("Could not download the scanned page: {e}"))
+    res.map_err(|e| format!("Could not download the scanned page: {e}"))?;
+    Ok(image_dpi(out).unwrap_or(dpi))
+}
+
+/// Stops the scan running: the scanner is told (eSCL), scanimage gets the interrupt it handles
+/// by cancelling (it does not handle TERM). Windows' scanner API finishes on its own.
+pub fn cancel_scan() {
+    for job in std::mem::take(&mut *SCAN_JOBS.lock().unwrap()) {
+        let _ = minreq::delete(job).with_timeout(2).send();
+    }
+    #[cfg(unix)]
+    let _ = Command::new("pkill").args(["-INT", "-P", &std::process::id().to_string(), "-x", "scanimage"]).status();
 }
 
 /// Sends a request until it gets a 2xx answer, waiting 2 s after each 503 (busy), `tries` times at most.
@@ -884,6 +1000,55 @@ fn black_and_white(mut g: GrayImage) -> GrayImage {
     g
 }
 
+/// The resolution an image file records: a PNG's pHYs chunk (SANE writes it), a JPEG's JFIF
+/// density (eSCL scanners do); None when it says nothing.
+pub fn image_dpi(path: &str) -> Option<u32> {
+    let data = std::fs::read(path).ok()?;
+    let round = |v: f64| (v.round() as u32 > 0).then_some(v.round() as u32);
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let mut i = 8;
+        while i + 8 <= data.len() {
+            let len = u32::from_be_bytes(data[i..i + 4].try_into().ok()?) as usize;
+            let kind = &data[i + 4..i + 8];
+            let body = data.get(i + 8..i + 8 + len)?;
+            if kind == b"pHYs" && len == 9 && body[8] == 1 {
+                // pixels per metre
+                return round(u32::from_be_bytes(body[..4].try_into().ok()?) as f64 * 0.0254);
+            }
+            if kind == b"IDAT" {
+                return None;
+            }
+            i += 12 + len;
+        }
+        return None;
+    }
+    // JFIF: FF D8, FF E0, length, "JFIF\0", version, units, x density
+    if data.len() > 17 && data.starts_with(&[0xFF, 0xD8, 0xFF, 0xE0]) && &data[6..11] == b"JFIF\0" {
+        let x = u16::from_be_bytes([data[14], data[15]]) as f64;
+        return match data[13] {
+            1 => round(x),
+            2 => round(x * 2.54),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// A JPEG that says it is `dpi` dots per inch (its JFIF header), for tools that size pages by it.
+#[cfg(any(unix, test))]
+fn with_jpeg_dpi(mut data: Vec<u8>, dpi: u32) -> Vec<u8> {
+    let d = (dpi.min(u16::MAX as u32) as u16).to_be_bytes();
+    if data.len() > 17 && data.starts_with(&[0xFF, 0xD8, 0xFF, 0xE0]) && &data[6..11] == b"JFIF\0" {
+        data[13] = 1;
+        data[14..16].copy_from_slice(&d);
+        data[16..18].copy_from_slice(&d);
+    } else if data.starts_with(&[0xFF, 0xD8]) {
+        let app0 = [0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F', 0, 1, 1, 1, d[0], d[1], d[0], d[1], 0, 0];
+        data.splice(2..2, app0);
+    }
+    data
+}
+
 /// The page as JPEG for a PDF: (width, height, grayscale, bytes). JPEG scans go in as they are.
 fn jpeg(path: &str) -> Result<(u32, u32, bool, Vec<u8>), String> {
     let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
@@ -915,15 +1080,22 @@ fn win_ansi(text: &str) -> Vec<u8> {
     text.chars().map(|c| if (c as u32) < 256 { c as u8 } else { b'?' }).collect()
 }
 
-/// One PDF page per image; `dpi` sets the page size (pixels / dpi). `words[i]`, when given, is laid
-/// invisibly over page i, in any language, so the PDF can be searched and copied from.
+/// One PDF page per image, all at `dpi` (see `pages_to_pdf`).
 pub fn images_to_pdf(pages: &[String], dpi: u32, words: &[Vec<Word>]) -> Result<Vec<u8>, String> {
+    let pages: Vec<(String, u32)> = pages.iter().map(|p| (p.clone(), dpi)).collect();
+    pages_to_pdf(&pages, words)
+}
+
+/// One PDF page per (image, dpi); the dpi sets the page size (pixels / dpi), each page its own, as
+/// pages scanned at different resolutions are still the same paper. `words[i]`, when given, is laid
+/// invisibly over page i, in any language, so the PDF can be searched and copied from.
+pub fn pages_to_pdf(pages: &[(String, u32)], words: &[Vec<Word>]) -> Result<Vec<u8>, String> {
     let mut pdf = Pdf::new();
     let (catalog, tree, font) = (Ref::new(1), Ref::new(2), Ref::new(3));
     let mut kids = Vec::new();
     let mut letters = glyphless::Letters::default();
-    let pt = 72.0 / dpi as f32;
-    for (i, path) in pages.iter().enumerate() {
+    for (i, (path, dpi)) in pages.iter().enumerate() {
+        let pt = 72.0 / (*dpi).max(1) as f32;
         let (page_id, image_id, content_id) = (Ref::new(3 * i as i32 + 4), Ref::new(3 * i as i32 + 5), Ref::new(3 * i as i32 + 6));
         let (w, h, gray, data) = jpeg(path)?;
         let (pw, ph) = (w as f32 * pt, h as f32 * pt);
@@ -989,18 +1161,19 @@ pub fn downscale(w: usize, h: usize, px: &[u8], ow: usize, oh: usize) -> Vec<u8>
     out
 }
 
-/// Saves scanned pages as one PDF, or as `out.png` / `out-1.png`, `out-2.png`... Returns the written paths.
-pub fn save_scans(pages: &[String], out: &str, format: &str, dpi: u32) -> Result<Vec<String>, String> {
+/// Saves scanned pages, each with the dpi it was scanned at, as one PDF, or as `out.png` /
+/// `out-1.png`, `out-2.png`... Returns the written paths.
+pub fn save_scans(pages: &[(String, u32)], out: &str, format: &str) -> Result<Vec<String>, String> {
     if format == "OCR" {
-        return ocr_pdf(pages, out, dpi);
+        return ocr_pdf(pages, out);
     }
     if format == "PDF" {
         let path = format!("{out}.pdf");
-        std::fs::write(&path, images_to_pdf(pages, dpi, &[])?).map_err(|e| format!("{path}: {e}"))?;
+        std::fs::write(&path, pages_to_pdf(pages, &[])?).map_err(|e| format!("{path}: {e}"))?;
         return Ok(vec![path]);
     }
     let mut written = Vec::new();
-    for (i, p) in pages.iter().enumerate() {
+    for (i, (p, _)) in pages.iter().enumerate() {
         let path = if pages.len() == 1 { format!("{out}.png") } else { format!("{out}-{}.png", i + 1) };
         // pages can be PNG (SANE) or JPEG (eSCL), so convert instead of copying
         save_png(&open(p)?, &path)?;
@@ -1130,7 +1303,7 @@ fn pages_to_pdf_and_back() {
     // a color PNG and a gray JPEG, like SANE and eSCL scans (no file extension)
     DynamicImage::ImageRgb8(image::RgbImage::from_pixel(300, 150, image::Rgb([200, 30, 30]))).save_with_format(p("a"), ImageFormat::Png).unwrap();
     DynamicImage::ImageLuma8(GrayImage::from_pixel(150, 300, Luma([90]))).save_with_format(p("b"), ImageFormat::Jpeg).unwrap();
-    let pdf = save_scans(&[p("a"), p("b")], &p("out"), "PDF", 150).unwrap().remove(0);
+    let pdf = save_scans(&[(p("a"), 150), (p("b"), 150)], &p("out"), "PDF").unwrap().remove(0);
     assert_eq!(page_count(&pdf), Some(2));
     assert_eq!(page_count(&p("a")), None);
 
@@ -1266,6 +1439,63 @@ fn old_temp_files_go() {
     let left: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     // page-12 starts with "page-1" too, but is another page
     assert_eq!(left, ["page-12"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn escl_scanners_and_their_settings() {
+    // a flatbed that takes Letter's width, three resolutions and two color modes
+    let caps = r#"<?xml version="1.0"?><scan:ScannerCapabilities xmlns:scan="x" xmlns:pwg="y"><pwg:Version>2.63</pwg:Version>
+<pwg:MakeAndModel>HP Smart Tank 5100</pwg:MakeAndModel><scan:Platen><scan:PlatenInputCaps><scan:MinWidth>8</scan:MinWidth>
+<scan:MaxWidth>2550</scan:MaxWidth><scan:MaxHeight>3508</scan:MaxHeight><scan:SettingProfiles><scan:SettingProfile>
+<scan:ColorModes><scan:ColorMode>RGB24</scan:ColorMode><scan:ColorMode>Grayscale8</scan:ColorMode></scan:ColorModes>
+<scan:SupportedResolutions><scan:DiscreteResolutions><scan:DiscreteResolution><scan:XResolution>75</scan:XResolution><scan:YResolution>75</scan:YResolution></scan:DiscreteResolution>
+<scan:DiscreteResolution><scan:XResolution>300</scan:XResolution><scan:YResolution>300</scan:YResolution></scan:DiscreteResolution>
+<scan:DiscreteResolution><scan:XResolution>1200</scan:XResolution><scan:YResolution>1200</scan:YResolution></scan:DiscreteResolution></scan:DiscreteResolutions></scan:SupportedResolutions>
+</scan:SettingProfile></scan:SettingProfiles></scan:PlatenInputCaps></scan:Platen></scan:ScannerCapabilities>"#;
+    let c = parse_escl_caps(caps).unwrap();
+    assert_eq!((c.model.as_str(), c.source, c.max), ("HP Smart Tank 5100", "Platen", (2550, 3508)));
+    assert_eq!((c.resolution(150), c.resolution(600), c.mode("Gray")), (75, 300, "Grayscale8"));
+    // a document scanner with only a feeder and a range of resolutions
+    let feeder = "<MakeAndModel>DS-C</MakeAndModel><Adf><AdfSimplexInputCaps><MaxWidth>2550</MaxWidth><MaxHeight>4200</MaxHeight>\
+<XResolutionRange><Min>100</Min><Max>600</Max></XResolutionRange><ColorMode>RGB24</ColorMode></AdfSimplexInputCaps></Adf>";
+    let c = parse_escl_caps(feeder).unwrap();
+    assert_eq!((c.source, c.resolution(1200), c.resolution(50), c.mode("Gray")), ("Feeder", 600, 100, "RGB24"));
+    // SANE's own escl backend names devices escl:http://ip:port: those go to SANE, not to this app's client
+    let dir = std::env::temp_dir().join(format!("printertui-route-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("page").to_string_lossy().into_owned();
+    #[cfg(unix)]
+    let _one = unix::SPAWNS.lock().unwrap_or_else(|e| e.into_inner());
+    let err = scan("escl:http://127.0.0.1:9", "Color", 300, "A4", &out).unwrap_err();
+    assert!(!err.contains("scanner refused") && !err.contains("cannot be reached"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn pages_keep_the_resolution_they_were_scanned_at() {
+    let dir = std::env::temp_dir().join(format!("printertui-dpi-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_string_lossy().into_owned();
+    // an A4 page scanned at 300 dpi and one at 150 dpi: both A4 in the PDF
+    for (name, dpi) in [("a", 300u32), ("b", 150)] {
+        let (w, h) = (2480 * dpi / 300, 3508 * dpi / 300);
+        let jpg = std::fs::File::create(p(name)).unwrap();
+        let mut enc = JpegEncoder::new_with_quality(jpg, 50);
+        enc.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(dpi as u16));
+        enc.encode_image(&GrayImage::from_pixel(w, h, Luma([200]))).unwrap();
+        assert_eq!(image_dpi(&p(name)), Some(dpi));
+    }
+    let pdf = save_scans(&[(p("a"), 300), (p("b"), 150)], &p("out"), "PDF").unwrap().remove(0);
+    let doc = lopdf::Document::load(&pdf).unwrap();
+    for id in doc.page_iter() {
+        let [_, _, w, h] = page_box(&doc, id).unwrap();
+        assert!((w - 595.0).abs() < 2.0 && (h - 842.0).abs() < 2.0, "{w} x {h}");
+    }
+    // a JPEG without a JFIF header gets one; a PNG says nothing unless it has pHYs
+    assert_eq!(&with_jpeg_dpi(vec![0xFF, 0xD8, 0xFF, 0xD9], 300)[..4], &[0xFF, 0xD8, 0xFF, 0xE0]);
+    GrayImage::from_pixel(10, 10, Luma([0])).save(p("c.png")).unwrap();
+    assert_eq!(image_dpi(&p("c.png")), None);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

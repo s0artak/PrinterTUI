@@ -89,6 +89,8 @@ struct ScannedPage {
     filter: usize,
     keep: bool,
     thumb: Thumb,
+    /// The resolution it was scanned at, which sets its size on paper.
+    dpi: u32,
 }
 
 /// What the Print tab preview shows: the n-th sheet side of the first file as it will print.
@@ -243,7 +245,8 @@ fn main() -> std::io::Result<()> {
         && let Some(path) = last_scan()
         && let Ok(thumb) = thumbnail(&path)
     {
-        app.scans.push(ScannedPage { orig: path.clone(), file: path, rot: 0, filter: 0, keep: true, thumb });
+        let dpi = image_dpi(&path).unwrap_or(SCAN_DPI[app.scan_dpi]);
+        app.scans.push(ScannedPage { orig: path.clone(), file: path, rot: 0, filter: 0, keep: true, thumb, dpi });
         app.status = t().loaded_last.into();
     }
     std::thread::spawn(clean_temp);
@@ -492,6 +495,8 @@ impl App {
                 }
                 KeyCode::Char(c) if self.tab == Tab::Scan && self.sel == PAGE && !self.scans.is_empty() && self.page_key(c, dd) => {}
                 // a print still being sent would be lost: wait for it, unless asked twice
+                // Esc stops a scan, and the app stays
+                KeyCode::Esc if self.scanning => self.cancel_scan(),
                 KeyCode::Esc | KeyCode::Char('q') if self.sending && !self.quit_after => {
                     self.quit_after = true;
                     if let Some((msg, _)) = &mut self.busy {
@@ -1329,7 +1334,7 @@ mod tests {
         let mut app = app();
         app.tab = Tab::Scan;
         app.sel = PAGE;
-        let page = |n: &str| ScannedPage { orig: n.into(), file: n.into(), rot: 0, filter: 0, keep: true, thumb: (1, 1, vec![0]) };
+        let page = |n: &str| ScannedPage { orig: n.into(), file: n.into(), rot: 0, filter: 0, keep: true, thumb: (1, 1, vec![0]), dpi: 300 };
         app.scans = vec![page("/nowhere/page-1"), page("/nowhere/page-2"), page("/nowhere/page-3")];
         press(&mut app, "x");
         assert!(!app.scans[0].keep);

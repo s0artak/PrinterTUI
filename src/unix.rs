@@ -56,7 +56,8 @@ pub fn printer_state(queue: &str) -> PrinterState {
     // finds as ipps://Name._ipps._tcp.local./): its address, to ask it directly
     let uri = if service_name(&uri).is_some() { bonjour_uri(&uri).unwrap_or(uri) } else { uri };
     // a name that cannot be looked up says nothing about the printer itself
-    let reachable = uri_host(&uri).is_some_and(|(scheme, host)| matches!(scheme, "ipp" | "ipps" | "http") && service_name(&uri).is_none() && resolve_host(host).is_some());
+    let reachable =
+        uri_host(&uri).is_some_and(|(scheme, host)| matches!(scheme, "ipp" | "ipps" | "http") && service_name(&uri).is_none() && resolve_host(host).is_some());
     if !reachable {
         return cups_state(&opts);
     }
@@ -233,14 +234,10 @@ pub fn add_printer(name: &str, uri: &str) -> Result<(), String> {
         Err(_) => {}
     }
     let on_path = |cmd: &str| std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(cmd).is_file()));
-    let helper = ["sudo", "doas", "run0", "pkexec"].into_iter().find(|h| on_path(h)).ok_or("Adding a printer needs administrator rights, and there is no sudo")?;
+    let helper =
+        ["sudo", "doas", "run0", "pkexec"].into_iter().find(|h| on_path(h)).ok_or("Adding a printer needs administrator rights, and there is no sudo")?;
     // the password is asked on the terminal; lpadmin's own message is kept for the status
-    let out = Command::new(helper)
-        .arg(&lpadmin)
-        .args(args)
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| format!("{helper}: {e}"))?;
+    let out = Command::new(helper).arg(&lpadmin).args(args).stderr(std::process::Stdio::piped()).output().map_err(|e| format!("{helper}: {e}"))?;
     if out.status.success() {
         return Ok(());
     }
@@ -500,16 +497,101 @@ pub fn local_scanners() -> Vec<(String, String)> {
     sane.lines().filter_map(|l| l.split_once('\t')).map(|(d, v)| (d.to_string(), v.to_string())).collect()
 }
 
+/// Scans with SANE's scanimage. Most backends call the modes Color and Gray; some (Brother's
+/// brscan: "24bit Color", "True Gray") do not, or lack the resolution asked for: then the device's
+/// own choices (`scanimage -A`) are read and the scan is tried once more with the nearest ones.
 pub fn scan_local(device: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
-    let dpi = dpi.to_string();
-    run("scanimage", &["-d", device, "--mode", mode, "--resolution", &dpi, "--format=png", "-o", out]).map(drop)
+    let scan = |mode: Option<&str>, dpi: u32| {
+        let dpi = dpi.to_string();
+        let mut args = vec!["-d", device, "--resolution", &dpi, "--format=png", "-o", out];
+        if let Some(mode) = mode {
+            args.extend(["--mode", mode]);
+        }
+        run("scanimage", &args).map(drop)
+    };
+    match scan(Some(mode), dpi) {
+        Err(e) if e.contains("--mode") || e.contains("--resolution") || e.contains("Invalid argument") => {
+            let (modes, resolutions, range) = sane_options(&run("scanimage", &["-d", device, "-A"]).unwrap_or_default());
+            let mode = sane_mode(&modes, mode);
+            let dpi = match (resolutions.iter().min_by_key(|r| r.abs_diff(dpi)), range) {
+                (Some(&r), _) => r,
+                (None, Some((lo, hi))) => dpi.clamp(lo, hi),
+                (None, None) => dpi,
+            };
+            scan(mode.as_deref(), dpi).map_err(|_| e)
+        }
+        res => res,
+    }
 }
 
-/// Stops running tools, their children first (e.g. LibreOffice's soffice.bin) so none are left orphaned.
+/// A device's --mode choices, --resolution list and --resolution range from `scanimage -A`:
+/// "    --mode Lineart|Gray|Color [Color]", "    --resolution 75|150|300dpi [150]",
+/// "    --resolution 50..2400dpi (in steps of 1) [150]".
+fn sane_options(help: &str) -> (Vec<String>, Vec<u32>, Option<(u32, u32)>) {
+    let value = |line: &str, option: &str| -> Option<String> {
+        let v = line.trim().strip_prefix(option)?.strip_prefix(' ')?;
+        // the default in brackets at the end, "[Color]", is not a choice ("Gray[Error Diffusion]" is)
+        let v = match v.rfind(" [") {
+            Some(i) if v.ends_with(']') => &v[..i],
+            _ => v,
+        };
+        Some(v.split(" (").next().unwrap_or(v).trim().to_string())
+    };
+    let modes = help.lines().find_map(|l| value(l, "--mode")).map_or(Vec::new(), |v| v.split('|').map(|m| m.trim().to_string()).collect());
+    let res = help.lines().find_map(|l| value(l, "--resolution")).unwrap_or_default();
+    let res = res.trim_end_matches("dpi");
+    let range = res.split_once("..").and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().trim_end_matches("dpi").parse().ok()?)));
+    let list = if range.is_some() { Vec::new() } else { res.split('|').filter_map(|r| r.trim().trim_end_matches("dpi").parse().ok()).collect() };
+    (modes, list, range)
+}
+
+/// The device's own name for Color or Gray: an exact match, else a color mode that is not the
+/// fast (lower quality) one, else a gray that is not dithered; None when it has no --mode.
+fn sane_mode(modes: &[String], mode: &str) -> Option<String> {
+    if modes.is_empty() {
+        return None;
+    }
+    let lower: Vec<String> = modes.iter().map(|m| m.to_lowercase()).collect();
+    let pick = |ok: &dyn Fn(&str) -> bool| lower.iter().position(|m| ok(m)).map(|i| modes[i].clone());
+    if mode == "Gray" {
+        pick(&|m| m == "gray")
+            .or_else(|| pick(&|m| m == "true gray"))
+            .or_else(|| pick(&|m| (m.starts_with("gray") || m.starts_with("grey")) && !m.contains('[')))
+            .or_else(|| pick(&|m| m.contains("gray") || m.contains("grey")))
+    } else {
+        pick(&|m| m == "color").or_else(|| pick(&|m| m.contains("color") && !m.contains("fast"))).or_else(|| pick(&|m| m.contains("color")))
+    }
+}
+
+/// Stops running tools, their children first (e.g. LibreOffice's soffice.bin) so none are left
+/// orphaned. A running scanimage first gets the interrupt it answers by cancelling the scan (TERM
+/// would leave the scanner mid-scan), and up to 2 seconds to do it.
 pub fn kill_tree(pids: &[u32]) {
-    let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
-    let _ = Command::new("pkill").args(["-TERM", "-P", &pids.join(",")]).status();
-    let _ = Command::new("kill").arg("-TERM").args(&pids).status();
+    let list: Vec<String> = pids.iter().map(u32::to_string).collect();
+    let ps = |fields: &str, pids: &[String]| {
+        Command::new("ps").args(["-o", fields, "-p", &pids.join(",")]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
+    };
+    let scans: Vec<String> = ps("pid=,comm=", &list)
+        .lines()
+        .filter_map(|l| l.split_once(char::is_whitespace))
+        .filter(|(_, comm)| comm.trim().ends_with("scanimage"))
+        .map(|(pid, _)| pid.trim().to_string())
+        .collect();
+    if !scans.is_empty() {
+        let _ = Command::new("kill").arg("-INT").args(&scans).stderr(std::process::Stdio::null()).status();
+        // gone, or a zombie its thread has not collected yet
+        let running = || ps("stat=", &scans).lines().any(|s| !s.trim().is_empty() && !s.trim().starts_with('Z'));
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while running() && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    // quietly: some have ended by now
+    let quiet = |cmd: &mut Command| {
+        let _ = cmd.stderr(std::process::Stdio::null()).status();
+    };
+    quiet(Command::new("pkill").args(["-TERM", "-P", &list.join(",")]));
+    quiet(Command::new("kill").arg("-TERM").args(&list));
 }
 
 /// The Documents folder: ~/Documents on macOS; on Linux the one in ~/.config/user-dirs.dirs,
@@ -549,14 +631,14 @@ pub fn timestamp() -> String {
 
 /// Searchable PDF: on macOS the system's text recognition (Vision), else tesseract, lays the
 /// recognised text invisibly over each page image.
-pub fn ocr_pdf(pages: &[String], out: &str, dpi: u32) -> Result<Vec<String>, String> {
+pub fn ocr_pdf(pages: &[(String, u32)], out: &str) -> Result<Vec<String>, String> {
     #[cfg(target_os = "macos")]
-    if let Ok(words) = vision_words(pages) {
+    if let Ok(words) = vision_words(&pages.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()) {
         let path = format!("{out}.pdf");
-        std::fs::write(&path, images_to_pdf(pages, dpi, &words)?).map_err(|e| format!("{path}: {e}"))?;
+        std::fs::write(&path, pages_to_pdf(pages, &words)?).map_err(|e| format!("{path}: {e}"))?;
         return Ok(vec![path]);
     }
-    tesseract_pdf(pages, out, dpi)
+    tesseract_pdf(pages, out)
 }
 
 /// The text lines Vision finds on each page, with their boxes in the image's pixels.
@@ -580,26 +662,27 @@ fn vision_words(pages: &[String]) -> Result<Vec<Vec<Word>>, String> {
     Ok(words)
 }
 
-fn tesseract_pdf(pages: &[String], out: &str, dpi: u32) -> Result<Vec<String>, String> {
+fn tesseract_pdf(pages: &[(String, u32)], out: &str) -> Result<Vec<String>, String> {
     let langs = run("tesseract", &["--list-langs"]).map_err(|_| "Searchable PDF needs tesseract (and tesseract-data-<language>)")?;
     // ponytail: every installed language except osd; slower with many installed, add a picker then
     let langs: Vec<&str> = langs.lines().skip(1).filter(|l| *l != "osd").collect();
     let tmp = std::env::temp_dir().join(format!("printertui-ocr-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
     // JPEG copies keep the PDF small (tesseract embeds the images as they are), and a list file
-    // with one image per line makes tesseract write all pages into one PDF
+    // with one image per line makes tesseract write all pages into one PDF; each JPEG says its
+    // own resolution, which tesseract sizes its page by
     let res = pages
         .iter()
         .enumerate()
-        .map(|(i, p)| {
+        .map(|(i, (p, dpi))| {
             let jpg = tmp.join(format!("{i}.jpg")).to_string_lossy().into_owned();
-            std::fs::write(&jpg, jpeg(p)?.3).map_err(|e| e.to_string()).map(|_| jpg)
+            std::fs::write(&jpg, with_jpeg_dpi(jpeg(p)?.3, *dpi)).map_err(|e| e.to_string()).map(|_| jpg)
         })
         .collect::<Result<Vec<_>, _>>()
         .and_then(|jpgs| {
             let list = tmp.join("pages.txt");
             std::fs::write(&list, jpgs.join("\n")).map_err(|e| e.to_string())?;
-            run("tesseract", &[&list.to_string_lossy(), out, "--dpi", &dpi.to_string(), "-l", &langs.join("+"), "pdf"])
+            run("tesseract", &[&list.to_string_lossy(), out, "-l", &langs.join("+"), "pdf"])
         });
     let _ = std::fs::remove_dir_all(&tmp);
     res.map(|_| vec![format!("{out}.pdf")])
@@ -637,7 +720,7 @@ fn macos_draws_and_reads_pages() {
     // the box is near the top left of the page, where the text is
     let first = words[0].iter().find(|w| w.text.contains("HELLO")).unwrap();
     assert!(first.x < w as f32 / 3.0 && first.y < h as f32 / 5.0, "{} {}", first.x, first.y);
-    let searchable = ocr_pdf(&[png], &dir.join("out").to_string_lossy(), 100).unwrap().remove(0);
+    let searchable = ocr_pdf(&[(png, 100)], &dir.join("out").to_string_lossy()).unwrap().remove(0);
     assert_eq!(page_count(&searchable), Some(1));
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -712,7 +795,25 @@ fn printers_cups_sets_up_by_itself() {
     // adding one found by Bonjour gives a readable queue name
     let dnssd = "dnssd://HP%20Smart%20Tank%205100%20series%20%5B4A8B2C%5D._ipp._tcp.local./?uuid=1";
     assert_eq!(to_ipp(dnssd).map(|(name, _)| name).as_deref(), Some("HP_Smart_Tank_5100_series_4A8B2C"));
-    assert_eq!(to_ipp("socket://192.168.1.46").map(|(name, uri)| (name, uri)), Some(("printer_192_168_1_46".into(), "ipp://192.168.1.46/ipp/print".into())));
+    assert_eq!(to_ipp("socket://192.168.1.46"), Some(("printer_192_168_1_46".into(), "ipp://192.168.1.46/ipp/print".into())));
+}
+
+#[test]
+fn sane_choices_of_each_backend() {
+    let pixma = "    --mode Color|Gray|Lineart [Color]\n        Selects the scan mode.\n    --resolution 75|150|300|600|1200dpi [75]\n";
+    let (modes, list, range) = sane_options(pixma);
+    assert_eq!((modes.len(), list, range), (3, vec![75, 150, 300, 600, 1200], None));
+    assert_eq!(sane_mode(&modes, "Gray").as_deref(), Some("Gray"));
+    // Brother's brscan names them its own way
+    let brscan = "    --mode Black & White|Gray[Error Diffusion]|True Gray|24bit Color|24bit Color[Fast] [24bit Color]\n    --resolution 100|150|200|300|400|600|1200|2400|4800|9600dpi [200]\n";
+    let (modes, list, _) = sane_options(brscan);
+    assert_eq!(modes, ["Black & White", "Gray[Error Diffusion]", "True Gray", "24bit Color", "24bit Color[Fast]"]);
+    assert_eq!(sane_mode(&modes, "Color").as_deref(), Some("24bit Color"));
+    assert_eq!(sane_mode(&modes, "Gray").as_deref(), Some("True Gray"));
+    assert_eq!(list[0], 100);
+    let range = "    --resolution 50..2400dpi (in steps of 1) [150]\n";
+    assert_eq!(sane_options(range).2, Some((50, 2400)));
+    assert_eq!(sane_mode(&[], "Color"), None);
 }
 
 #[test]
@@ -755,7 +856,7 @@ fn ocr_pdf_has_text() {
     std::fs::create_dir_all(&dir).unwrap();
     let (img, out) = (dir.join("p.png").to_string_lossy().into_owned(), dir.join("out").to_string_lossy().into_owned());
     run("magick", &["-size", "1200x300", "xc:white", "-pointsize", "72", "-annotate", "+50+180", "Hello printer", &img]).unwrap();
-    let pdf = save_scans(&[img], &out, "OCR", 150).unwrap().remove(0);
+    let pdf = save_scans(&[(img, 150)], &out, "OCR").unwrap().remove(0);
     let text = run("pdftotext", &[&pdf, "-"]).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(text.contains("Hello printer"), "{text}");
