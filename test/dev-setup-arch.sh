@@ -4,8 +4,9 @@
 #   from scratch:     curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/test/dev-setup-arch.sh | bash
 #
 # What it does and where things go:
-#   1. pacman: git, gcc, rust (unless cargo exists), cups, cups-filters
-#   2. starts CUPS (cups.socket) so printers work
+#   1. pacman: git, gcc, rust (unless cargo exists), cups, cups-filters, poppler (the preview),
+#      avahi and nss-mdns (printers on the network)
+#   2. starts CUPS (cups.socket) and Avahi (avahi-daemon.service) so printers work
 #   3. source code  -> the checkout this script is in, else cloned into ~/Development/PrinterTUI
 #   4. build        -> <source>/target/release/printertui
 #   5. command      -> /usr/local/bin/printertui-dev, a symlink to that build.
@@ -18,11 +19,11 @@ command -v pacman >/dev/null || {
 	exit 1
 }
 
-pkgs=(git gcc cups cups-filters)
+pkgs=(git gcc cups cups-filters poppler avahi nss-mdns)
 # rust conflicts with rustup, only add it when there is no cargo yet
 command -v cargo >/dev/null || pkgs+=(rust)
 sudo pacman -S --needed --noconfirm "${pkgs[@]}"
-sudo systemctl enable --now cups.socket
+sudo systemctl enable --now cups.socket avahi-daemon.service
 
 src=${BASH_SOURCE[0]:-}
 if [[ -f $src ]] && dir=$(git -C "$(dirname "$src")" rev-parse --show-toplevel 2>/dev/null); then

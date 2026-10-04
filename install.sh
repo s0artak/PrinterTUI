@@ -1,9 +1,11 @@
 #!/bin/sh
 # PrinterTUI installer for Linux (Arch, Debian, Ubuntu, Fedora, openSUSE and their relatives) and macOS.
+# Other Linux systems (image-based ones, other package managers) get PrinterTUI and a hint for the packages.
 #   curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.sh | sh
 # Asks for a language, then opens a menu: Install the first time, Update or Uninstall when
 # PrinterTUI is already there, then a checklist of optional extras.
 # Skip all of it with an argument: ... | sh -s install | update | uninstall
+# PRINTERTUI_BIN_DIR=dir puts printertui there instead of /usr/local/bin (or ~/.local/bin without root).
 # PRINTERTUI_PREVIEW=fresh|installed|jam|smudge plays the menus and animations without changing anything
 # (see installer-preview.sh).
 set -eu
@@ -174,6 +176,11 @@ wrap() {
         }'
 }
 die() { printf '  \033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+# a problem that does not stop the install; $2, when given, is a line to copy (a command, a setting)
+warn() {
+    printf '  \033[33m! %s\033[0m\n' "$1"
+    [ -z "${2:-}" ] || printf '      \033[1m%s\033[0m\n' "$2"
+}
 # every command that changes the system goes through run, so the preview can skip it
 run() {
     if [ -n "$preview" ]; then
@@ -183,6 +190,33 @@ run() {
         "$@"
     fi
 }
+
+# Runs a command as root: as it is when we are root, else with sudo or doas. Without them (or when
+# sudo refuses the password) only this step fails, with a message.
+asked= noroot=
+as_root() {
+    if [ "$(id -u)" = 0 ]; then
+        run "$@"
+    elif [ -z "$noroot" ] && command -v sudo >/dev/null; then
+        # the password once, up front: refused, the other steps that need root are skipped too
+        if [ -z "$preview$asked" ]; then
+            asked=1
+            if ! sudo -v; then
+                noroot=1
+                as_root "$@"
+                return
+            fi
+        fi
+        run sudo "$@"
+    elif command -v doas >/dev/null; then
+        run doas "$@"
+    else
+        warn "$T_no_root" "$*"
+        return 1
+    fi
+}
+# as_root can work: we are root, or sudo (not refused yet) or doas is there
+rootable() { [ "$(id -u)" = 0 ] || { [ -z "$noroot" ] && command -v sudo >/dev/null; } || command -v doas >/dev/null; }
 
 # --- languages: the 10 most spoken (Ethnologue), each sets every T_ text -----
 LANGS="en zh hi es ar fr bn pt ru id"
@@ -206,7 +240,7 @@ lang_en() {
     T_bye="Paper's back in the tray. Bye for now!"
     T_left="CUPS and your printers were left as they are."
     T_quit="No worries, nothing was touched."
-    T_e_os="needs macOS, or a Linux with pacman, apt, dnf or zypper"
+    T_e_os="needs Linux or macOS"
     T_e_brew="Homebrew is needed first: https://brew.sh"
     T_e_net="check your internet connection and run the installer again"
     T_extras="Want some extras? All optional."
@@ -217,6 +251,13 @@ lang_en() {
     T_extras_inst="Installing the extras"
     T_smudge="Smudged page! Something's off with that download."
     T_e_sum="the download doesn't match its checksum, so nothing was installed"
+    T_e_arch="there's no ready-made PrinterTUI for this processor; build it with: cargo install --git https://github.com/$REPO"
+    T_e_404="there's no ready-made PrinterTUI for this system yet (404); build it with: cargo install --git https://github.com/$REPO"
+    T_no_root="This needs root, and neither sudo nor doas let me in, so I skipped it:"
+    T_deps_fail="CUPS couldn't be installed (see above), so PrinterTUI goes in without it; printing works once CUPS is there"
+    T_own_pkgs="I don't install packages on this system: add CUPS's client tools (lp, lpstat, lpq), poppler's pdftoppm and any extras you picked with its own tools"
+    T_path="printertui's folder isn't on your PATH yet: add this line to ~/.profile (or your shell's startup file) and open a new terminal"
+    T_mdns="To find network printers by name, put mdns_minimal [NOTFOUND=return] before resolve and dns on the hosts line of /etc/nsswitch.conf:"
 }
 
 lang_zh() {
@@ -238,7 +279,7 @@ lang_zh() {
     T_bye="纸已放回纸盒。再见！"
     T_left="CUPS 和你的打印机都保持原样。"
     T_quit="没关系，什么都没改动。"
-    T_e_os="需要 macOS，或带有 pacman、apt、dnf 或 zypper 的 Linux"
+    T_e_os="需要 Linux 或 macOS"
     T_e_brew="需要先安装 Homebrew：https://brew.sh"
     T_e_net="请检查网络连接后重新运行安装程序"
     T_extras="要来点附加组件吗？全部可选。"
@@ -249,6 +290,13 @@ lang_zh() {
     T_extras_inst="正在安装附加组件"
     T_smudge="页面印花了！这次下载有问题。"
     T_e_sum="下载的文件与校验和不符，什么都没有安装"
+    T_e_arch="这种处理器没有现成的 PrinterTUI，可以自己编译：cargo install --git https://github.com/$REPO"
+    T_e_404="这个系统还没有现成的 PrinterTUI（404），可以自己编译：cargo install --git https://github.com/$REPO"
+    T_no_root="这一步需要 root 权限，但 sudo 和 doas 都没让我进去，所以跳过了："
+    T_deps_fail="CUPS 没能安装（见上方），PrinterTUI 照样安装；装好 CUPS 之后就能打印"
+    T_own_pkgs="我不在这个系统上安装软件包：请用系统自己的工具添加 CUPS 客户端工具（lp、lpstat、lpq）、poppler 的 pdftoppm 以及你选的附加组件"
+    T_path="printertui 所在的文件夹还不在你的 PATH 里：把这一行加到 ~/.profile（或你的 shell 启动文件）里，然后打开一个新终端"
+    T_mdns="要按名称找到网络打印机，请在 /etc/nsswitch.conf 的 hosts 行里，把 mdns_minimal [NOTFOUND=return] 放在 resolve 和 dns 前面："
 }
 
 lang_hi() {
@@ -270,7 +318,7 @@ lang_hi() {
     T_bye="कागज़ वापस ट्रे में। फिर मिलेंगे!"
     T_left="CUPS और आपके प्रिंटर जैसे थे वैसे ही हैं।"
     T_quit="कोई बात नहीं, कुछ भी नहीं बदला।"
-    T_e_os="macOS या pacman, apt, dnf या zypper वाला Linux चाहिए"
+    T_e_os="Linux या macOS चाहिए"
     T_e_brew="पहले Homebrew चाहिए: https://brew.sh"
     T_e_net="इंटरनेट कनेक्शन जाँचें और इंस्टॉलर फिर से चलाएँ"
     T_extras="कुछ अतिरिक्त चाहिए? सब वैकल्पिक हैं।"
@@ -281,6 +329,13 @@ lang_hi() {
     T_extras_inst="अतिरिक्त चीज़ें इंस्टॉल हो रही हैं"
     T_smudge="पेज पर धब्बा! इस डाउनलोड में कुछ गड़बड़ है।"
     T_e_sum="डाउनलोड चेकसम से मेल नहीं खाता, इसलिए कुछ भी इंस्टॉल नहीं हुआ"
+    T_e_arch="इस प्रोसेसर के लिए तैयार PrinterTUI नहीं है; इसे खुद बनाएँ: cargo install --git https://github.com/$REPO"
+    T_e_404="इस सिस्टम के लिए अभी तैयार PrinterTUI नहीं है (404); इसे खुद बनाएँ: cargo install --git https://github.com/$REPO"
+    T_no_root="इसके लिए root चाहिए, पर sudo या doas से अनुमति नहीं मिली, इसलिए इसे छोड़ दिया:"
+    T_deps_fail="CUPS इंस्टॉल नहीं हो पाया (ऊपर देखें), फिर भी PrinterTUI इंस्टॉल हो रहा है; CUPS आने पर छपाई चलेगी"
+    T_own_pkgs="इस सिस्टम पर मैं पैकेज इंस्टॉल नहीं करता: CUPS के क्लाइंट टूल (lp, lpstat, lpq), poppler का pdftoppm और चुनी हुई अतिरिक्त चीज़ें सिस्टम के अपने टूल से जोड़ें"
+    T_path="printertui का फ़ोल्डर अभी आपके PATH में नहीं है: यह पंक्ति ~/.profile (या अपने shell की स्टार्टअप फ़ाइल) में जोड़ें और नया टर्मिनल खोलें"
+    T_mdns="नेटवर्क प्रिंटर नाम से ढूँढने के लिए /etc/nsswitch.conf की hosts पंक्ति में resolve और dns से पहले mdns_minimal [NOTFOUND=return] लगाएँ:"
 }
 
 lang_es() {
@@ -302,7 +357,7 @@ lang_es() {
     T_bye="El papel ha vuelto a la bandeja. ¡Hasta pronto!"
     T_left="CUPS y tus impresoras se quedan como estaban."
     T_quit="Tranquilo, no he tocado nada."
-    T_e_os="hace falta macOS o un Linux con pacman, apt, dnf o zypper"
+    T_e_os="hace falta Linux o macOS"
     T_e_brew="primero hace falta Homebrew: https://brew.sh"
     T_e_net="revisa tu conexión a internet y vuelve a ejecutar el instalador"
     T_extras="¿Unos extras? Todos son opcionales."
@@ -313,6 +368,13 @@ lang_es() {
     T_extras_inst="Instalando los extras"
     T_smudge="¡Página emborronada! Algo raro pasa con esa descarga."
     T_e_sum="la descarga no coincide con su checksum, así que no he instalado nada"
+    T_e_arch="no hay PrinterTUI listo para este procesador; compílalo con: cargo install --git https://github.com/$REPO"
+    T_e_404="todavía no hay PrinterTUI listo para este sistema (404); compílalo con: cargo install --git https://github.com/$REPO"
+    T_no_root="Esto necesita root y ni sudo ni doas me han dejado, así que me lo he saltado:"
+    T_deps_fail="No se ha podido instalar CUPS (mira arriba), así que PrinterTUI se instala sin él; podrás imprimir cuando CUPS esté"
+    T_own_pkgs="En este sistema no instalo paquetes: añade con sus propias herramientas los clientes de CUPS (lp, lpstat, lpq), el pdftoppm de poppler y los extras que hayas elegido"
+    T_path="La carpeta de printertui aún no está en tu PATH: añade esta línea a ~/.profile (o al archivo de inicio de tu shell) y abre otra terminal"
+    T_mdns="Para encontrar impresoras de red por su nombre, pon mdns_minimal [NOTFOUND=return] antes de resolve y dns en la línea hosts de /etc/nsswitch.conf:"
 }
 
 lang_ar() {
@@ -334,7 +396,7 @@ lang_ar() {
     T_bye="عاد الورق إلى الدرج. إلى اللقاء!"
     T_left="بقيت CUPS وطابعاتك كما هي."
     T_quit="لا بأس، لم يتغير شيء."
-    T_e_os="يلزم macOS أو Linux فيه pacman أو apt أو dnf أو zypper"
+    T_e_os="يلزم Linux أو macOS"
     T_e_brew="يلزم Homebrew أولاً: https://brew.sh"
     T_e_net="تحقّق من اتصالك بالإنترنت ثم أعد تشغيل المثبّت"
     T_extras="هل تريد بعض الإضافات؟ كلها اختيارية."
@@ -345,6 +407,13 @@ lang_ar() {
     T_extras_inst="جارٍ تثبيت الإضافات"
     T_smudge="صفحة ملطّخة! هناك خطب ما في هذا التنزيل."
     T_e_sum="الملف المنزّل لا يطابق المجموع الاختباري، لذلك لم يُثبَّت شيء"
+    T_e_arch="لا توجد نسخة جاهزة من PrinterTUI لهذا المعالج؛ ابنِها بنفسك: cargo install --git https://github.com/$REPO"
+    T_e_404="لا توجد بعد نسخة جاهزة من PrinterTUI لهذا النظام (404)؛ ابنِها بنفسك: cargo install --git https://github.com/$REPO"
+    T_no_root="هذه الخطوة تحتاج صلاحيات root، ولم يسمح لي sudo ولا doas، لذلك تخطّيتها:"
+    T_deps_fail="تعذّر تثبيت CUPS (انظر أعلاه)، لذا يُثبَّت PrinterTUI بدونه؛ ستعمل الطباعة بعد تثبيت CUPS"
+    T_own_pkgs="لا أثبّت حزماً على هذا النظام: أضف بأدواته الخاصة أدوات عميل CUPS (lp و lpstat و lpq) و pdftoppm من poppler وأي إضافات اخترتها"
+    T_path="مجلد printertui ليس في PATH بعد: أضف هذا السطر إلى ~/.profile (أو ملف بدء الصدفة لديك) ثم افتح طرفية جديدة"
+    T_mdns="للعثور على طابعات الشبكة بأسمائها، ضع mdns_minimal [NOTFOUND=return] قبل resolve و dns في سطر hosts من /etc/nsswitch.conf:"
 }
 
 lang_fr() {
@@ -366,7 +435,7 @@ lang_fr() {
     T_bye="Le papier est retourné dans le bac. À bientôt !"
     T_left="CUPS et vos imprimantes restent tels quels."
     T_quit="Pas de souci, rien n'a été modifié."
-    T_e_os="il faut macOS ou un Linux avec pacman, apt, dnf ou zypper"
+    T_e_os="il faut Linux ou macOS"
     T_e_brew="Homebrew est nécessaire d'abord : https://brew.sh"
     T_e_net="vérifiez votre connexion internet puis relancez l'installateur"
     T_extras="Quelques extras ? Tous optionnels."
@@ -377,6 +446,13 @@ lang_fr() {
     T_extras_inst="Installation des extras"
     T_smudge="Page tachée ! Ce téléchargement a un souci."
     T_e_sum="le téléchargement ne correspond pas à sa somme de contrôle, rien n'a été installé"
+    T_e_arch="pas de PrinterTUI tout prêt pour ce processeur ; compilez-le avec : cargo install --git https://github.com/$REPO"
+    T_e_404="pas encore de PrinterTUI tout prêt pour ce système (404) ; compilez-le avec : cargo install --git https://github.com/$REPO"
+    T_no_root="Il faut être root, et ni sudo ni doas ne m'ont laissé faire, alors j'ai sauté cette étape :"
+    T_deps_fail="CUPS n'a pas pu être installé (voir plus haut), PrinterTUI s'installe quand même ; l'impression marchera une fois CUPS en place"
+    T_own_pkgs="Je n'installe pas de paquets sur ce système : ajoutez avec ses propres outils les clients CUPS (lp, lpstat, lpq), le pdftoppm de poppler et les extras choisis"
+    T_path="Le dossier de printertui n'est pas encore dans votre PATH : ajoutez cette ligne à ~/.profile (ou au fichier de démarrage de votre shell) puis ouvrez un nouveau terminal"
+    T_mdns="Pour trouver les imprimantes réseau par leur nom, mettez mdns_minimal [NOTFOUND=return] avant resolve et dns sur la ligne hosts de /etc/nsswitch.conf :"
 }
 
 lang_bn() {
@@ -398,7 +474,7 @@ lang_bn() {
     T_bye="কাগজ আবার ট্রেতে। আবার দেখা হবে!"
     T_left="CUPS আর আপনার প্রিন্টার যেমন ছিল তেমনই আছে।"
     T_quit="চিন্তা নেই, কিছুই বদলানো হয়নি।"
-    T_e_os="macOS অথবা pacman, apt, dnf বা zypper সহ Linux লাগবে"
+    T_e_os="Linux অথবা macOS লাগবে"
     T_e_brew="আগে Homebrew লাগবে: https://brew.sh"
     T_e_net="ইন্টারনেট সংযোগ দেখে নিন, তারপর ইনস্টলার আবার চালান"
     T_extras="কিছু বাড়তি জিনিস চান? সবই ঐচ্ছিক।"
@@ -409,6 +485,13 @@ lang_bn() {
     T_extras_inst="বাড়তি জিনিস ইনস্টল হচ্ছে"
     T_smudge="পাতায় দাগ! এই ডাউনলোডে কিছু গোলমাল আছে।"
     T_e_sum="ডাউনলোড চেকসামের সাথে মেলেনি, তাই কিছুই ইনস্টল হয়নি"
+    T_e_arch="এই প্রসেসরের জন্য তৈরি PrinterTUI নেই; নিজে বানিয়ে নিন: cargo install --git https://github.com/$REPO"
+    T_e_404="এই সিস্টেমের জন্য এখনও তৈরি PrinterTUI নেই (404); নিজে বানিয়ে নিন: cargo install --git https://github.com/$REPO"
+    T_no_root="এর জন্য root লাগে, কিন্তু sudo বা doas কেউই ঢুকতে দেয়নি, তাই এটা বাদ দিলাম:"
+    T_deps_fail="CUPS ইনস্টল করা যায়নি (উপরে দেখুন), তবু PrinterTUI ইনস্টল হচ্ছে; CUPS এলে ছাপা যাবে"
+    T_own_pkgs="এই সিস্টেমে আমি প্যাকেজ ইনস্টল করি না: CUPS-এর ক্লায়েন্ট টুল (lp, lpstat, lpq), poppler-এর pdftoppm আর বেছে নেওয়া বাড়তি জিনিস সিস্টেমের নিজের টুল দিয়ে যোগ করুন"
+    T_path="printertui-এর ফোল্ডার এখনও আপনার PATH-এ নেই: এই লাইনটি ~/.profile-এ (বা আপনার shell-এর স্টার্টআপ ফাইলে) যোগ করে নতুন টার্মিনাল খুলুন"
+    T_mdns="নেটওয়ার্ক প্রিন্টার নাম দিয়ে খুঁজে পেতে /etc/nsswitch.conf-এর hosts লাইনে resolve আর dns-এর আগে mdns_minimal [NOTFOUND=return] বসান:"
 }
 
 lang_pt() {
@@ -430,7 +513,7 @@ lang_pt() {
     T_bye="O papel voltou para a bandeja. Até mais!"
     T_left="CUPS e suas impressoras ficaram como estavam."
     T_quit="Tudo bem, nada foi alterado."
-    T_e_os="é preciso macOS ou um Linux com pacman, apt, dnf ou zypper"
+    T_e_os="é preciso Linux ou macOS"
     T_e_brew="primeiro é preciso o Homebrew: https://brew.sh"
     T_e_net="verifique sua conexão com a internet e rode o instalador de novo"
     T_extras="Quer uns extras? Todos opcionais."
@@ -441,6 +524,13 @@ lang_pt() {
     T_extras_inst="Instalando os extras"
     T_smudge="Página borrada! Tem algo errado com esse download."
     T_e_sum="o download não bate com o checksum, então nada foi instalado"
+    T_e_arch="não há PrinterTUI pronto para este processador; compile com: cargo install --git https://github.com/$REPO"
+    T_e_404="ainda não há PrinterTUI pronto para este sistema (404); compile com: cargo install --git https://github.com/$REPO"
+    T_no_root="Isso precisa de root, e nem o sudo nem o doas me deixaram entrar, então pulei:"
+    T_deps_fail="Não deu para instalar o CUPS (veja acima), então o PrinterTUI vai sem ele; a impressão funciona quando o CUPS estiver lá"
+    T_own_pkgs="Neste sistema eu não instalo pacotes: adicione com as ferramentas dele os clientes do CUPS (lp, lpstat, lpq), o pdftoppm do poppler e os extras que você escolheu"
+    T_path="A pasta do printertui ainda não está no seu PATH: adicione esta linha ao ~/.profile (ou ao arquivo de inicialização do seu shell) e abra um novo terminal"
+    T_mdns="Para achar impressoras de rede pelo nome, coloque mdns_minimal [NOTFOUND=return] antes de resolve e dns na linha hosts do /etc/nsswitch.conf:"
 }
 
 lang_ru() {
@@ -462,7 +552,7 @@ lang_ru() {
     T_bye="Бумага вернулась в лоток. Пока!"
     T_left="CUPS и ваши принтеры остались как были."
     T_quit="Ничего страшного, ничего не изменено."
-    T_e_os="нужен macOS или Linux с pacman, apt, dnf или zypper"
+    T_e_os="нужен Linux или macOS"
     T_e_brew="сначала нужен Homebrew: https://brew.sh"
     T_e_net="проверьте подключение к интернету и запустите установщик снова"
     T_extras="Немного дополнений? Всё по желанию."
@@ -473,6 +563,13 @@ lang_ru() {
     T_extras_inst="Устанавливаю дополнения"
     T_smudge="Страница смазана! С этой загрузкой что-то не так."
     T_e_sum="загрузка не совпадает с контрольной суммой, поэтому ничего не установлено"
+    T_e_arch="для этого процессора нет готового PrinterTUI; соберите его сами: cargo install --git https://github.com/$REPO"
+    T_e_404="для этой системы пока нет готового PrinterTUI (404); соберите его сами: cargo install --git https://github.com/$REPO"
+    T_no_root="Здесь нужны права root, но ни sudo, ни doas меня не пустили, поэтому шаг пропущен:"
+    T_deps_fail="CUPS установить не удалось (см. выше), поэтому PrinterTUI ставится без него; печать заработает, когда появится CUPS"
+    T_own_pkgs="На этой системе я не ставлю пакеты: добавьте её собственными средствами клиентские утилиты CUPS (lp, lpstat, lpq), pdftoppm из poppler и выбранные дополнения"
+    T_path="Папки printertui ещё нет в вашем PATH: добавьте эту строку в ~/.profile (или в файл запуска вашей оболочки) и откройте новый терминал"
+    T_mdns="Чтобы находить сетевые принтеры по имени, добавьте mdns_minimal [NOTFOUND=return] перед resolve и dns в строке hosts файла /etc/nsswitch.conf:"
 }
 
 lang_id() {
@@ -494,7 +591,7 @@ lang_id() {
     T_bye="Kertas sudah kembali ke baki. Sampai jumpa!"
     T_left="CUPS dan printermu tetap seperti semula."
     T_quit="Tenang, tidak ada yang diubah."
-    T_e_os="perlu macOS atau Linux dengan pacman, apt, dnf, atau zypper"
+    T_e_os="perlu Linux atau macOS"
     T_e_brew="perlu Homebrew dulu: https://brew.sh"
     T_e_net="periksa koneksi internet lalu jalankan installer lagi"
     T_extras="Mau tambahan? Semuanya opsional."
@@ -505,6 +602,13 @@ lang_id() {
     T_extras_inst="Memasang tambahan"
     T_smudge="Halamannya belepotan! Ada yang aneh dengan unduhan itu."
     T_e_sum="unduhan tidak cocok dengan checksum-nya, jadi tidak ada yang dipasang"
+    T_e_arch="belum ada PrinterTUI siap pakai untuk prosesor ini; bangun sendiri dengan: cargo install --git https://github.com/$REPO"
+    T_e_404="belum ada PrinterTUI siap pakai untuk sistem ini (404); bangun sendiri dengan: cargo install --git https://github.com/$REPO"
+    T_no_root="Ini butuh root, tapi sudo maupun doas tidak mengizinkanku, jadi kulewati:"
+    T_deps_fail="CUPS tidak bisa dipasang (lihat di atas), jadi PrinterTUI dipasang tanpanya; mencetak bisa setelah CUPS ada"
+    T_own_pkgs="Di sistem ini aku tidak memasang paket: tambahkan alat klien CUPS (lp, lpstat, lpq), pdftoppm dari poppler, dan tambahan yang kamu pilih dengan alat sistem itu sendiri"
+    T_path="Folder printertui belum ada di PATH-mu: tambahkan baris ini ke ~/.profile (atau file awal shell-mu) lalu buka terminal baru"
+    T_mdns="Agar printer jaringan bisa ditemukan lewat namanya, taruh mdns_minimal [NOTFOUND=return] sebelum resolve dan dns di baris hosts /etc/nsswitch.conf:"
 }
 
 # --- pixel art: two pixels per character with half blocks --------------------
@@ -693,31 +797,53 @@ menu() {
 # where this installer puts printertui, plus ~/.local/bin from older installs.
 # A printertui found elsewhere on PATH (a development build) is not ours and is left alone.
 bins() {
+    [ -z "${PRINTERTUI_BIN_DIR:-}" ] || echo "${PRINTERTUI_BIN_DIR%/}/printertui"
     echo /usr/local/bin/printertui
     if command -v brew >/dev/null; then echo "$(brew --prefix)/bin/printertui"; fi
     echo "$HOME/.local/bin/printertui"
 }
 
-# extras: 1 LibreOffice, 2 SANE, 3 Tesseract; the ones already installed start marked
+# Tesseract's code for the language picked: it reads English plus that one
+ocr_code() {
+    case $lang in
+        zh) echo chi_sim ;; hi) echo hin ;; es) echo spa ;; ar) echo ara ;; fr) echo fra ;;
+        bn) echo ben ;; pt) echo por ;; ru) echo rus ;; id) echo ind ;; *) echo eng ;;
+    esac
+}
+
+# extras: 1 LibreOffice, 2 SANE, 3 Tesseract (with English and the language picked); the ones
+# already installed start marked, and are not installed again
 has_extra() {
     case $1 in
         1) command -v soffice >/dev/null || command -v libreoffice >/dev/null || [ -d /Applications/LibreOffice.app ] ;;
         2) command -v scanimage >/dev/null ;;
-        3) command -v tesseract >/dev/null ;;
+        3) command -v tesseract >/dev/null && tesseract --list-langs 2>&1 | grep -qx eng &&
+            tesseract --list-langs 2>&1 | grep -qx "$(ocr_code)" ;;
     esac
 }
 
+# Printing's tools are there already: CUPS's lp, lpstat and lpq (the queue), poppler's pdftoppm (the
+# preview), and on Arch Avahi with nss-mdns (printers on the network).
+have_base() {
+    for c in lp lpstat lpq pdftoppm; do
+        command -v $c >/dev/null || return 1
+    done
+    [ "$pm" != pacman ] || { command -v avahi-daemon >/dev/null && [ -e /usr/lib/libnss_mdns_minimal.so.2 ]; }
+}
+
 # The packages a Linux package manager ($1: pacman, apt, dnf or zypper) installs. "base" is what
-# printing needs: CUPS, and poppler's pdftoppm for the preview. "extras" are the extras marked in
-# $3 (as "101": 1 LibreOffice, 2 SANE, 3 Tesseract; all when not given), Tesseract reading English
-# and the language $4 (its tesseract code: spa, chi_sim...).
+# printing needs: CUPS (with lpq for the queue), poppler's pdftoppm for the preview, and on Arch
+# Avahi with nss-mdns for network printers. "extras" are the extras marked in $3 (as "101":
+# 1 LibreOffice, 2 SANE, 3 Tesseract; all when not given), Tesseract reading English and the
+# language $4 (its tesseract code: spa, chi_sim...).
 packages() {
     marks=${3:-111} ocr=${4:-eng}
     case $2 in
         base)
             case $1 in
-                pacman) echo cups cups-filters poppler ;;
-                apt | dnf) echo cups cups-client cups-filters poppler-utils ;;
+                pacman) echo cups cups-filters poppler avahi nss-mdns ;;
+                apt) echo cups cups-client cups-bsd cups-filters poppler-utils ;;
+                dnf) echo cups cups-client cups-filters poppler-utils ;;
                 zypper) echo cups cups-client cups-filters poppler-tools ;;
             esac ;;
         extras)
@@ -762,35 +888,107 @@ packages() {
 # installs packages with the package manager in $pm
 install_pkgs() {
     case $pm in
-        pacman) run sudo pacman -S --needed --noconfirm "$@" ;;
-        apt) run sudo apt-get update -qq && run sudo apt-get install -y "$@" ;;
-        dnf) run sudo dnf install -y "$@" ;;
-        zypper) run sudo zypper --non-interactive install "$@" ;;
+        pacman) as_root pacman -S --needed --noconfirm "$@" ;;
+        apt)
+            # a source that is down (an old PPA) fails the update, not the install
+            as_root apt-get update -qq || true
+            as_root apt-get install -y "$@" ;;
+        dnf) as_root dnf install -y "$@" ;;
+        zypper) as_root zypper --non-interactive install "$@" ;;
     esac
+}
+
+# Image-based systems, whose packages are not added from here: prints ostree (Silverblue, Kinoite,
+# Bazzite), nixos, steamos or ro (a read-only root, as on openSUSE MicroOS), or nothing.
+immutable() {
+    if [ -e /run/ostree-booted ]; then
+        echo ostree
+    elif [ -e /etc/NIXOS ]; then
+        echo nixos
+    elif grep -Eqx 'ID="?steamos"?' /etc/os-release 2>/dev/null; then
+        echo steamos
+    elif read_only /; then
+        echo ro
+    fi
+}
+
+# The command that adds what is missing (CUPS's client tools, pdftoppm, the extras in $want) on the
+# image-based system $sys, when it has one: rpm-ostree only takes packages its image does not have yet.
+own_line() {
+    cups= pdf=
+    for c in lp lpstat lpq; do
+        command -v $c >/dev/null || cups=1
+    done
+    command -v pdftoppm >/dev/null || pdf=1
+    case $sys in
+        ostree) set -- rpm-ostree install ${cups:+cups-client} ${pdf:+poppler-utils} $(packages dnf extras "$want" "$(ocr_code)") ;;
+        ro) command -v transactional-update >/dev/null || return 0
+            set -- sudo transactional-update pkg install ${cups:+cups-client} ${pdf:+poppler-tools} $(packages zypper extras "$want" "$(ocr_code)") ;;
+        nixos) set -- ${cups:+services.printing.enable = true;} ${pdf:+environment.systemPackages = [ pkgs.poppler_utils ];} ;;
+        *) return 0 ;;
+    esac
+    case "$*" in *install) ;; *) echo "$*" ;; esac
+}
+
+# $1, or the nearest folder above it that exists
+existing() {
+    d=$1
+    while [ ! -e "$d" ]; do d=$(dirname "$d"); done
+    echo "$d"
+}
+
+# folder $1 (or where it would be made) is on a read-only filesystem, which root cannot write either
+read_only() { findmnt -no OPTIONS -T "$(existing "$1")" 2>/dev/null | tail -n 1 | tr , '\n' | grep -qx ro; }
+
+# The hosts line of nsswitch.conf $1 with mdns_minimal before resolve or dns, as Avahi needs to find
+# printers by their .local names; nothing when it has mdns already.
+mdns_line() {
+    grep '^hosts:' "$1" 2>/dev/null | head -n 1 | awk '/mdns/ { exit }
+        { for (i = 2; i <= NF; i++) if ($i == "resolve" || $i == "dns") { $i = "mdns_minimal [NOTFOUND=return] " $i; print; exit } }'
+}
+
+# puts the downloaded printertui into folder $1 (made when missing), as root when it is not the user's
+put() {
+    if [ -w "$(existing "$1")" ]; then
+        { [ -d "$1" ] || run mkdir -p "$1"; } && run install -m 755 "$tmp" "$1/printertui"
+    else
+        { [ -d "$1" ] || as_root mkdir -p "$1"; } && as_root install -m 755 "$tmp" "$1/printertui"
+    fi
 }
 
 sha() {
     if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
 }
 
-# downloads the binary and its checksum into $tmp: 0 ok, 1 download failed, 2 checksum mismatch
+# downloads $1 into $2: 0 ok, 3 not there (HTTP 404), 1 no connection or another failure
+get() {
+    code=$(curl -fsL -w '%{http_code}' "$1" -o "$2") && return 0
+    [ "$code" != 404 ] || return 3
+    return 1
+}
+
+# downloads the binary and its checksum into $tmp: 0 ok, 1 download failed, 2 checksum mismatch,
+# 3 no such file (no release for this system)
 fetch() {
     if [ -n "$preview" ]; then
         sleep 3
         case $preview in jam) return 1 ;; smudge) return 2 ;; esac
         return 0
     fi
-    curl -fsL "$url" -o "$tmp" && curl -fsL "$url.sha256" -o "$tmp.sha256" || return 1
+    get "$url" "$tmp" && get "$url.sha256" "$tmp.sha256" || return $?
     [ "$(sha "$tmp")" = "$(cut -d' ' -f1 "$tmp.sha256")" ] || return 2
 }
 
 do_uninstall() {
     say "$T_rm_cmd"
-    for bin in $(bins); do
-        run rm -f "$bin" 2>/dev/null || run sudo rm -f "$bin"
-    done
+    while IFS= read -r bin; do
+        run rm -f "$bin" 2>/dev/null || as_root rm -f "$bin" || true
+    done <<EOF
+$(bins)
+EOF
     say "$T_rm_cfg"
-    run rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/printertui" "${TMPDIR:-/tmp}/printertui" "${TMPDIR:-/tmp}/printertui-scan" "${TMPDIR:-/tmp}/printertui-sounds"
+    # the app's temporary files: per user now, in one folder for everyone before
+    run rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/printertui" "${TMPDIR:-/tmp}/printertui-$(id -u)" "${TMPDIR:-/tmp}/printertui" "${TMPDIR:-/tmp}/printertui-scan" "${TMPDIR:-/tmp}/printertui-sounds"
     # installed from source by an earlier run
     if [ -f "$HOME/.local/.crates.toml" ] && command -v cargo >/dev/null; then
         run cargo uninstall --root "$HOME/.local" printertui 2>/dev/null || true
@@ -798,44 +996,74 @@ do_uninstall() {
 }
 
 do_install() {
+    # only these have a release, so this comes before anything is installed
+    case "$(uname -m)" in
+        x86_64 | amd64) arch=x86_64 ;;
+        arm64 | aarch64) arch=aarch64 ;;
+        *) die "$(uname -m): $T_e_arch" ;;
+    esac
+    # the extras marked that are not there yet: an update with nothing new installs nothing
+    checked=$extras want=
+    for e in 1 2 3; do
+        if marked $e && ! has_extra $e; then want=${want}1; else want=${want}0; fi
+    done
+    checked=
+
     case "$(uname -s)" in
         Linux)
-            pm=
-            for p in pacman apt-get dnf zypper; do
-                if command -v $p >/dev/null; then pm=${p%-get}; break; fi
-            done
-            [ -n "$pm" ] || die "$T_e_os"
-            say "$T_deps_linux"
-            # shellcheck disable=SC2046
-            install_pkgs $(packages $pm base)
-            # Debian and Ubuntu start CUPS themselves; WSL and containers may have no systemd
-            if command -v systemctl >/dev/null; then
-                say "$T_cups"
-                run sudo systemctl enable --now cups.socket || true
+            # image-based systems add packages their own way, other package managers are not known here:
+            # there PrinterTUI goes in on its own, with a hint for the packages
+            sys=$(immutable) pm=
+            if [ -z "$sys" ]; then
+                for p in pacman apt-get dnf zypper; do
+                    if command -v $p >/dev/null; then pm=${p%-get}; break; fi
+                done
             fi
-            if [ "$extras" != 000 ]; then
-                # Tesseract reads English plus the language picked here
-                case $lang in
-                    zh) ocr=chi_sim ;; hi) ocr=hin ;; es) ocr=spa ;; ar) ocr=ara ;; fr) ocr=fra ;;
-                    bn) ocr=ben ;; pt) ocr=por ;; ru) ocr=rus ;; id) ocr=ind ;; *) ocr=eng ;;
-                esac
-                say "$T_extras_inst"
-                # an extra the system cannot install (its package manager says why) does not stop PrinterTUI
-                # shellcheck disable=SC2046
-                install_pkgs $(packages $pm extras "$extras" $ocr) || true
+            if [ -z "$pm" ]; then
+                if ! have_base || [ "$want" != 000 ]; then warn "$T_own_pkgs" "$(own_line)"; fi
+            else
+                if ! have_base; then
+                    say "$T_deps_linux"
+                    # a package that cannot be installed (a mirror down, no root) does not stop PrinterTUI
+                    # shellcheck disable=SC2046
+                    install_pkgs $(packages $pm base) || warn "$T_deps_fail"
+                fi
+                # Debian and Ubuntu start CUPS themselves; WSL and containers may have no systemd.
+                # On Arch, Avahi finds the printers on the network.
+                if command -v systemctl >/dev/null; then
+                    units=cups.socket todo=
+                    [ $pm != pacman ] || units="$units avahi-daemon.service"
+                    for u in $units; do
+                        systemctl is-enabled --quiet $u 2>/dev/null || todo="$todo $u"
+                    done
+                    [ -z "$todo" ] || say "$T_cups"
+                    for u in $todo; do
+                        as_root systemctl enable --now $u || true
+                    done
+                fi
+                if [ "$want" != 000 ]; then
+                    say "$T_extras_inst"
+                    # an extra the system cannot install (its package manager says why) does not stop PrinterTUI
+                    # shellcheck disable=SC2046
+                    install_pkgs $(packages $pm extras "$want" "$(ocr_code)") || true
+                fi
+                # nsswitch.conf is the system's own: say what to change, not change it
+                if [ $pm = pacman ] && line=$(mdns_line /etc/nsswitch.conf) && [ -n "$line" ]; then
+                    warn "$T_mdns" "$line"
+                fi
             fi
             # already on every PATH, so printertui runs right away in this terminal
             bin_dir=/usr/local/bin
             os=linux ;;
         Darwin)
             # PrinterTUI itself needs nothing: macOS has CUPS, PDFKit and Vision; only the extras come from Homebrew
-            if [ "$extras" != 000 ] && ! command -v brew >/dev/null; then
+            if [ "$want" != 000 ] && ! command -v brew >/dev/null; then
                 say "$T_e_brew"
-            elif [ "$extras" != 000 ]; then
+            elif [ "$want" != 000 ]; then
                 say "$T_extras_inst"
-                checked=$extras
-                if marked 1; then run brew install --cask libreoffice; fi
-                if marked 2; then run brew install sane-backends; fi
+                checked=$want
+                if marked 1; then run brew install --cask libreoffice || true; fi
+                if marked 2; then run brew install sane-backends || true; fi
                 checked=
             fi
             # Homebrew's bin is the user's own; /usr/local/bin is on every macOS PATH
@@ -844,11 +1072,21 @@ do_install() {
         *) die "$T_e_os" ;;
     esac
 
-    case "$(uname -m)" in
-        x86_64 | amd64) arch=x86_64 ;;
-        arm64 | aarch64) arch=aarch64 ;;
-        *) arch=$(uname -m) ;;
-    esac
+    # printertui's folder: PRINTERTUI_BIN_DIR, else where it is already (an update), else the one above
+    # while it can be written (as root too), else the user's own
+    if [ -n "${PRINTERTUI_BIN_DIR:-}" ]; then
+        bin_dir=${PRINTERTUI_BIN_DIR%/}
+    else
+        while IFS= read -r bin; do
+            if [ -e "$bin" ]; then
+                bin_dir=${bin%/*}
+                break
+            fi
+        done <<EOF
+$(bins)
+EOF
+        if [ ! -w "$(existing "$bin_dir")" ] && { ! rootable || read_only "$bin_dir"; }; then bin_dir=$HOME/.local/bin; fi
+    fi
 
     tmp=$(mktemp)
     url="https://github.com/$REPO/releases/latest/download/printertui-$os-$arch"
@@ -869,18 +1107,29 @@ do_install() {
     case $status in
         0) echo ;;
         2) talk "$T_smudge" pet 203; die "$T_e_sum" ;;
+        3) talk "$T_jam" pet 203; die "$T_e_404" ;;
         *) talk "$T_jam" pet 203; die "$T_e_net" ;;
     esac
 
     say "$T_put $bin_dir"
-    # Apple silicon Macs may not have /usr/local/bin yet
-    [ -d "$bin_dir" ] || run sudo mkdir -p "$bin_dir"
-    if [ -w "$bin_dir" ]; then
-        run install -m 755 "$tmp" "$bin_dir/printertui"
-    else
-        run sudo install -m 755 "$tmp" "$bin_dir/printertui"
+    # (Apple silicon Macs may not have /usr/local/bin yet.) When root is refused after all, the user's own folder.
+    if ! put "$bin_dir"; then
+        [ "$bin_dir" != "$HOME/.local/bin" ] || exit 1
+        bin_dir=$HOME/.local/bin
+        say "$T_put $bin_dir"
+        put "$bin_dir"
     fi
-    run rm -f "$HOME/.local/bin/printertui" # older installs, would shadow the new one
+    # an older install in ~/.local/bin would shadow this one
+    if [ "$(cd "$bin_dir" 2>/dev/null && pwd -P)" != "$(cd "$HOME/.local/bin" 2>/dev/null && pwd -P)" ]; then
+        run rm -f "$HOME/.local/bin/printertui"
+    fi
+    # a folder that is not on PATH (~/.local/bin on some systems): the line that puts it there
+    case ":$PATH:" in
+        *":$bin_dir:"* | *":$bin_dir/:"*) ;;
+        *)
+            case $bin_dir in "$HOME"/*) shown="\$HOME/${bin_dir#"$HOME"/}" ;; *) shown=$bin_dir ;; esac
+            warn "$T_path" "export PATH=\"$shown:\$PATH\"" ;;
+    esac
 }
 
 # the app speaks the language picked in the menu (without a menu it follows the system's)
@@ -900,9 +1149,11 @@ installed=
 if [ -n "$preview" ]; then
     if [ "$preview" = installed ]; then installed=1; fi
 else
-    for bin in $(bins); do
+    while IFS= read -r bin; do
         if [ -e "$bin" ]; then installed=1; fi
-    done
+    done <<EOF
+$(bins)
+EOF
 fi
 extras=000 checked=
 
