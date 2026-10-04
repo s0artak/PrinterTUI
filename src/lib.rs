@@ -41,6 +41,18 @@ fn run_c(cmd: &str, args: &[&str]) -> Result<String, String> {
 }
 
 fn run_env(cmd: &str, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
+    let out = output(cmd, args, env)?;
+    let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
+    if out.status.success() {
+        return Ok(text(&out.stdout));
+    }
+    // a tool that fails without a word still gets an error that says something
+    let err = [text(&out.stderr), text(&out.stdout)].into_iter().find(|e| !e.is_empty());
+    Err(err.unwrap_or_else(|| format!("{cmd}: {}", out.status)))
+}
+
+/// Runs a tool that `stop_all` can end, and returns all it printed.
+fn output(cmd: &str, args: &[&str], env: &[(&str, &str)]) -> Result<std::process::Output, String> {
     let child = Command::new(cmd)
         .args(args)
         .envs(env.iter().copied())
@@ -53,14 +65,7 @@ fn run_env(cmd: &str, args: &[&str], env: &[(&str, &str)]) -> Result<String, Str
     CHILDREN.lock().unwrap().push(pid);
     let out = child.wait_with_output();
     CHILDREN.lock().unwrap().retain(|&p| p != pid);
-    let out = out.map_err(|e| format!("{cmd}: {e}"))?;
-    let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
-    if out.status.success() {
-        return Ok(text(&out.stdout));
-    }
-    // a tool that fails without a word still gets an error that says something
-    let err = [text(&out.stderr), text(&out.stdout)].into_iter().find(|e| !e.is_empty());
-    Err(err.unwrap_or_else(|| format!("{cmd}: {}", out.status)))
+    out.map_err(|e| format!("{cmd}: {e}"))
 }
 
 /// A PowerShell string literal. PowerShell ends a '...' string at the typographic quotes ‘ ’ ‚ ‛
@@ -99,19 +104,26 @@ pub fn page_count(file: &str) -> Option<u32> {
     (n > 0).then_some(n)
 }
 
+/// The app's temp folder, the user's own: on Linux, where /tmp is shared by every user,
+/// printertui-<uid>, which only they can open (see `private_temp`).
+pub fn temp_root() -> std::path::PathBuf {
+    static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(private_temp).clone()
+}
+
 /// A temp folder of its own for each source file, so same-named files never overwrite each other.
 pub fn work_dir(file: &str) -> Result<std::path::PathBuf, String> {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     file.hash(&mut h);
-    let dir = std::env::temp_dir().join("printertui").join(format!("{:016x}", Hasher::finish(&h)));
+    let dir = temp_root().join(format!("{:016x}", Hasher::finish(&h)));
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     Ok(dir)
 }
 
 /// This session's folder for scanned pages, edits and copies; quitting removes it.
 pub fn scan_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join("printertui-scan").join(std::process::id().to_string())
+    temp_root().join("scan").join(std::process::id().to_string())
 }
 
 /// Deletes a scanned page's files: the scan, its edited copies and their previews.
@@ -133,9 +145,12 @@ pub fn forget_scan(orig: &str) {
 pub fn clean_temp() {
     let day = std::time::Duration::from_secs(24 * 3600);
     let age = |p: &std::path::Path| p.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
-    let tmp = std::env::temp_dir();
+    let (root, tmp) = (temp_root(), std::env::temp_dir());
     let mine = scan_dir();
-    for entry in [tmp.join("printertui-scan"), tmp.join("printertui")].iter().filter_map(|d| std::fs::read_dir(d).ok()).flatten().flatten() {
+    // and what older versions left straight in the temp folder
+    let legacy = [tmp.join("printertui-scan"), tmp.join("printertui")].into_iter().filter(|d| *d != root);
+    let dirs: Vec<_> = [root.join("scan"), root.clone()].into_iter().chain(legacy).collect();
+    for entry in dirs.iter().filter_map(|d| std::fs::read_dir(d).ok()).flatten().flatten() {
         let (path, name) = (entry.path(), entry.file_name().to_string_lossy().into_owned());
         // session folders (a pid) and work folders (16 hex digits), and pages older versions left loose
         if !(name.chars().all(|c| c.is_ascii_hexdigit()) || name.starts_with("page-") || name == "copy.pdf") || path == mine {
@@ -173,24 +188,57 @@ pub fn paper_inches(paper: &str) -> (f32, f32) {
     }
 }
 
+/// LibreOffice as it is installed: its command, the arguments that go before LibreOffice's own,
+/// and for Flathub's and the Snap Store's, the folder of their own they can see.
+pub struct Office {
+    pub cmd: String,
+    pub pre: Vec<String>,
+    pub sandbox: Option<std::path::PathBuf>,
+}
+
 /// Converts a document, text or image to PDF with LibreOffice, returns the PDF path.
 /// The PDF is reused while it is newer than the file, so the preview does not convert it again.
 pub fn to_pdf(file: &str) -> Result<String, String> {
     let dir = work_dir(file)?;
-    let d = dir.to_str().ok_or("Bad temp dir")?;
-    let stem = std::path::Path::new(file).file_stem().ok_or("Bad file name")?;
-    let pdf = dir.join(stem).with_extension("pdf").to_string_lossy().into_owned();
+    let name = std::path::Path::new(file).file_name().ok_or("Bad file name")?;
+    let pdf = dir.join(name).with_extension("pdf").to_string_lossy().into_owned();
     if fresh(file, pdf.as_ref()) && page_count(&pdf).is_some() {
         return Ok(pdf);
     }
     let _ = std::fs::remove_file(&pdf);
+    let office = soffice();
+    // a sandboxed LibreOffice sees neither the temp folder nor, maybe, the file: it converts a
+    // copy in its own folder, one for each conversion as the preview and a print may overlap
+    static JOBS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let (input, outdir, base) = match &office.sandbox {
+        Some(sandbox) => {
+            let n = JOBS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let job = sandbox.join(format!("{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&job).map_err(|e| format!("{}: {e}", job.display()))?;
+            let input = job.join(name);
+            std::fs::copy(file, &input).map_err(|e| format!("{file}: {e}"))?;
+            (input, job, sandbox.clone())
+        }
+        None => (file.into(), dir.clone(), temp_root()),
+    };
     // own profile, so a running LibreOffice window does not swallow the conversion
     // (a file URL: file:///tmp/... or file:///C:/Users/...)
-    let base = std::env::temp_dir().join("printertui");
     let profile = format!("-env:UserInstallation=file:///{}/profile", base.to_string_lossy().replace('\\', "/").trim_start_matches('/'));
-    run(&soffice(), &[&profile, "--headless", "--convert-to", "pdf", "--outdir", d, file])
-        .map_err(|e| format!("Could not convert {file} to PDF (is libreoffice installed?): {e}"))?;
-    page_count(&pdf).map(|_| pdf).ok_or(format!("LibreOffice could not convert {file} to PDF"))
+    let (input_s, outdir_s) = (input.to_string_lossy(), outdir.to_string_lossy());
+    let args: Vec<&str> =
+        office.pre.iter().map(String::as_str).chain([profile.as_str(), "--headless", "--convert-to", "pdf", "--outdir", &outdir_s, &input_s]).collect();
+    let res = output(&office.cmd, &args, &[]);
+    if office.sandbox.is_some() {
+        let made = outdir.join(name).with_extension("pdf");
+        let _ = std::fs::rename(&made, &pdf).or_else(|_| std::fs::copy(&made, &pdf).map(|_| ()));
+        let _ = std::fs::remove_dir_all(&outdir);
+    }
+    let out = res.map_err(|e| format!("Could not convert {file} to PDF (is LibreOffice installed?): {e}"))?;
+    // LibreOffice may fail and still exit with 0: what it said is the error
+    page_count(&pdf).map(|_| pdf).ok_or_else(|| {
+        let said: Vec<String> = [&out.stderr, &out.stdout].iter().map(|b| String::from_utf8_lossy(b).trim().to_string()).filter(|s| !s.is_empty()).collect();
+        format!("LibreOffice could not convert {file} to PDF{}", if said.is_empty() { String::new() } else { format!(": {}", said.join(" ")) })
+    })
 }
 
 /// A copy of the PDF with each page's content scaled by `percent` around the page centre; the
@@ -1517,7 +1565,7 @@ fn text_files_print_without_libreoffice() {
 
 #[test]
 fn old_temp_files_go() {
-    let tmp = std::env::temp_dir().join("printertui");
+    let tmp = temp_root();
     let (old, new, sounds) = (tmp.join("00000000000000aa"), tmp.join("00000000000000bb"), tmp.join("sounds"));
     for d in [&old, &new] {
         std::fs::create_dir_all(d).unwrap();

@@ -12,6 +12,9 @@ pdf-writer = "0.15.0"
 ratatui = "0.30.2"
 unicode-width = "0.2.2"
 
+[target."cfg(unix)".dependencies]
+libc = "0.2"
+
 [target."cfg(windows)".dependencies]
 mdns-sd = "0.21.4"
 pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_7881", "thread_safe"] }

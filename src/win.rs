@@ -637,13 +637,19 @@ pub fn kill_tree(pids: &[u32]) {
 }
 
 /// LibreOffice's soffice.exe in Program Files, else whatever is on the PATH.
-pub fn soffice() -> String {
-    ["ProgramFiles", "ProgramFiles(x86)"]
+pub fn soffice() -> Office {
+    let cmd = ["ProgramFiles", "ProgramFiles(x86)"]
         .iter()
         .filter_map(std::env::var_os)
         .map(|d| std::path::Path::new(&d).join(r"LibreOffice\program\soffice.exe"))
         .find(|p| p.is_file())
-        .map_or("soffice".into(), |p| p.to_string_lossy().into_owned())
+        .map_or("soffice".into(), |p| p.to_string_lossy().into_owned());
+    Office { cmd, pre: Vec::new(), sandbox: None }
+}
+
+/// The temp folder is the user's own on Windows.
+pub fn private_temp() -> std::path::PathBuf {
+    std::env::temp_dir().join("printertui")
 }
 
 /// Local time for file names: 2026-09-26_154200.

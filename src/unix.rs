@@ -293,7 +293,7 @@ pub fn pick_files() -> Option<Vec<String>> {
             return picked;
         }
     }
-    let out = std::env::temp_dir().join(format!("printertui-pick-{}", std::process::id()));
+    let out = temp_root().join(format!("pick-{}", std::process::id()));
     let o = out.to_str().unwrap_or_default();
     let pickers: [(&str, Vec<String>); 4] = [
         ("yazi", vec![format!("--chooser-file={o}")]),
@@ -649,9 +649,62 @@ fn xdg_documents(dirs: &str, home: &std::path::Path) -> Option<std::path::PathBu
     (path != home).then_some(path)
 }
 
-/// LibreOffice; macOS does not put it on the PATH.
-pub fn soffice() -> String {
-    if cfg!(target_os = "macos") { "/Applications/LibreOffice.app/Contents/MacOS/soffice" } else { "libreoffice" }.into()
+/// LibreOffice: the system's, the one from libreoffice.org in /opt, or Flathub's or the Snap
+/// Store's, which see only their own folders. macOS does not put it on the PATH.
+pub fn soffice() -> Office {
+    let plain = |cmd: String| Office { cmd, pre: Vec::new(), sandbox: None };
+    if cfg!(target_os = "macos") {
+        return plain("/Applications/LibreOffice.app/Contents/MacOS/soffice".into());
+    }
+    let home = std::env::home_dir().unwrap_or_default();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let on_path = |cmd: &str| std::env::split_paths(&path).map(|d| d.join(cmd)).find(|p| p.is_file());
+    if let Some(found) = on_path("libreoffice").or_else(|| on_path("soffice")) {
+        // the snap's sees $HOME but not /tmp, which it has its own of
+        let snap = found.starts_with("/snap") || found.starts_with("/var/lib/snapd/snap");
+        let sandbox = snap.then(|| home.join("snap/libreoffice/common/printertui"));
+        return Office { cmd: found.to_string_lossy().into_owned(), pre: Vec::new(), sandbox };
+    }
+    // /opt/libreoffice25.8: the newest when there are several
+    let opt = std::fs::read_dir("/opt").into_iter().flatten().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("libreoffice"));
+    if let Some(soffice) = opt.map(|e| e.path().join("program/soffice")).filter(|p| p.is_file()).max() {
+        return plain(soffice.to_string_lossy().into_owned());
+    }
+    const FLATPAK: &str = "org.libreoffice.LibreOffice";
+    let installed = [std::path::PathBuf::from("/var/lib/flatpak/app"), home.join(".local/share/flatpak/app")].iter().any(|d| d.join(FLATPAK).is_dir());
+    if installed && on_path("flatpak").is_some() {
+        return Office {
+            cmd: "flatpak".into(),
+            pre: vec!["run".into(), FLATPAK.into()],
+            sandbox: Some(home.join(".var/app").join(FLATPAK).join("cache/printertui")),
+        };
+    }
+    // not installed: the error names it
+    plain("libreoffice".into())
+}
+
+/// /tmp/printertui-<uid>, made by this user and open only to them; a folder or link someone
+/// else put there first is not used, but the user's cache folder instead.
+pub fn private_temp() -> std::path::PathBuf {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    // SAFETY: getuid has no preconditions and cannot fail
+    let uid = unsafe { libc::getuid() };
+    let dir = std::env::temp_dir().join(format!("printertui-{uid}"));
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    if let Ok(m) = std::fs::symlink_metadata(&dir)
+        && m.is_dir()
+        && m.uid() == uid
+    {
+        if m.mode() & 0o077 != 0 {
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        return dir;
+    }
+    let home = std::env::home_dir().unwrap_or_default();
+    let cache = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()).map_or_else(|| home.join(".cache"), std::path::PathBuf::from);
+    let dir = cache.join("printertui");
+    let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
+    dir
 }
 
 /// Local time for file names: 2026-09-26_154200.
@@ -696,7 +749,7 @@ fn tesseract_pdf(pages: &[(String, u32)], out: &str) -> Result<Vec<String>, Stri
     let langs = run("tesseract", &["--list-langs"]).map_err(|_| "Searchable PDF needs tesseract (and tesseract-data-<language>)")?;
     // ponytail: every installed language except osd; slower with many installed, add a picker then
     let langs: Vec<&str> = langs.lines().skip(1).filter(|l| *l != "osd").collect();
-    let tmp = std::env::temp_dir().join(format!("printertui-ocr-{}", std::process::id()));
+    let tmp = temp_root().join(format!("ocr-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
     // JPEG copies keep the PDF small (tesseract embeds the images as they are), and a list file
     // with one image per line makes tesseract write all pages into one PDF; each JPEG says its

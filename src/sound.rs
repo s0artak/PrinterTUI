@@ -76,7 +76,7 @@ pub fn play(s: Sound) {
 
 /// The sound as a WAV file in the temp folder, written the first time it is needed.
 pub fn file(s: Sound, vol: u8) -> Option<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join("printertui").join("sounds");
+    let dir = printertui::temp_root().join("sounds");
     // the version changes with the sounds, so an update does not play the old ones
     let path = dir.join(format!("{}-{vol}-v2.wav", name(s)));
     if !path.exists() {
