@@ -446,7 +446,7 @@ pub fn render_page(pdf: &str, page: u32, png: &str) -> Result<(), String> {
 
 /// Hosts of the network printers in CUPS, to try as eSCL scanners, as addresses this app can reach.
 pub fn printer_hosts() -> Vec<String> {
-    let mut hosts: Vec<String> = run_c("lpstat", &["-v"])
+    let mut hosts: Vec<(String, String)> = run_c("lpstat", &["-v"])
         .unwrap_or_default()
         .lines()
         .filter_map(|l| {
@@ -457,12 +457,14 @@ pub fn printer_hosts() -> Vec<String> {
             if !NETWORK.contains(&scheme) {
                 return None;
             }
-            resolve_host(host)
+            Some((resolve_host(host)?, host.to_string()))
         })
         .collect();
-    hosts.sort();
-    hosts.dedup();
-    hosts
+    // one per printer, by its name rather than its address when a queue has it, so a scanner
+    // saved as the one to use is still that one when the network gives the printer a new address
+    hosts.sort_by_key(|(ip, host)| (ip.clone(), host.parse::<std::net::IpAddr>().is_ok()));
+    hosts.dedup_by(|a, b| a.0 == b.0);
+    hosts.into_iter().map(|(_, host)| host).collect()
 }
 
 /// Bonjour names already looked up, and the printer address each has.
@@ -542,6 +544,10 @@ pub fn scan_local(device: &str, mode: &str, dpi: u32, out: &str) -> Result<(), S
     match scan(Some(mode), dpi) {
         Err(e) if e.contains("--mode") || e.contains("--resolution") || e.contains("Invalid argument") => {
             let (modes, resolutions, range) = sane_options(&run("scanimage", &["-d", device, "-A"]).unwrap_or_default());
+            // stopped while the choices were asked for: no second scan
+            if scan_cancelled() {
+                return Err(SCAN_STOPPED.into());
+            }
             let mode = sane_mode(&modes, mode);
             let dpi = match (resolutions.iter().min_by_key(|r| r.abs_diff(dpi)), range) {
                 (Some(&r), _) => r,
@@ -603,7 +609,8 @@ pub fn kill_tree(pids: &[u32]) {
     };
     let scans: Vec<String> = ps("pid=,comm=", &list)
         .lines()
-        .filter_map(|l| l.split_once(char::is_whitespace))
+        // ps pads the pids on the left
+        .filter_map(|l| l.trim_start().split_once(char::is_whitespace))
         .filter(|(_, comm)| comm.trim().ends_with("scanimage"))
         .map(|(pid, _)| pid.trim().to_string())
         .collect();

@@ -62,9 +62,11 @@ impl App {
             let mut list = scanners(full);
             Box::new(move |app: &mut App| {
                 // the quick search only looks for network scanners by address: the scanner chosen
-                // before (a USB one, say) stays the one selected, rather than the first one found
+                // before (a USB one, say) stays the one selected, rather than the first one found;
+                // for those network ones the search has the last word
                 let pref = &app.scanner_pref;
-                if !full && !pref.is_empty() && !list.iter().any(|(d, _)| d == pref) {
+                let ours = pref.starts_with("escl:") && pref.ends_with("/eSCL");
+                if !full && !pref.is_empty() && !ours && !list.iter().any(|(d, _)| d == pref) {
                     list.insert(0, (pref.clone(), pref.clone()));
                 }
                 app.scanner = list.iter().position(|(d, _)| *d == app.scanner_pref).unwrap_or(0);

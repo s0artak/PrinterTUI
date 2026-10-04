@@ -679,7 +679,11 @@ pub fn job_id(lp_out: &str) -> Option<&str> {
     if let Some(rest) = lp_out.strip_prefix("request id is ") {
         return rest.split_whitespace().next();
     }
-    lp_out.split_whitespace().find(|w| w.rsplit_once('-').is_some_and(|(queue, n)| !queue.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+    // CUPS 2.4.2 and older write the Chinese line with no space before a full-width parenthesis
+    lp_out
+        .split_whitespace()
+        .filter_map(|w| w.split(['(', '（']).next())
+        .find(|w| w.rsplit_once('-').is_some_and(|(queue, n)| !queue.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
 }
 
 /// Printer name for a network printer at `host`: printer_192_168_1_46.
@@ -888,11 +892,26 @@ pub fn scanners(full: bool) -> Vec<(String, String)> {
 /// where there is no SANE AirScan backend; any other device goes through the system (SANE's
 /// `scanimage`, whose own escl backend also names devices escl:http://..., or Windows' scanner API).
 pub fn scan(device: &str, mode: &str, dpi: u32, paper: &str, out: &str) -> Result<u32, String> {
+    SCAN_STARTED.set(SCAN_GEN.load(std::sync::atomic::Ordering::SeqCst));
     match device.strip_prefix("escl:").filter(|url| url.ends_with("/eSCL")) {
         Some(url) => escl_scan(url, mode, dpi, paper, out),
         None => scan_local(device, mode, dpi, out).map(|_| image_dpi(out).unwrap_or(dpi)),
     }
 }
+
+/// Counts `cancel_scan`s. A scan keeps the count it started with (per thread: each scan runs in
+/// its own) and stops at its next step once the count has moved on.
+static SCAN_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+thread_local! {
+    static SCAN_STARTED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// True once the scan running on this thread was stopped.
+fn scan_cancelled() -> bool {
+    SCAN_GEN.load(std::sync::atomic::Ordering::SeqCst) != SCAN_STARTED.get()
+}
+
+const SCAN_STOPPED: &str = "Scan stopped";
 
 /// What an eSCL scanner can do, from its ScannerCapabilities: its model, the largest area its
 /// glass (or feeder) takes in 1/300 inch, its resolutions and color modes.
@@ -1024,6 +1043,12 @@ fn escl_scan(url: &str, mode: &str, dpi: u32, paper: &str, out: &str) -> Result<
     // Location may be relative to the scanner ("/eSCL/ScanJobs/..."), keep scheme://host from the url
     let job = if job.starts_with('/') { format!("{}{job}", url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/")) } else { job.to_string() };
     SCAN_JOBS.lock().unwrap().push(job.clone());
+    // stopped while the job was being made: cancel_scan found no job to cancel
+    if scan_cancelled() {
+        let _ = minreq::delete(&job).with_timeout(2).send();
+        SCAN_JOBS.lock().unwrap().retain(|j| *j != job);
+        return Err(SCAN_STOPPED.into());
+    }
     // the scanner answers 503 until the page is ready
     let res = retry_busy(30, || minreq::get(format!("{job}/NextDocument")).with_timeout(600).send())
         .and_then(|page| std::fs::write(out, page.as_bytes()).map_err(|e| e.to_string()));
@@ -1035,6 +1060,8 @@ fn escl_scan(url: &str, mode: &str, dpi: u32, paper: &str, out: &str) -> Result<
 /// Stops the scan running: the scanner is told (eSCL), scanimage gets the interrupt it handles
 /// by cancelling (it does not handle TERM). Windows' scanner API finishes on its own.
 pub fn cancel_scan() {
+    // first, so a scan whose job is not listed yet sees it once it is
+    SCAN_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     for job in std::mem::take(&mut *SCAN_JOBS.lock().unwrap()) {
         let _ = minreq::delete(job).with_timeout(2).send();
     }
@@ -1042,9 +1069,13 @@ pub fn cancel_scan() {
     let _ = Command::new("pkill").args(["-INT", "-P", &std::process::id().to_string(), "-x", "scanimage"]).status();
 }
 
-/// Sends a request until it gets a 2xx answer, waiting 2 s after each 503 (busy), `tries` times at most.
+/// Sends a request until it gets a 2xx answer, waiting 2 s after each 503 (busy), `tries` times
+/// at most, and no longer once the scan is stopped.
 fn retry_busy(tries: u32, send: impl Fn() -> Result<minreq::Response, minreq::Error>) -> Result<minreq::Response, String> {
     for _ in 1..tries {
+        if scan_cancelled() {
+            return Err(SCAN_STOPPED.into());
+        }
         match send() {
             Ok(r) if r.status_code == 503 => std::thread::sleep(std::time::Duration::from_secs(2)),
             res => return answer(res),
@@ -1670,6 +1701,7 @@ fn job_ids_in_any_language() {
     assert_eq!(job_id("id de requisição é Office-Laser-13 (1 arquivo(s))"), Some("Office-Laser-13"));
     assert_eq!(job_id("id запроса HP_Tank-14 (1 файл(ов))"), Some("HP_Tank-14"));
     assert_eq!(job_id("请求 ID 为 HP_Tank-15 (1 个文件)"), Some("HP_Tank-15"));
+    assert_eq!(job_id("请求 ID 为 HP_Tank-15（1 个文件）"), Some("HP_Tank-15"));
     assert_eq!(job_id("lp: error - no default destination available."), None);
 }
 
