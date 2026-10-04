@@ -57,6 +57,17 @@ jobs:
       # the macOS install as it runs from curl | sh, without changing anything
       - if: runner.os == 'macOS'
         run: PRINTERTUI_PREVIEW=fresh sh install.sh install
+      # the Linux install and uninstall as they run from curl | sh, without changing anything; a
+      # download that fails (jam) or does not match its checksum (smudge) stops it with an error
+      - if: runner.os == 'Linux'
+        run: |
+          PRINTERTUI_PREVIEW=fresh sh install.sh install
+          PRINTERTUI_PREVIEW=installed sh install.sh uninstall
+          for mode in jam smudge; do
+            status=0
+            PRINTERTUI_PREVIEW=$mode sh install.sh install || status=$?
+            test $status = 1
+          done
       # the Linux installer's package lists for each distribution it knows
       - if: runner.os == 'Linux'
         run: |
