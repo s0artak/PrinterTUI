@@ -24,6 +24,9 @@ pkgs=(git gcc cups cups-filters poppler avahi nss-mdns)
 command -v cargo >/dev/null || pkgs+=(rust)
 sudo pacman -S --needed --noconfirm "${pkgs[@]}"
 sudo systemctl enable --now cups.socket avahi-daemon.service
+# nss-mdns does nothing until nsswitch.conf names it, which is left to you (as install.sh does)
+grep -q '^hosts:.*mdns' /etc/nsswitch.conf ||
+	echo "note: to find network printers by name, put mdns_minimal [NOTFOUND=return] before resolve and dns on the hosts line of /etc/nsswitch.conf" >&2
 
 src=${BASH_SOURCE[0]:-}
 if [[ -f $src ]] && dir=$(git -C "$(dirname "$src")" rev-parse --show-toplevel 2>/dev/null); then
