@@ -30,7 +30,25 @@ pub const PER_SHEET: [u32; 6] = [1, 2, 4, 6, 9, 16];
 pub const SCALES: [u32; 9] = [25, 50, 75, 90, 100, 110, 125, 150, 200];
 
 fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
-    let child = Command::new(cmd).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("{cmd}: {e}"))?;
+    run_env(cmd, args, &[])
+}
+
+/// `run` for a tool whose output is read, not shown: in the C locale, as CUPS translates its
+/// messages ("la id solicitada es ...", "1024 octets") and the parsing expects English.
+#[cfg(unix)]
+fn run_c(cmd: &str, args: &[&str]) -> Result<String, String> {
+    run_env(cmd, args, &[("LC_ALL", "C.UTF-8")])
+}
+
+fn run_env(cmd: &str, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
+    let child = Command::new(cmd)
+        .args(args)
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{cmd}: {e}"))?;
     let pid = child.id();
     CHILDREN.lock().unwrap().push(pid);
     let out = child.wait_with_output();
@@ -517,14 +535,36 @@ pub fn stop_all() {
     let _ = std::fs::remove_dir_all(scan_dir());
 }
 
-/// "request id is P-12 (1 file(s))" -> "P-12".
+/// The job id in what `submit` printed: "request id is P-12 (1 file(s))" -> "P-12". CUPS says it
+/// in the user's language ("la id solicitada es P-12 ...", "请求 ID 为 P-12 ..."), so after the
+/// English form, the first word shaped like a CUPS job id (queue-number) counts.
 pub fn job_id(lp_out: &str) -> Option<&str> {
-    lp_out.strip_prefix("request id is ")?.split_whitespace().next()
+    if let Some(rest) = lp_out.strip_prefix("request id is ") {
+        return rest.split_whitespace().next();
+    }
+    lp_out.split_whitespace().find(|w| w.rsplit_once('-').is_some_and(|(queue, n)| !queue.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
 }
 
 /// Printer name for a network printer at `host`: printer_192_168_1_46.
 pub fn queue_name(host: &str) -> String {
     format!("printer_{}", host.replace(|c: char| !c.is_ascii_alphanumeric(), "_"))
+}
+
+/// "host:port" with the host as an address this app can connect to (see `resolve_host`).
+fn reachable(authority: &str) -> Result<String, String> {
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !h.ends_with(']') && !h.contains(':') && p.bytes().all(|b| b.is_ascii_digit()) => (h, Some(p)),
+        _ => (authority, None),
+    };
+    let ip = resolve_host(host).ok_or(format!("{host} cannot be found on the network"))?;
+    Ok(port.map_or(ip.clone(), |p| format!("{ip}:{p}")))
+}
+
+/// A URL with its host made reachable (see `resolve_host`): http://HP.local/eSCL -> http://192.168.1.46/eSCL.
+fn reachable_url(url: &str) -> Result<String, String> {
+    let Some((scheme, rest)) = url.split_once("://") else { return Ok(url.to_string()) };
+    let (authority, path) = rest.find('/').map_or((rest, ""), |i| (&rest[..i], &rest[i..]));
+    Ok(format!("{scheme}://{}{path}", reachable(authority)?))
 }
 
 /// ("ipp", "192.168.1.46") from "ipp://192.168.1.46/ipp/print".
@@ -551,6 +591,8 @@ pub fn ipp_attributes(url: &str, names: &[&str]) -> Result<IppAttributes, String
     let (_, rest) = url.split_once("://").ok_or(format!("Bad printer address: {url}"))?;
     let (authority, path) = rest.find('/').map_or((rest, "/ipp/print"), |i| (&rest[..i], &rest[i..]));
     let authority = if authority.contains(':') { authority.to_string() } else { format!("{authority}:631") };
+    // the printer is asked by its address; the printer-uri keeps its name
+    let address = reachable(&authority)?;
     let mut body = vec![1, 1, 0, 0x0B, 0, 0, 0, 1, 0x01];
     let mut attr = |tag: u8, name: &str, value: &[u8]| {
         body.push(tag);
@@ -567,7 +609,7 @@ pub fn ipp_attributes(url: &str, names: &[&str]) -> Result<IppAttributes, String
         attr(0x44, if i == 0 { "requested-attributes" } else { "" }, name.as_bytes());
     }
     body.push(0x03);
-    let res = minreq::post(format!("http://{authority}{path}"))
+    let res = minreq::post(format!("http://{address}{path}"))
         .with_header("Content-Type", "application/ipp")
         .with_body(body)
         .with_timeout(3)
@@ -1225,6 +1267,19 @@ fn old_temp_files_go() {
     // page-12 starts with "page-1" too, but is another page
     assert_eq!(left, ["page-12"]);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn job_ids_in_any_language() {
+    assert_eq!(job_id("request id is HP_Tank-12 (1 file(s))"), Some("HP_Tank-12"));
+    // Windows' own line
+    assert_eq!(job_id("request id is 12 (Microsoft Print to PDF)"), Some("12"));
+    // what CUPS prints in Spanish, Portuguese, Russian and Chinese
+    assert_eq!(job_id("la id solicitada es HP_Tank-12 (1 archivo(s))"), Some("HP_Tank-12"));
+    assert_eq!(job_id("id de requisição é Office-Laser-13 (1 arquivo(s))"), Some("Office-Laser-13"));
+    assert_eq!(job_id("id запроса HP_Tank-14 (1 файл(ов))"), Some("HP_Tank-14"));
+    assert_eq!(job_id("请求 ID 为 HP_Tank-15 (1 个文件)"), Some("HP_Tank-15"));
+    assert_eq!(job_id("lp: error - no default destination available."), None);
 }
 
 #[test]

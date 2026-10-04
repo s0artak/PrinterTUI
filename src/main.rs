@@ -220,10 +220,15 @@ fn main() -> std::io::Result<()> {
     let mut app = App::new(file, tab);
     app.graphics = detect_graphics();
     app.set_printers(printers());
-    if let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) {
-        for (k, v) in parse_config(&text) {
-            app.apply(k, v);
-        }
+    let config = config_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    for (k, v) in parse_config(&config) {
+        app.apply(k, v);
+    }
+    // before any paper is chosen, the one the printer (or the system) is set up for: Letter in the US
+    if !parse_config(&config).iter().any(|(k, _)| *k == "paper")
+        && let Some(paper) = app.printers.get(app.printer).and_then(|p| default_paper(p))
+    {
+        app.paper = PAPERS.iter().position(|p| *p == paper).unwrap_or(app.paper);
     }
     // set by the installer from the language picked in its menu
     app.apply_settings();
@@ -646,13 +651,19 @@ impl App {
     fn find_printers(&mut self) {
         self.spawn(t().searching_printers, || {
             let found = discover();
-            Box::new(move |app: &mut App| {
-                if found.is_empty() {
-                    app.status = t().no_net_printers.into();
-                    app.mode = Mode::Address(String::new());
-                } else {
+            Box::new(move |app: &mut App| match found {
+                Ok(found) if !found.is_empty() => {
                     app.status = String::new();
                     app.mode = Mode::Pick(found, ListState::default().with_selected(Some(0)));
+                }
+                // none found, or the system would not say: a printer can still be added by its address
+                Ok(_) => {
+                    app.status = t().no_net_printers.into();
+                    app.mode = Mode::Address(String::new());
+                }
+                Err(e) => {
+                    app.status = failed(e);
+                    app.mode = Mode::Address(String::new());
                 }
             })
         });

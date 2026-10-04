@@ -13,8 +13,8 @@ const NETWORK: [&str; 6] = ["ipp", "ipps", "socket", "lpd", "http", "https"];
 
 /// Configured printers, default printer first.
 pub fn printers() -> Vec<String> {
-    let mut list: Vec<String> = run("lpstat", &["-e"]).unwrap_or_default().lines().map(str::to_string).collect();
-    if let Some(def) = run("lpstat", &["-d"]).ok().and_then(|s| s.rsplit(": ").next().map(str::to_string))
+    let mut list: Vec<String> = run_c("lpstat", &["-e"]).unwrap_or_default().lines().map(str::to_string).collect();
+    if let Some(def) = run_c("lpstat", &["-d"]).ok().and_then(|s| s.rsplit(": ").next().map(str::to_string))
         && let Some(i) = list.iter().position(|p| *p == def)
     {
         list.swap(0, i);
@@ -29,8 +29,10 @@ pub fn printer_label(queue: &str, lpoptions: &str) -> String {
     let info = opt("printer-info").filter(|i| !i.is_empty() && i != queue);
     let model = opt("printer-make-and-model").map(|m| m.trim_end_matches(" - IPP Everywhere").to_string());
     let name = info.or(model).unwrap_or_else(|| queue.to_string());
-    match opt("device-uri").as_deref().and_then(uri_host) {
-        Some((scheme, host)) if NETWORK.contains(&scheme) => format!("{name} ({host})"),
+    let uri = opt("device-uri").unwrap_or_default();
+    match uri_host(&uri) {
+        // a Bonjour service name is no address to show
+        Some((scheme, host)) if NETWORK.contains(&scheme) && service_name(&uri).is_none() => format!("{name} ({host})"),
         _ => name,
     }
 }
@@ -50,9 +52,12 @@ fn lpoption(lpoptions: &str, key: &str) -> Option<String> {
 pub fn printer_state(queue: &str) -> PrinterState {
     let opts = run("lpoptions", &["-p", queue]).unwrap_or_default();
     let uri = lpoption(&opts, "device-uri").unwrap_or_default();
-    // a printer macOS added has a Bonjour name: its address, to ask it directly
-    let uri = if uri.starts_with("dnssd://") { bonjour_uri(&uri).unwrap_or(uri) } else { uri };
-    if !matches!(uri_host(&uri), Some(("ipp" | "ipps" | "http", _))) {
+    // a printer known by its Bonjour name (macOS adds them as dnssd://, CUPS sets up the ones it
+    // finds as ipps://Name._ipps._tcp.local./): its address, to ask it directly
+    let uri = if service_name(&uri).is_some() { bonjour_uri(&uri).unwrap_or(uri) } else { uri };
+    // a name that cannot be looked up says nothing about the printer itself
+    let reachable = uri_host(&uri).is_some_and(|(scheme, host)| matches!(scheme, "ipp" | "ipps" | "http") && service_name(&uri).is_none() && resolve_host(host).is_some());
+    if !reachable {
         return cups_state(&opts);
     }
     ipp_attributes(&uri, &STATE_ATTRIBUTES).map_or_else(
@@ -78,6 +83,56 @@ pub fn printer_labels(queues: &[String]) -> Vec<String> {
     queues.iter().map(|q| printer_label(q, &run("lpoptions", &["-p", q]).unwrap_or_default())).collect()
 }
 
+/// Names Avahi announces (HP4A8B2C.local) as addresses. The Linux release is a static binary whose
+/// resolver only knows DNS and /etc/hosts, so it asks the system's own tools, which go through
+/// nss-mdns: glibc's getent, else Avahi. The answers are kept. Other names, and every name on
+/// macOS (its resolver knows Bonjour), are left as they are; None when a .local name is not found.
+pub fn resolve_host(host: &str) -> Option<String> {
+    static KNOWN: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    let name = host.trim_end_matches('.');
+    if cfg!(target_os = "macos") || !name.to_ascii_lowercase().ends_with(".local") {
+        return Some(host.to_string());
+    }
+    if let Some((_, ip)) = KNOWN.lock().unwrap().iter().find(|(n, _)| n == name) {
+        return Some(ip.clone());
+    }
+    let ipv4 = |s: &str| s.parse::<std::net::Ipv4Addr>().is_ok().then(|| s.to_string());
+    // getent: "192.168.1.46  STREAM HP4A8B2C.local"; avahi: "HP4A8B2C.local\t192.168.1.46"
+    let ip = run("getent", &["ahostsv4", name])
+        .ok()
+        .and_then(|out| out.split_whitespace().next().and_then(ipv4))
+        .or_else(|| run("avahi-resolve-host-name", &["-4", name]).ok().and_then(|out| out.split_whitespace().nth(1).and_then(ipv4)))?;
+    KNOWN.lock().unwrap().push((name.to_string(), ip.clone()));
+    Some(ip)
+}
+
+/// The paper the queue is set up for (CUPS' media default), else the system's (/etc/papersize,
+/// LC_PAPER), as one of PAPERS: where to start before one is chosen.
+pub fn default_paper(queue: &str) -> Option<&'static str> {
+    let media = lpoption(&run("lpoptions", &["-p", queue]).unwrap_or_default(), "media");
+    let system = || {
+        std::fs::read_to_string("/etc/papersize").ok().map(|s| s.trim().to_string()).or_else(|| {
+            // "height=279 width=216" is Letter, "height=297 width=210" A4
+            let paper = run("locale", &["-k", "LC_PAPER"]).ok()?;
+            match paper.lines().find_map(|l| l.strip_prefix("width="))? {
+                "216" => Some("letter".into()),
+                "210" => Some("a4".into()),
+                _ => None,
+            }
+        })
+    };
+    media.or_else(system).and_then(|m| paper_name(&m))
+}
+
+/// One of PAPERS for a media name: "na_letter_8.5x11in", "iso_a4_210x297mm", "Letter", "a4".
+fn paper_name(media: &str) -> Option<&'static str> {
+    let m = media.to_ascii_lowercase();
+    PAPERS.iter().copied().find(|p| {
+        let p = p.to_ascii_lowercase();
+        m == p || m.starts_with(&format!("na_{p}_")) || m.starts_with(&format!("iso_{p}_"))
+    })
+}
+
 /// Sends a job with `lp`, returns its "request id is ..." line.
 pub fn submit(job: &Job) -> Result<String, String> {
     let args = lp_args(job);
@@ -87,12 +142,16 @@ pub fn submit(job: &Job) -> Result<String, String> {
 
 /// True while the job is still pending, held or printing.
 pub fn job_active(id: &str) -> bool {
-    run("lpstat", &["-W", "not-completed", "-o"]).is_ok_and(|s| s.lines().any(|l| l.split_whitespace().next() == Some(id)))
+    run_c("lpstat", &["-W", "not-completed", "-o"]).is_ok_and(|s| s.lines().any(|l| l.split_whitespace().next() == Some(id)))
 }
 
 /// Unfinished jobs on all printers as (job number, "file  size  position") for the queue popup.
+/// lpq names the files; where it is missing (Debian puts it in cups-bsd), lpstat lists the jobs.
 pub fn queue() -> Vec<(String, String)> {
-    parse_lpq(&run("lpq", &["-a"]).unwrap_or_default())
+    match run_c("lpq", &["-a"]) {
+        Ok(text) => parse_lpq(&text),
+        Err(_) => parse_lpstat_jobs(&run_c("lpstat", &["-W", "not-completed", "-o"]).unwrap_or_default()),
+    }
 }
 
 /// `lpq -a` rows: "1st  spartak  8  my file.txt  1024 bytes" (the header and "no entries" are skipped).
@@ -100,9 +159,22 @@ pub fn parse_lpq(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|l| {
             let w: Vec<&str> = l.split_whitespace().collect();
-            let [rank, owner, job, ref file @ .., size, "bytes"] = w[..] else { return None };
+            let [rank, owner, job, ref file @ .., size, _unit] = w[..] else { return None };
             job.parse::<u32>().ok()?;
-            Some((job.to_string(), format!("{}  ({owner}, {} KB, {rank})", file.join(" "), size.parse::<u64>().unwrap_or(0).div_ceil(1024))))
+            let size = size.parse::<u64>().ok()?;
+            Some((job.to_string(), format!("{}  ({owner}, {} KB, {rank})", file.join(" "), size.div_ceil(1024))))
+        })
+        .collect()
+}
+
+/// `lpstat -o` rows: "HP_Tank-12  ana  20480  Sat 04 Oct 2026 10:00:00 AM CEST".
+fn parse_lpstat_jobs(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            let [job, owner, size, ..] = w[..] else { return None };
+            let size = size.parse::<u64>().ok()?;
+            Some((job.to_string(), format!("{job}  ({owner}, {} KB)", size.div_ceil(1024))))
         })
         .collect()
 }
@@ -111,18 +183,36 @@ pub fn cancel_job(id: &str) -> Result<(), String> {
     run("cancel", &[id]).map(drop)
 }
 
-/// Network printers found by `lpinfo -v`, as (queue name, IPP uri) ready for `lpadmin -m everywhere`.
-pub fn discover() -> Vec<(String, String)> {
-    let mut found: Vec<(String, String)> =
-        run("lpinfo", &["-v"]).unwrap_or_default().lines().filter_map(|l| l.split_whitespace().nth(1)).filter_map(to_ipp).collect();
+/// A CUPS admin tool: on the PATH, else in /usr/sbin, which Debian and openSUSE keep off a user's PATH.
+fn tool(cmd: &str) -> String {
+    let on_path = std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(cmd).is_file()));
+    if on_path { cmd.into() } else { format!("/usr/sbin/{cmd}") }
+}
+
+/// Network printers found by `lpinfo -v` that have no queue yet, as (queue name, IPP uri) ready
+/// for `lpadmin -m everywhere`. CUPS lets only its admin group list devices; its refusal is the error.
+pub fn discover() -> Result<Vec<(String, String)>, String> {
+    let schemes = "dnssd,ipp,ipps,lpd,snmp,socket";
+    let devices = run_c(&tool("lpinfo"), &["--timeout", "5", "--include-schemes", schemes, "-v"])?;
+    let queued = run_c("lpstat", &["-v"]).unwrap_or_default();
+    let mut found: Vec<(String, String)> = devices
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .filter(|uri| !queued.lines().any(|q| q.ends_with(&format!(" {uri}"))))
+        .filter_map(to_ipp)
+        .collect();
     found.sort();
     found.dedup_by(|a, b| a.0 == b.0);
-    found
+    Ok(found)
 }
 
 fn to_ipp(uri: &str) -> Option<(String, String)> {
     let (scheme, host) = uri_host(uri)?;
-    let name = queue_name(host);
+    // a Bonjour service makes a readable queue name: HP_Smart_Tank_5100_series_4A8B2C
+    let name = match service_name(uri) {
+        Some(service) => service.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join("_"),
+        None => queue_name(host),
+    };
     match scheme {
         "ipp" | "ipps" | "dnssd" => Some((name, uri.to_string())),
         // ponytail: assumes the standard IPP Everywhere path; edit the queue with lpadmin if a printer differs
@@ -131,10 +221,31 @@ fn to_ipp(uri: &str) -> Option<(String, String)> {
     }
 }
 
-/// Interactive: sudo may ask for a password, so the terminal must be in normal mode.
+/// Adds a printer with CUPS' driverless IPP Everywhere setup. Members of CUPS' admin group
+/// (lpadmin on Debian and Ubuntu, wheel or sys elsewhere) need no password; anyone else is asked
+/// for it by sudo (or doas, run0, pkexec), so the terminal must be in normal mode.
 pub fn add_printer(name: &str, uri: &str) -> Result<(), String> {
-    let ok = Command::new("sudo").args(["lpadmin", "-p", name, "-E", "-v", uri, "-m", "everywhere"]).status().map_err(|e| e.to_string())?.success();
-    if ok { Ok(()) } else { Err(format!("lpadmin failed for {uri}")) }
+    let lpadmin = tool("lpadmin");
+    let args = ["-p", name, "-E", "-v", uri, "-m", "everywhere"];
+    match run_c(&lpadmin, &args) {
+        Ok(_) => return Ok(()),
+        Err(e) if !e.contains("Forbidden") && !e.contains("Unauthorized") && !e.contains("not authorized") => return Err(e),
+        Err(_) => {}
+    }
+    let on_path = |cmd: &str| std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(cmd).is_file()));
+    let helper = ["sudo", "doas", "run0", "pkexec"].into_iter().find(|h| on_path(h)).ok_or("Adding a printer needs administrator rights, and there is no sudo")?;
+    // the password is asked on the terminal; lpadmin's own message is kept for the status
+    let out = Command::new(helper)
+        .arg(&lpadmin)
+        .args(args)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("{helper}: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(if why.is_empty() { format!("lpadmin failed for {uri}") } else { why })
 }
 
 /// macOS: the system's file dialog (cancelling it picks nothing).
@@ -189,6 +300,9 @@ pub fn lp_args(job: &Job) -> Vec<String> {
         format!("media={}", job.paper),
         "-o".into(),
         format!("print-color-mode={}", if job.color { "color" } else { "monochrome" }),
+        // one side, whatever the queue's default: double-sided is done by turning the stack
+        "-o".into(),
+        "sides=one-sided".into(),
     ];
     if let Some(p) = &job.pages {
         a.extend(["-o".into(), format!("page-ranges={p}")]);
@@ -303,17 +417,20 @@ pub fn render_page(pdf: &str, page: u32, png: &str) -> Result<(), String> {
     }
 }
 
-/// Hosts of the network printers in CUPS, to try as eSCL scanners.
+/// Hosts of the network printers in CUPS, to try as eSCL scanners, as addresses this app can reach.
 pub fn printer_hosts() -> Vec<String> {
-    let mut hosts: Vec<String> = run("lpstat", &["-v"])
+    let mut hosts: Vec<String> = run_c("lpstat", &["-v"])
         .unwrap_or_default()
         .lines()
         .filter_map(|l| {
             let uri = l.rsplit(' ').next()?;
-            // printers macOS adds itself have a Bonjour name instead of an address
-            let uri = if uri.starts_with("dnssd://") { bonjour_uri(uri)? } else { uri.to_string() };
+            // printers known by a Bonjour name instead of an address
+            let uri = if service_name(uri).is_some() { bonjour_uri(uri)? } else { uri.to_string() };
             let (scheme, host) = uri_host(&uri)?;
-            NETWORK.contains(&scheme).then(|| host.to_string())
+            if !NETWORK.contains(&scheme) {
+                return None;
+            }
+            resolve_host(host)
         })
         .collect();
     hosts.sort();
@@ -328,7 +445,7 @@ static BONJOUR: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// (dnssd://Name._ipps._tcp.local./?uuid=...), as macOS adds printers: CUPS' ippfind looks up
 /// every printer on the network at once, and the answers are kept.
 fn bonjour_uri(uri: &str) -> Option<String> {
-    let name = dnssd_name(uri)?;
+    let name = service_name(uri)?;
     let known = |list: &[(String, String)]| list.iter().find(|(n, _)| *n == name).map(|(_, u)| u.clone());
     if let Some(found) = known(&BONJOUR.lock().unwrap()) {
         return Some(found);
@@ -339,9 +456,15 @@ fn bonjour_uri(uri: &str) -> Option<String> {
     known(&list)
 }
 
-/// The Bonjour service name in a dnssd:// printer address, with its %20-style escapes decoded.
-fn dnssd_name(uri: &str) -> Option<String> {
-    let service = uri.strip_prefix("dnssd://")?.split(['/', '?']).next()?;
+/// The Bonjour service name in a printer address that has one instead of a host, with its
+/// %20-style escapes decoded: dnssd://Name._ipps._tcp.local./?uuid=... as macOS adds printers,
+/// ipps://Name._ipps._tcp.local./ as CUPS sets up the printers it finds itself.
+fn service_name(uri: &str) -> Option<String> {
+    let (scheme, rest) = uri.split_once("://")?;
+    if !matches!(scheme, "dnssd" | "ipp" | "ipps") {
+        return None;
+    }
+    let service = rest.split(['/', '?']).next()?;
     let name = &service[..service.find("._ipp")?];
     let bytes = name.as_bytes();
     let mut out = Vec::new();
@@ -539,8 +662,8 @@ fn macos_prints_heic_photos() {
 #[test]
 fn bonjour_printers() {
     let uri = "dnssd://HP%20Smart%20Tank%205100%20series%20%5B4A8B2C%5D._ipps._tcp.local./?uuid=1234";
-    assert_eq!(dnssd_name(uri).as_deref(), Some("HP Smart Tank 5100 series [4A8B2C]"));
-    assert_eq!(dnssd_name("ipp://192.168.1.46/ipp/print"), None);
+    assert_eq!(service_name(uri).as_deref(), Some("HP Smart Tank 5100 series [4A8B2C]"));
+    assert_eq!(service_name("ipp://192.168.1.46/ipp/print"), None);
     let found = "HP Smart Tank 5100 series [4A8B2C]|||ipps://HP4A8B2C.local:631/ipp/print\nbroken line\nx|||nothing";
     let answers = bonjour_answers(found);
     assert_eq!(answers, [("HP Smart Tank 5100 series [4A8B2C]".to_string(), "ipps://HP4A8B2C.local:631/ipp/print".to_string())]);
@@ -555,6 +678,41 @@ fn documents_folder_in_the_desktop_language() {
     assert_eq!(xdg_documents("XDG_DOCUMENTS_DIR=\"/srv/docs\"", home), Some("/srv/docs".into()));
     assert_eq!(xdg_documents("XDG_DOCUMENTS_DIR=\"$HOME/\"", home), None);
     assert_eq!(xdg_documents("", home), None);
+}
+
+#[test]
+fn jobs_and_options_cups_sees() {
+    // lpq's size unit is translated (octets, Bytes, байт); the number is what counts
+    let fr = "Rang    Propriétaire Tâche    Fichier(s)       Taille totale\nactive  ana     12      rapport.pdf      20480 octets";
+    assert_eq!(parse_lpq(fr), [("12".to_string(), "rapport.pdf  (ana, 20 KB, active)".to_string())]);
+    // where lpq is missing, lpstat lists the jobs
+    let jobs = "HP_Tank-12              ana          20480   Sat 04 Oct 2026 10:00:00 AM CEST";
+    assert_eq!(parse_lpstat_jobs(jobs), [("HP_Tank-12".to_string(), "HP_Tank-12  (ana, 20 KB)".to_string())]);
+    // one side, whatever the queue's default
+    let job = Job { printer: "Q".into(), file: "f.pdf".into(), color: false, paper: "A4", pages: None, reverse: false, copies: 1, collate: true, per_sheet: 1 };
+    assert!(lp_args(&job).windows(2).any(|w| w == ["-o", "sides=one-sided"]));
+    // the paper a queue or the system is set up for
+    assert_eq!(paper_name("na_letter_8.5x11in"), Some("Letter"));
+    assert_eq!(paper_name("iso_a4_210x297mm"), Some("A4"));
+    assert_eq!(paper_name("letter"), Some("Letter"));
+    assert_eq!(paper_name("na_legal_8.5x14in"), Some("Legal"));
+    assert_eq!(paper_name("om_small-photo_100x150mm"), None);
+    // names that are not .local are left to the resolver
+    assert_eq!(resolve_host("192.168.1.46").as_deref(), Some("192.168.1.46"));
+}
+
+#[test]
+fn printers_cups_sets_up_by_itself() {
+    // a driverless printer CUPS found: its device-uri holds the Bonjour service name, not a host
+    let uri = "ipps://HP%20Smart%20Tank%205100%20series%20%5B4A8B2C%5D._ipps._tcp.local./";
+    assert_eq!(service_name(uri).as_deref(), Some("HP Smart Tank 5100 series [4A8B2C]"));
+    let opts = format!("device-uri={uri} printer-make-and-model='HP\\ Smart\\ Tank\\ 5100'");
+    assert_eq!(printer_label("HP_Smart_Tank", &opts), "HP Smart Tank 5100");
+    assert_eq!(printer_label("q", "device-uri=ipp://192.168.1.46/ipp/print printer-info=Tank"), "Tank (192.168.1.46)");
+    // adding one found by Bonjour gives a readable queue name
+    let dnssd = "dnssd://HP%20Smart%20Tank%205100%20series%20%5B4A8B2C%5D._ipp._tcp.local./?uuid=1";
+    assert_eq!(to_ipp(dnssd).map(|(name, _)| name).as_deref(), Some("HP_Smart_Tank_5100_series_4A8B2C"));
+    assert_eq!(to_ipp("socket://192.168.1.46").map(|(name, uri)| (name, uri)), Some(("printer_192_168_1_46".into(), "ipp://192.168.1.46/ipp/print".into())));
 }
 
 #[test]

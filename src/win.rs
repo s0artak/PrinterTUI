@@ -20,6 +20,16 @@ use windows::Win32::Storage::Xps::{AbortDoc, DOCINFOW, EndDoc, EndPage, StartDoc
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
+/// Windows' own resolver finds .local names (mDNS), so every name is left as it is.
+pub fn resolve_host(host: &str) -> Option<String> {
+    Some(host.to_string())
+}
+
+/// No paper is suggested from the printer: Windows starts with the first of PAPERS.
+pub fn default_paper(_queue: &str) -> Option<&'static str> {
+    None
+}
+
 /// The user's first display language, like "es-ES".
 pub fn system_language() -> String {
     windows::Globalization::ApplicationLanguages::Languages().and_then(|l| l.GetAt(0)).map(|l| l.to_string()).unwrap_or_default()
@@ -500,9 +510,9 @@ pub fn cancel_job(id: &str) -> Result<(), String> {
 
 /// IPP printers announced on the network (mDNS `_ipp._tcp`) that are not installed yet,
 /// as (name, IPP uri) for Add-Printer.
-pub fn discover() -> Vec<(String, String)> {
-    let Ok(mdns) = mdns_sd::ServiceDaemon::new() else { return Vec::new() };
-    let Ok(events) = mdns.browse("_ipp._tcp.local.") else { return Vec::new() };
+pub fn discover() -> Result<Vec<(String, String)>, String> {
+    let mdns = mdns_sd::ServiceDaemon::new().map_err(|e| e.to_string())?;
+    let events = mdns.browse("_ipp._tcp.local.").map_err(|e| e.to_string())?;
     let known = printer_hosts();
     let mut found = Vec::new();
     let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -520,7 +530,7 @@ pub fn discover() -> Vec<(String, String)> {
     let _ = mdns.shutdown();
     found.sort();
     found.dedup();
-    found
+    Ok(found)
 }
 
 /// Adds an IPP printer with Windows' own IPP driver; Windows asks for administrator rights.
