@@ -6,17 +6,26 @@ on:
     tags: ["v*"]
   pull_request:
 
+# only the release job writes (it publishes the release)
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
   build:
     strategy:
       fail-fast: false
       matrix:
         include:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, name: printertui-linux-x86_64, test: true }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: printertui-linux-aarch64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: printertui-linux-aarch64, test: true }
           - { os: macos-latest, target: aarch64-apple-darwin, name: printertui-macos-aarch64, test: true }
           - { os: macos-latest, target: x86_64-apple-darwin, name: printertui-macos-x86_64, test: true }
           # the tests print for real to "Microsoft Print to PDF"
@@ -28,8 +37,10 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v7
-      - run: rustup target add ${{ matrix.target }}
+      - run: rustup target add ${{ matrix.target }} && rustup component add clippy
       - run: cargo build --release --target ${{ matrix.target }}
+      # the code each system builds on its own (unix.rs, win.rs, macOS parts) is linted there
+      - run: cargo clippy --release --all-targets --target ${{ matrix.target }} -- -D warnings
       # the installers: syntax, and the speech bubble's text measuring with this system's awk / PowerShell
       - if: runner.os != 'Windows'
         run: |
@@ -46,6 +57,14 @@ jobs:
       # the macOS install as it runs from curl | sh, without changing anything
       - if: runner.os == 'macOS'
         run: PRINTERTUI_PREVIEW=fresh sh install.sh install
+      # the Linux installer's package lists for each distribution it knows
+      - if: runner.os == 'Linux'
+        run: |
+          sed -n '/^packages() {/,/^}/p' install.sh > packages.sh
+          . ./packages.sh
+          for pm in pacman apt dnf zypper; do test -n "$(packages $pm base)"; test -n "$(packages $pm extras)"; done
+          packages apt base | grep -q poppler-utils
+          packages dnf extras | grep -q tesseract
       - if: runner.os == 'Windows'
         shell: powershell
         run: |
@@ -54,6 +73,15 @@ jobs:
           $source = [IO.File]::ReadAllText("$PWD\install.ps1", [Text.Encoding]::UTF8)
           $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$null, [ref]$errors)
           if ($errors) { $errors; exit 1 }
+          # the whole install, without changing anything, as `irm | iex` runs it; it must leave
+          # the PowerShell session as it was
+          $before = $ErrorActionPreference
+          foreach ($mode in 'fresh', 'installed', 'jam') {
+            $env:PRINTERTUI_PREVIEW = $mode
+            Invoke-Expression $source
+          }
+          Remove-Item Env:\PRINTERTUI_PREVIEW
+          if ($ErrorActionPreference -ne $before -or (Get-Command Talk -ErrorAction SilentlyContinue) -or (Get-Variable S -ErrorAction SilentlyContinue)) { 'the installer changed the session'; exit 1 }
           $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -in 'Cols', 'Wrap', 'Synth' }, $true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
           foreach ($name in 'boot', 'blip', 'print', 'done', 'jam', 'bye') {
             $wav = Synth $name 50
@@ -75,12 +103,18 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs: [lint, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
+          path: dist
           merge-multiple: true
-      - run: gh release create ${{ github.ref_name }} printertui-* --repo ${{ github.repository }} --title ${{ github.ref_name }} --generate-notes
+      # a Scoop manifest for this release: scoop install https://github.com/<repo>/releases/latest/download/printertui.json
+      - run: sh packaging/scoop.sh "${GITHUB_REF_NAME#v}" "${{ github.repository }}" dist > dist/printertui.json
+      - run: gh release create ${{ github.ref_name }} dist/printertui-* dist/printertui.json --repo ${{ github.repository }} --title ${{ github.ref_name }} --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

@@ -4,16 +4,16 @@ Terminal app to print and scan on Linux, macOS and Windows.
 
 [![PrinterTUI demo](docs/demo.gif)](docs/demo.mp4)
 
-- Prints PDFs, photos (JPEG, PNG; HEIC and other formats on macOS), text files, and other documents through LibreOffice.
+- Prints PDFs, photos (JPEG, PNG, BMP, GIF, TIFF, WebP; HEIC and AVIF on macOS and Windows), text files, and other documents through LibreOffice.
 - Preview of the pages as they will print; scale 25-200%, pages per sheet, copies, paper, color.
 - Manual double-sided printing for printers without a duplexer.
-- Scans from network printers (eSCL) or SANE; saves PDF, searchable PDF or PNG; copies (scan and print).
+- Scans from network printers (eSCL), SANE or Windows; saves PDF, searchable PDF (in any language) or PNG; copies (scan and print).
 - Shows the printer's ink levels and problems (out of paper, jam, offline).
 - 10 languages. Settings in `~/.config/printertui/config` (`%APPDATA%\printertui\config` on Windows).
 
 ## Install
 
-Arch Linux or macOS:
+Linux (Arch, Debian, Ubuntu, Fedora, openSUSE and their relatives) or macOS:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.sh | sh
@@ -25,11 +25,13 @@ Windows 10/11, in PowerShell:
 irm https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.ps1 | iex
 ```
 
+Or with [Scoop](https://scoop.sh): `scoop install https://github.com/s0artak/PrinterTUI/releases/latest/download/printertui.json`.
+
 Run the same command again to update or uninstall (`... | sh -s uninstall` uninstalls directly).
 
 macOS and Windows need nothing else. On Linux the installer adds CUPS. Optional: LibreOffice (other documents), SANE (USB scanners), Tesseract (searchable PDFs on Linux).
 
-Development on Arch: `bash test/dev-setup-arch.sh`. `sh test/installer-preview.sh [fresh|jam|smudge]` runs the installer without changing anything.
+Development on Arch: `bash test/dev-setup-arch.sh`. Before a commit, as CI checks: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`. `sh test/installer-preview.sh [fresh|jam|smudge]` (and `pwsh test/installer-preview.ps1` for Windows' installer) runs the installer without changing anything.
 
 ## Keys
 
@@ -58,3 +60,5 @@ On the Scan tab's Page row:
 | `dd` | Delete |
 
 Double-sided: the front pages print, then flip the stack as shown and press Enter. If the back pages come out in reverse, set Back order to Reversed.
+
+Prints already sent keep printing after you quit; quitting while one is still being sent waits for it (`q` twice quits right away). The Queue button cancels jobs.

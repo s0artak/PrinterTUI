@@ -5,16 +5,26 @@
 # $env:PRINTERTUI_PREVIEW = 'fresh' | 'installed' | 'jam' | 'smudge' plays the menus and animations
 # without changing anything (see test/installer-preview.ps1).
 # Runs through `iex` in the user's own PowerShell: never `exit`, it would close their window.
+# Everything runs inside `& { }`, so its settings ($ErrorActionPreference...), functions and
+# variables stay in there instead of changing the user's session; the state the functions share
+# lives in $S rather than in script-scope variables, which `iex` would leave in the session.
 
+& {
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+# process-wide, so put back at the end (a host without a console, like CI, has no encoding to set)
+$oldProtocol = [Net.ServicePointManager]::SecurityProtocol
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$oldEncoding = $null
+try { $oldEncoding = [Console]::OutputEncoding; [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
 $repo = 's0artak/PrinterTUI'
 $preview = $env:PRINTERTUI_PREVIEW
 $E = [char]27
 $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [IO.Path]::GetTempPath() }
+# where the app keeps its settings (the preview runs where there is no APPDATA too)
+$roaming = if ($env:APPDATA) { $env:APPDATA } else { $base }
+$configFile = Join-Path $roaming 'printertui\config'
 $dir = Join-Path $base 'Programs\PrinterTUI'
 $exe = Join-Path $dir 'printertui.exe'
 $startMenu = [Environment]::GetFolderPath('Programs')
@@ -44,14 +54,14 @@ function Say([string]$t) { W "  $E[38;5;69m▸$E[0m $t`n" }
 function Talk([string]$t, [switch]$Pet, [int]$Color = 69) {
     if (-not $tty) { W "`n  $t`n`n"; return }
     $cols = try { [Console]::WindowWidth } catch { 80 }
-    $left = if ($Pet -and $script:drawn -and $cols -ge 64) { 24 } else { 2 }
+    $left = if ($Pet -and $S.drawn -and $cols -ge 64) { 24 } else { 2 }
     $lines = Wrap $t ([math]::Min(60, $cols - $left - 5))
     $w = ($lines | Measure-Object -Property Cols -Maximum).Maximum
     $c = "$E[38;5;$($Color)m"
     $go = "$E[$($left + 1)G"
     $bar = [string]::new([char]0x2500, $w + 2)
     # beside the printer: back up to its second row, so the tail meets its lights
-    if ($left -gt 2) { W "$E[$($script:drawn - 1)A" } else { W "`n" }
+    if ($left -gt 2) { W "$E[$($S.drawn - 1)A" } else { W "`n" }
     W "$go$c$([char]0x256D)$bar$([char]0x256E)$E[0m`n"
     $first = $true
     foreach ($l in $lines) {
@@ -60,31 +70,30 @@ function Talk([string]$t, [switch]$Pet, [int]$Color = 69) {
         $first = $false
     }
     W "$go$c$([char]0x2570)$bar$([char]0x256F)$E[0m`n"
-    if ($left -gt 2 -and $lines.Count + 3 -lt $script:drawn) { W "$E[$($script:drawn - $lines.Count - 3)B" }
+    if ($left -gt 2 -and $lines.Count + 3 -lt $S.drawn) { W "$E[$($S.drawn - $lines.Count - 3)B" }
     W "`n"
-    $script:drawn = 0
+    $S.drawn = 0
 }
 
 # --- sounds: the app's (see src/sound.rs), synthesized here, as there are no files to ship ---
 # The app's volume when it has one (an update keeps it, muted too), else its gentle default.
 $volume = 50
-$configFile = Join-Path $env:APPDATA 'printertui\config'
 if (Test-Path $configFile) {
     $found = [IO.File]::ReadAllLines($configFile) | Select-String '^volume=(\d+)$' | Select-Object -Last 1
     if ($found) { $volume = [int]$found.Matches[0].Groups[1].Value }
 }
-$script:sounds = @{}
-$script:playing = [System.Collections.ArrayList]::new()
+# what the functions share: rows of art drawn, sounds made and playing, the paper, the frame
+$S = @{ drawn = 0; sounds = @{}; playing = [System.Collections.ArrayList]::new(); paper = $null; n = 0 }
 
 # Plays a sound (boot blip print done jam bye) in the background, when a person is listening.
 function Play([string]$name) {
     if (-not $tty -or $volume -le 0) { return }
     try {
-        if (-not $script:sounds[$name]) { $script:sounds[$name] = Synth $name $volume }
-        $player = [System.Media.SoundPlayer]::new([IO.MemoryStream]::new($script:sounds[$name]))
+        if (-not $S.sounds[$name]) { $S.sounds[$name] = Synth $name $volume }
+        $player = [System.Media.SoundPlayer]::new([IO.MemoryStream]::new($S.sounds[$name]))
         $player.Play()
         # kept alive while it plays
-        [void]$script:playing.Add($player)
+        [void]$S.playing.Add($player)
     } catch { }
 }
 
@@ -219,6 +228,7 @@ $Langs = [ordered]@{
         smudge = 'Smudged page! Something''s off with that download.'
         e_net = 'check your internet connection and run the installer again'
         e_sum = 'the download doesn''t match its checksum, so nothing was installed'
+        e_winget = 'winget is not on this Windows, so LibreOffice was skipped: get it from libreoffice.org'
         put = 'Putting printertui in'
         done = 'Page printed, ink dry, ready to go. Run: printertui'
         rm_cmd = 'Removing the printertui command'
@@ -248,6 +258,7 @@ $Langs = [ordered]@{
         smudge = '页面印花了！这次下载有问题。'
         e_net = '请检查网络连接后重新运行安装程序'
         e_sum = '下载的文件与校验和不符，什么都没有安装'
+        e_winget = '此 Windows 没有 winget，已跳过 LibreOffice：请从 libreoffice.org 下载'
         put = '正在把 printertui 放到'
         done = '页面已打印，墨迹已干，一切就绪。运行：printertui'
         rm_cmd = '正在删除 printertui 命令'
@@ -277,6 +288,7 @@ $Langs = [ordered]@{
         smudge = 'पेज पर धब्बा! इस डाउनलोड में कुछ गड़बड़ है।'
         e_net = 'इंटरनेट कनेक्शन जाँचें और इंस्टॉलर फिर से चलाएँ'
         e_sum = 'डाउनलोड चेकसम से मेल नहीं खाता, इसलिए कुछ भी इंस्टॉल नहीं हुआ'
+        e_winget = 'इस Windows में winget नहीं है, इसलिए LibreOffice छोड़ दिया: libreoffice.org से लें'
         put = 'printertui को यहाँ रखा जा रहा है:'
         done = 'पेज छप गया, स्याही सूख गई, सब तैयार। चलाएँ: printertui'
         rm_cmd = 'printertui कमांड हटाई जा रही है'
@@ -306,6 +318,7 @@ $Langs = [ordered]@{
         smudge = '¡Página emborronada! Algo raro pasa con esa descarga.'
         e_net = 'revisa tu conexión a internet y vuelve a ejecutar el instalador'
         e_sum = 'la descarga no coincide con su checksum, así que no he instalado nada'
+        e_winget = 'este Windows no tiene winget, así que me salto LibreOffice: descárgalo de libreoffice.org'
         put = 'Poniendo printertui en'
         done = 'Página impresa, tinta seca, todo listo. Ejecuta: printertui'
         rm_cmd = 'Quitando el comando printertui'
@@ -335,6 +348,7 @@ $Langs = [ordered]@{
         smudge = 'صفحة ملطّخة! هناك خطب ما في هذا التنزيل.'
         e_net = 'تحقّق من اتصالك بالإنترنت ثم أعد تشغيل المثبّت'
         e_sum = 'الملف المنزّل لا يطابق المجموع الاختباري، لذلك لم يُثبَّت شيء'
+        e_winget = 'لا يوجد winget في Windows هذا، لذا تخطيت LibreOffice: نزّله من libreoffice.org'
         put = 'جارٍ وضع printertui في'
         done = 'طُبعت الصفحة وجفّ الحبر، كل شيء جاهز. شغّل: printertui'
         rm_cmd = 'جارٍ حذف أمر printertui'
@@ -364,6 +378,7 @@ $Langs = [ordered]@{
         smudge = 'Page tachée ! Ce téléchargement a un souci.'
         e_net = 'vérifiez votre connexion internet puis relancez l''installateur'
         e_sum = 'le téléchargement ne correspond pas à sa somme de contrôle, rien n''a été installé'
+        e_winget = 'ce Windows n''a pas winget, LibreOffice est donc ignoré : téléchargez-le sur libreoffice.org'
         put = 'Installation de printertui dans'
         done = 'Page imprimée, encre sèche, tout est prêt. Lancez : printertui'
         rm_cmd = 'Suppression de la commande printertui'
@@ -393,6 +408,7 @@ $Langs = [ordered]@{
         smudge = 'পাতায় দাগ! এই ডাউনলোডে কিছু গোলমাল আছে।'
         e_net = 'ইন্টারনেট সংযোগ দেখে নিন, তারপর ইনস্টলার আবার চালান'
         e_sum = 'ডাউনলোড চেকসামের সাথে মেলেনি, তাই কিছুই ইনস্টল হয়নি'
+        e_winget = 'এই Windows-এ winget নেই, তাই LibreOffice বাদ দিলাম: libreoffice.org থেকে নিন'
         put = 'printertui রাখা হচ্ছে:'
         done = 'পাতা ছাপা হয়েছে, কালি শুকিয়েছে, সব তৈরি। চালান: printertui'
         rm_cmd = 'printertui কমান্ড সরানো হচ্ছে'
@@ -422,6 +438,7 @@ $Langs = [ordered]@{
         smudge = 'Página borrada! Tem algo errado com esse download.'
         e_net = 'verifique sua conexão com a internet e rode o instalador de novo'
         e_sum = 'o download não bate com o checksum, então nada foi instalado'
+        e_winget = 'este Windows não tem winget, então pulei o LibreOffice: baixe em libreoffice.org'
         put = 'Colocando o printertui em'
         done = 'Página impressa, tinta seca, tudo pronto. Execute: printertui'
         rm_cmd = 'Removendo o comando printertui'
@@ -451,6 +468,7 @@ $Langs = [ordered]@{
         smudge = 'Страница смазана! С этой загрузкой что-то не так.'
         e_net = 'проверьте подключение к интернету и запустите установщик снова'
         e_sum = 'загрузка не совпадает с контрольной суммой, поэтому ничего не установлено'
+        e_winget = 'в этом Windows нет winget, поэтому LibreOffice пропущен: скачайте его с libreoffice.org'
         put = 'Кладу printertui в'
         done = 'Страница напечатана, чернила высохли, всё готово. Запуск: printertui'
         rm_cmd = 'Удаляю команду printertui'
@@ -480,6 +498,7 @@ $Langs = [ordered]@{
         smudge = 'Halamannya belepotan! Ada yang aneh dengan unduhan itu.'
         e_net = 'periksa koneksi internet lalu jalankan installer lagi'
         e_sum = 'unduhan tidak cocok dengan checksum-nya, jadi tidak ada yang dipasang'
+        e_winget = 'Windows ini tidak punya winget, jadi LibreOffice dilewati: unduh dari libreoffice.org'
         put = 'Menaruh printertui di'
         done = 'Halaman tercetak, tinta kering, siap dipakai. Jalankan: printertui'
         rm_cmd = 'Menghapus perintah printertui'
@@ -555,16 +574,15 @@ function Render([string[]]$rows, [int]$pad) {
 
 # $n rows of paper out of the slot, two lights, and the indent (2, the printer shakes with 1 and 3);
 # drawn over the previous frame, so the art grows and shrinks with the paper
-$script:drawn = 0
-$script:paper = $Page
+$S.paper = $Page
 function Show([int]$n, [string]$l1, [string]$l2, [int]$pad = 2) {
-    if ($script:drawn) { W "$E[$($script:drawn)A" }
+    if ($S.drawn) { W "$E[$($S.drawn)A" }
     $rows = @($Printer | ForEach-Object { $_.Replace('L', $l1).Replace('M', $l2) })
-    if ($n -gt 0) { $rows += $script:paper[($script:paper.Count - $n)..($script:paper.Count - 1)] }
+    if ($n -gt 0) { $rows += $S.paper[($S.paper.Count - $n)..($S.paper.Count - 1)] }
     if ($n % 2) { $rows += '....................' }
     Render $rows $pad
     W "$E[J"
-    $script:drawn = [int][math]::Floor((11 + $n) / 2)
+    $S.drawn = [int][math]::Floor((11 + $n) / 2)
     Start-Sleep -Milliseconds 90
 }
 
@@ -576,32 +594,32 @@ function Animate([string]$what, $task) {
     if (-not $tty) { return }
     [Console]::CursorVisible = $false
     # finish and jam carry on from where print stopped
-    if ($what -ne 'finish' -and $what -ne 'jam') { $script:drawn = 0 }
+    if ($what -ne 'finish' -and $what -ne 'jam') { $S.drawn = 0 }
     switch ($what) {
         'boot' { Play 'boot'; foreach ($l in 'gg', 'Gg', 'gg', 'Gg', 'GG') { Show 0 $l[0] $l[1] } }
         'print' {
-            $script:n = 0
+            $S.n = 0
             while (-not $task.IsCompleted) {
-                if ($script:n -eq 0) { Play 'print' }
-                Blink $script:n
-                $script:n = ($script:n + 1) % 11
+                if ($S.n -eq 0) { Play 'print' }
+                Blink $S.n
+                $S.n = ($S.n + 1) % 11
             }
         }
         'finish' {
-            for (; $script:n -le 10; $script:n++) { Blink $script:n }
+            for (; $S.n -le 10; $S.n += 1) { Blink $S.n }
             Play 'done'
             Show 10 'G' 'G'
         }
         'jam' {
             Play 'jam'
-            $script:paper = $Jam
+            $S.paper = $Jam
             $i = 0
             foreach ($x in 1, 3, 1, 3, 1, 3, 2, 2, 2, 2) {
                 if ($i % 2) { Show 5 'g' 'g' $x } else { Show 5 'r' 'r' $x }
                 $i++
             }
             Show 5 'r' 'r'
-            $script:paper = $Page
+            $S.paper = $Page
         }
         'unprint' {
             Play 'bye'
@@ -668,8 +686,12 @@ function New-Shortcut([string]$path) {
 function Install-PrinterTUI([bool]$libreoffice, [bool]$onDesktop) {
     if ($libreoffice) {
         Say $T.extras_inst
-        Step 'winget install TheDocumentFoundation.LibreOffice' {
-            winget install -e --id TheDocumentFoundation.LibreOffice --accept-package-agreements --accept-source-agreements
+        # older Windows 10 and LTSC have no winget: say so and install PrinterTUI anyway
+        if (-not $preview -and -not (Get-Command winget -ErrorAction SilentlyContinue)) { Fail $T.e_winget }
+        else {
+            Step 'winget install TheDocumentFoundation.LibreOffice' {
+                winget install -e --id TheDocumentFoundation.LibreOffice --accept-package-agreements --accept-source-agreements
+            }
         }
     }
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
@@ -731,7 +753,6 @@ function Uninstall-PrinterTUI {
     }
     Say $T.rm_cfg
     # settings, and the copy of pdfium the app unpacks
-    $roaming = if ($env:APPDATA) { $env:APPDATA } else { $base }
     $data = @((Join-Path $roaming 'printertui'), (Join-Path $base 'printertui'))
     Step "remove $($data -join ', ')" { Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue }
     W "`n"
@@ -740,7 +761,7 @@ function Uninstall-PrinterTUI {
 
 # the app speaks the language picked in the menu (without a menu it follows the system's)
 function Save-Lang([string]$code) {
-    $conf = Join-Path $env:APPDATA 'printertui\config'
+    $conf = $configFile
     Step "lang=$code > $conf" {
         New-Item -ItemType Directory -Force (Split-Path $conf) | Out-Null
         $lines = @(if (Test-Path $conf) { [IO.File]::ReadAllLines($conf) | Where-Object { $_ -notmatch '^lang=' } })
@@ -805,4 +826,7 @@ try {
     }
 } finally {
     if ($tty) { [Console]::CursorVisible = $true }
+    [Net.ServicePointManager]::SecurityProtocol = $oldProtocol
+    if ($oldEncoding) { try { [Console]::OutputEncoding = $oldEncoding } catch { } }
+}
 }

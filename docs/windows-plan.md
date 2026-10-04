@@ -42,21 +42,40 @@ one code path to test, and ImageMagick, qpdf and curl stop being dependencies th
 
 ## Status
 
-Phases 1–5 are done. CI builds Windows x86_64 and ARM and runs the tests there, including a real
-print through pdfium to "Microsoft Print to PDF". `install.ps1` has the same menus, languages and
-pixel-art printer as `install.sh`; `pwsh test/installer-preview.ps1 [fresh|jam|smudge]` plays it.
+Phases 1–5 are done. CI builds Windows x86_64 and ARM and runs the tests there, including real
+prints through pdfium to "Microsoft Print to PDF" that check how large the pages come out (one
+to a sheet at their own size, two to a sideways sheet filling their halves), and photo decoding
+with Windows' own codecs. `install.ps1` has the same menus, languages and pixel-art printer as
+`install.sh`; `pwsh test/installer-preview.ps1 [fresh|jam|smudge]` plays it, and CI runs it
+to check it leaves the user's PowerShell session as it was.
+
+Fixed after the first review:
+- Pages printed about 2 inches wide: pdfium drew them at 72 dpi and GDI shrank that further.
+- Adding a printer found on the network could run code: its name reached PowerShell inside
+  quotes that a typographic ’ could end. Names and addresses now only reach PowerShell as quoted
+  literals in -EncodedCommand scripts, and a failed Add-Printer says why.
+- Printing froze the screen while pages were drawn; it now runs in the background.
+- Dots per inch across and down taken separately, landscape pages turned on upright paper,
+  2 and 6 pages per sheet on a sideways sheet (as CUPS does), copies made by the driver, color
+  asked for explicitly.
+- HEIC, AVIF, JPEG XR and camera raw photos go through Windows' decoders (HEIC and AVIF need the
+  free Microsoft Store extensions); BMP, GIF, TIFF and WebP are read by the app itself.
+- Paths in quotes ("Copy as path", files dragged onto the terminal) are understood.
+- Scans go to the real Documents folder (OneDrive when its backup is on).
+- Ink levels for the printers the app adds; the file dialog opens in front of the terminal;
+  Sixel images sized for Windows Terminal's 10 x 20 cells.
 
 Known limits:
 - Untested on real hardware: printing to a physical printer, scanning (WinRT), OCR, Add-Printer, the file dialog.
 - Wine can start the exe but its console garbles full-screen apps, and it cannot run PowerShell,
   so neither is a stand-in for Windows.
 - Flags in the language menu show as letters on Windows (no flag emoji in Windows' fonts).
-- Pages per sheet are laid out in a grid without rotating them the way CUPS does.
 - OCR uses the Windows user's language only, not several at once like tesseract.
-- The exe is unsigned: SmartScreen warns on first run until it is signed or well known.
-- The installer needs a release that has the Windows exe (a new tag after merging).
+- Ink levels for network printers Windows added by itself (a "WSD-..." port) are not shown.
+- The exe is unsigned: SmartScreen warns on first run until it is signed or well known
+  (see [windows-packaging.md](windows-packaging.md)).
 
-Later, only if asked for: code signing (SignPath, free for open source), winget/Scoop, a GUI (egui).
+Later, only if asked for: a window of its own instead of the console (below).
 
 ## Checklist on a real Windows machine
 
@@ -68,3 +87,29 @@ Later, only if asked for: code signing (SignPath, free for open source), winget/
 - [ ] Rotate, filter, reorder, save as PDF / PNG / searchable PDF
 - [ ] Print a .docx with LibreOffice installed, clear error without it
 - [ ] Settings remembered between runs
+
+## A window of its own (proposal, not started)
+
+The console is the weak part on Windows: Windows 10 opens the old console host on double-click
+(its fonts lack some symbols, it has no image protocol), Windows Terminal only shows Sixel images
+from version 1.22, and both redraw slowly. The app could open its own window there and keep
+the same screens: ratatui draws into a Buffer, and backends exist that paint that buffer into a
+window ([egui_ratatui](https://github.com/gold-silver-copper/egui_ratatui) on top of
+soft_ratatui, [ratatui-wgpu](https://docs.rs/ratatui-wgpu)).
+
+What is already in place: `App::on_key` takes crossterm key events and `App::mouse` mouse
+events, and `ui::draw` draws a Frame, none of them tied to the terminal. A window build would:
+
+1. Open a window with eframe and egui_ratatui (`--tui` keeps the console version), and turn
+   egui's key and mouse events into the same crossterm events.
+2. Draw the preview as a real image (an egui texture over the preview panel), instead of
+   kitty/Sixel/half blocks.
+3. Use Windows' own fonts for the grid (Cascadia Mono, with Microsoft YaHei, Nirmala UI and
+   Segoe UI as fallbacks for Chinese, Hindi/Bengali and Arabic), so the exe does not grow by a
+   CJK font.
+4. Take files dropped onto the window as the File to print.
+
+Cost: about a week to a usable version (resizing, high-DPI, clipboard, icon, remembering the
+window size), and 3 to 8 MB more in the exe. The file dialog, Add-Printer and printing need no
+change; the console's restore/init around them goes away.
+
