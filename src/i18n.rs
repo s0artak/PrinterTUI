@@ -453,7 +453,7 @@ pub const EN: Texts = Texts {
     graphics_chat: "How pages are drawn. Auto picks the best your terminal can do.",
     folder_chat: "Where scans are saved. i to type a folder.",
     saved_to: "Settings are saved as you change them, in {path}",
-    unix_hints: ["install yazi, lf, ranger, nnn or fzf", "for other scanners install SANE", "sudo may ask for your password"],
+    unix_hints: ["install zenity, kdialog, yazi or fzf", "for other scanners install SANE", "sudo may ask for your password"],
     win_hints: ["the file dialog was closed", "USB scanners need their Windows driver installed", "Windows will ask you to allow it"],
 };
 
@@ -639,7 +639,7 @@ pub const ZH: Texts = Texts {
     graphics_chat: "页面的绘制方式。自动会选择终端支持的最佳方式。",
     folder_chat: "扫描文件的保存位置。按 i 输入文件夹。",
     saved_to: "设置在更改时即保存到 {path}",
-    unix_hints: ["请安装 yazi、lf、ranger、nnn 或 fzf", "要使用其他扫描仪，请安装 SANE", "sudo 可能会要求输入密码"],
+    unix_hints: ["请安装 zenity、kdialog、yazi 或 fzf", "要使用其他扫描仪，请安装 SANE", "sudo 可能会要求输入密码"],
     win_hints: ["文件对话框已关闭", "USB 扫描仪需要安装其 Windows 驱动", "Windows 会请求你的许可"],
 };
 
@@ -825,7 +825,7 @@ pub const HI: Texts = Texts {
     graphics_chat: "पेज कैसे बनें। अपने आप आपके टर्मिनल का सबसे अच्छा तरीका चुनता है।",
     folder_chat: "स्कैन कहाँ सहेजें। फ़ोल्डर लिखने के लिए i।",
     saved_to: "सेटिंग्स बदलते ही यहाँ सहेजी जाती हैं: {path}",
-    unix_hints: ["yazi, lf, ranger, nnn या fzf इंस्टॉल करें", "दूसरे स्कैनरों के लिए SANE इंस्टॉल करें", "sudo आपका पासवर्ड माँग सकता है"],
+    unix_hints: ["zenity, kdialog, yazi या fzf इंस्टॉल करें", "दूसरे स्कैनरों के लिए SANE इंस्टॉल करें", "sudo आपका पासवर्ड माँग सकता है"],
     win_hints: ["फ़ाइल डायलॉग बंद कर दिया गया", "USB स्कैनरों को उनका Windows ड्राइवर चाहिए", "Windows आपसे अनुमति माँगेगा"],
 };
 
@@ -1017,7 +1017,7 @@ pub const ES: Texts = Texts {
     graphics_chat: "Cómo se dibujan las páginas. Auto elige lo mejor que admite tu terminal.",
     folder_chat: "Dónde se guardan los escaneos. i para escribir una carpeta.",
     saved_to: "Los ajustes se guardan al cambiarlos, en {path}",
-    unix_hints: ["instala yazi, lf, ranger, nnn o fzf", "para otros escáneres instala SANE", "sudo puede pedirte la contraseña"],
+    unix_hints: ["instala zenity, kdialog, yazi o fzf", "para otros escáneres instala SANE", "sudo puede pedirte la contraseña"],
     win_hints: ["se cerró el diálogo de archivos", "los escáneres USB necesitan su driver de Windows", "Windows te pedirá permiso"],
 };
 
@@ -1209,7 +1209,7 @@ pub const AR: Texts = Texts {
     graphics_chat: "طريقة رسم الصفحات. التلقائي يختار الأفضل لطرفيتك.",
     folder_chat: "مكان حفظ المسح. i لكتابة مجلد.",
     saved_to: "تُحفظ الإعدادات فور تغييرها في {path}",
-    unix_hints: ["ثبّت yazi أو lf أو ranger أو nnn أو fzf", "للماسحات الأخرى ثبّت SANE", "قد يطلب sudo كلمة المرور"],
+    unix_hints: ["ثبّت zenity أو kdialog أو yazi أو fzf", "للماسحات الأخرى ثبّت SANE", "قد يطلب sudo كلمة المرور"],
     win_hints: ["أُغلقت نافذة الملفات", "ماسحات USB تحتاج تعريف Windows الخاص بها", "سيطلب Windows إذنك"],
 };
 
@@ -1401,7 +1401,7 @@ pub const FR: Texts = Texts {
     graphics_chat: "Comment les pages sont dessinées. Auto choisit le mieux pour votre terminal.",
     folder_chat: "Où les numérisations sont enregistrées. i pour taper un dossier.",
     saved_to: "Les réglages sont enregistrés dès qu'ils changent, dans {path}",
-    unix_hints: ["installez yazi, lf, ranger, nnn ou fzf", "pour d'autres scanners installez SANE", "sudo peut demander votre mot de passe"],
+    unix_hints: ["installez zenity, kdialog, yazi ou fzf", "pour d'autres scanners installez SANE", "sudo peut demander votre mot de passe"],
     win_hints: ["la fenêtre de fichiers a été fermée", "les scanners USB ont besoin de leur pilote Windows", "Windows vous demandera l'autorisation"],
 };
 
@@ -1587,7 +1587,7 @@ pub const BN: Texts = Texts {
     graphics_chat: "পৃষ্ঠা কীভাবে আঁকা হবে। স্বয়ংক্রিয় আপনার টার্মিনালের সেরাটা বাছে।",
     folder_chat: "স্ক্যান কোথায় রাখা হবে। ফোল্ডার লিখতে i।",
     saved_to: "সেটিংস বদলালেই এখানে রাখা হয়: {path}",
-    unix_hints: ["yazi, lf, ranger, nnn বা fzf ইনস্টল করুন", "অন্য স্ক্যানারের জন্য SANE ইনস্টল করুন", "sudo আপনার পাসওয়ার্ড চাইতে পারে"],
+    unix_hints: ["zenity, kdialog, yazi বা fzf ইনস্টল করুন", "অন্য স্ক্যানারের জন্য SANE ইনস্টল করুন", "sudo আপনার পাসওয়ার্ড চাইতে পারে"],
     win_hints: ["ফাইল ডায়ালগ বন্ধ করা হয়েছে", "USB স্ক্যানারের জন্য তার Windows ড্রাইভার লাগে", "Windows আপনার অনুমতি চাইবে"],
 };
 
@@ -1779,7 +1779,7 @@ pub const PT: Texts = Texts {
     graphics_chat: "Como as páginas são desenhadas. Auto escolhe o melhor para o seu terminal.",
     folder_chat: "Onde as digitalizações são salvas. i para digitar uma pasta.",
     saved_to: "Os ajustes são salvos quando mudam, em {path}",
-    unix_hints: ["instale yazi, lf, ranger, nnn ou fzf", "para outros scanners instale o SANE", "o sudo pode pedir sua senha"],
+    unix_hints: ["instale zenity, kdialog, yazi ou fzf", "para outros scanners instale o SANE", "o sudo pode pedir sua senha"],
     win_hints: ["a janela de arquivos foi fechada", "scanners USB precisam do driver do Windows", "o Windows vai pedir sua permissão"],
 };
 
@@ -1971,7 +1971,7 @@ pub const RU: Texts = Texts {
     graphics_chat: "Как рисуются страницы. Авто выбирает лучшее для вашего терминала.",
     folder_chat: "Куда сохранять сканы. i — ввести папку.",
     saved_to: "Настройки сохраняются сразу, в {path}",
-    unix_hints: ["установите yazi, lf, ranger, nnn или fzf", "для других сканеров установите SANE", "sudo может спросить пароль"],
+    unix_hints: ["установите zenity, kdialog, yazi или fzf", "для других сканеров установите SANE", "sudo может спросить пароль"],
     win_hints: ["окно выбора файла закрыто", "USB-сканерам нужен драйвер Windows", "Windows попросит разрешения"],
 };
 
@@ -2163,7 +2163,7 @@ pub const ID: Texts = Texts {
     graphics_chat: "Cara halaman digambar. Otomatis memilih yang terbaik untuk terminalmu.",
     folder_chat: "Tempat hasil pindaian disimpan. i untuk mengetik folder.",
     saved_to: "Pengaturan disimpan saat diubah, di {path}",
-    unix_hints: ["pasang yazi, lf, ranger, nnn atau fzf", "untuk pemindai lain pasang SANE", "sudo mungkin meminta kata sandimu"],
+    unix_hints: ["pasang zenity, kdialog, yazi atau fzf", "untuk pemindai lain pasang SANE", "sudo mungkin meminta kata sandimu"],
     win_hints: ["jendela berkas ditutup", "pemindai USB perlu driver Windows-nya", "Windows akan meminta izinmu"],
 };
 

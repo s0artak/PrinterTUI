@@ -12,12 +12,23 @@ impl App {
                 let want = self.preview_png().map(|p| (p, area.width, area.height));
                 if want.is_some() && want != self.sent && area.width > 0 {
                     let (png, c, r) = want.clone().unwrap_or_default();
-                    emit(&kitty(&format!("a=T,U=1,f=100,t=f,i={},q=2,c={c},r={r}", image_id()), &base64(png.as_bytes()), tmux));
+                    // the image itself, not its path: over SSH the terminal runs on another computer;
+                    // shrunk to the cells it fills, so it is quick to send
+                    let (cell_w, cell_h) = sixel_cell();
+                    if let Ok(data) = fit_png(&png, (c as usize * cell_w) as u32, (r as usize * cell_h) as u32) {
+                        emit(&kitty_chunks(&format!("a=T,U=1,f=100,i={},q=2,c={c},r={r}", image_id()), &base64(&data), tmux));
+                    }
                     self.sent = want;
                 }
             }
             Graphics::Sixel => {
                 let area = self.preview_area.get();
+                // an image is drawn over everything: wait for the popup on it to close, which also
+                // wipes the part it covered, then draw the image again
+                if self.popup_area.get().intersects(area) {
+                    self.sent = None;
+                    return;
+                }
                 let clear = |buf: &mut String| {
                     for r in 0..area.height {
                         buf.push_str(&format!("\x1b[{};{}H{:w$}", area.y + 1 + r, area.x + 1, " ", w = area.width as usize));
@@ -99,7 +110,7 @@ pub(crate) fn kitty_graphics() -> Option<bool> {
     (known(&var("TERM")) || known(&var("TERM_PROGRAM")) || !var("KITTY_WINDOW_ID").is_empty()).then_some(false)
 }
 
-/// The size of a character cell in Sixel pixels: what the terminal reports, else Windows
+/// The size of a character cell in pixels: what the terminal reports, else Windows
 /// Terminal's fixed 10 x 20 (it scales images from that to its font, as the VT340 did), else a
 /// small guess, so the image is at worst a little small, never spilling out of the preview.
 pub(crate) fn sixel_cell() -> (usize, usize) {

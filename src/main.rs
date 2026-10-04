@@ -277,19 +277,41 @@ fn last_scan() -> Option<String> {
 
 /// Mouse clicks on Windows, where people expect them; elsewhere the terminal keeps its own text selection.
 const MOUSE: bool = cfg!(windows);
+/// Pasted text as one piece, so a file dropped on the terminal is not read as keys; crossterm
+/// only reports it apart on Unix (on Windows it would arrive as keys starting with Esc).
+const PASTE: bool = cfg!(unix);
 
 fn init() -> DefaultTerminal {
     let term = ratatui::init();
     if MOUSE {
-        let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::EnableMouseCapture);
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), event::EnableMouseCapture);
     }
+    if PASTE {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste);
+    }
+    // ratatui's own hook puts the screen back after a crash, but not the mouse or the paste mode
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let next = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            terminal_modes_off();
+            next(info);
+        }));
+    });
     term
 }
 
-fn restore() {
+fn terminal_modes_off() {
     if MOUSE {
-        let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::DisableMouseCapture);
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), event::DisableMouseCapture);
     }
+    if PASTE {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste);
+    }
+}
+
+fn restore() {
+    terminal_modes_off();
     ratatui::restore();
 }
 
@@ -347,6 +369,10 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
         let keys = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => vec![k],
             Event::Mouse(m) => app.mouse(m),
+            Event::Paste(text) => {
+                app.paste(&text);
+                continue;
+            }
             _ => continue,
         };
         if app.act.done() {
@@ -360,6 +386,8 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     restore();
                     let picked = pick_files();
                     *term = init();
+                    // a new screen: the image preview has to be sent again
+                    app.clear = true;
                     app.picked(picked);
                 }
                 Step::Add(name, uri) => app.add(term, &name, &uri),
@@ -377,6 +405,12 @@ enum Step {
     PickFiles,
     /// Add the printer (name, address).
     Add(String, String),
+}
+
+/// Deletes the last word of a field, and the spaces after it.
+fn delete_word(field: &mut String) {
+    let kept = field.trim_end().trim_end_matches(|c: char| !c.is_whitespace()).len();
+    field.truncate(kept);
 }
 
 /// Keeps a list's selection on one of its `len` items.
@@ -471,6 +505,8 @@ impl App {
         if self.busy.is_some() && k.code == KeyCode::Enter {
             return Step::Stay;
         }
+        // a Ctrl+letter is no letter to type; AltGr, which Windows reports as Ctrl+Alt, types one
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL) && !k.modifiers.contains(KeyModifiers::ALT);
         // vim `gg`: a second `g` right after the first
         let prev = pending.take();
         let (gg, dd) = (prev == Some('g') && k.code == KeyCode::Char('g'), prev == Some('d') && k.code == KeyCode::Char('d'));
@@ -545,7 +581,16 @@ impl App {
                 KeyCode::Backspace => {
                     self.text().map(String::pop);
                 }
-                KeyCode::Char(c) => {
+                // as in a shell: Ctrl+U empties the field, Ctrl+W deletes the last word
+                KeyCode::Char('u') if ctrl => {
+                    self.text().map(String::clear);
+                }
+                KeyCode::Char('w') if ctrl => {
+                    if let Some(t) = self.text() {
+                        delete_word(t);
+                    }
+                }
+                KeyCode::Char(c) if !ctrl => {
                     if let Some(t) = self.text() {
                         t.push(c)
                     }
@@ -570,7 +615,9 @@ impl App {
                 KeyCode::Backspace => {
                     addr.pop();
                 }
-                KeyCode::Char(c) => addr.push(c),
+                KeyCode::Char('u') if ctrl => addr.clear(),
+                KeyCode::Char('w') if ctrl => delete_word(addr),
+                KeyCode::Char(c) if !ctrl => addr.push(c),
                 KeyCode::Enter if !addr.trim().is_empty() => {
                     let addr = addr.trim().to_string();
                     // a bare IP or name gets the standard IPP Everywhere path; a full uri is used as is
@@ -643,12 +690,46 @@ impl App {
         Step::Stay
     }
 
-    /// Puts the files picked in the dialog or file manager into the File row.
-    fn picked(&mut self, picked: Vec<String>) {
-        if picked.is_empty() {
-            self.status = fill(t().no_file_picked, &[("hint", &t().hints()[0])]);
-        } else {
-            self.file = picked.join("; ");
+    /// Puts the files picked in the dialog or file manager into the File row; None: there was
+    /// nothing to pick them with. Nothing picked is a cancel, and the File row stays as it was.
+    fn picked(&mut self, picked: Option<Vec<String>>) {
+        match picked {
+            None => self.status = fill(t().no_file_picked, &[("hint", &t().hints()[0])]),
+            Some(files) if !files.is_empty() => self.file = join_files(&files),
+            Some(_) => {}
+        }
+    }
+
+    /// Text pasted into the terminal, or files dropped on it: typed into the field being edited,
+    /// and on the Print tab, the files to print.
+    fn paste(&mut self, text: &str) {
+        let files = || dropped_paths(text).into_iter().filter(|f| std::path::Path::new(f).is_file()).collect::<Vec<_>>();
+        // a field holds one line
+        let line: String = text.trim().lines().collect::<Vec<_>>().join(" ").chars().filter(|c| !c.is_control()).collect();
+        match &mut self.mode {
+            Mode::Main if self.tab == Tab::Print => {
+                let files = files();
+                if files.is_empty() {
+                    return self.status = failed(fill(t().file_not_found, &[("file", &line)]));
+                }
+                self.file = join_files(&files);
+                self.sel = FILE;
+                self.status = String::new();
+            }
+            Mode::Insert if self.tab == Tab::Print && self.sel == FILE => {
+                let files = files();
+                let more = if files.is_empty() { line } else { join_files(&files) };
+                let field = self.file.trim_end();
+                self.file =
+                    if field.is_empty() || field.ends_with(';') || files.is_empty() { format!("{}{more}", self.file) } else { format!("{field}; {more}") };
+            }
+            Mode::Insert => {
+                if let Some(field) = self.text() {
+                    field.push_str(&line);
+                }
+            }
+            Mode::Address(addr) => addr.push_str(&line),
+            _ => {}
         }
     }
 
@@ -747,6 +828,7 @@ impl App {
         println!("{}", fill(t().adding, &[("name", &name), ("uri", &uri), ("note", &t().hints()[2])]));
         let res = add_printer(name, uri);
         *term = init();
+        self.clear = true;
         self.status = match res {
             Ok(()) => fill(t().added, &[("name", &name)]),
             Err(e) => failed(e),
@@ -1281,6 +1363,45 @@ mod tests {
         // q in the field is a letter, not quitting
         assert_eq!(press(&mut app, "iq"), Step::Stay);
         assert_eq!(app.file, "a b.pdq");
+    }
+
+    #[test]
+    fn shell_keys_and_pasted_text_in_a_field() {
+        let mut app = app();
+        app.sel = FILE;
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        press(&mut app, "ia b.pdf");
+        app.on_key(ctrl('w'), &mut None);
+        assert_eq!(app.file, "a ");
+        // a Ctrl+letter types nothing; AltGr (Ctrl+Alt on Windows) types its character
+        app.on_key(ctrl('x'), &mut None);
+        app.on_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT), &mut None);
+        assert_eq!(app.file, "a @");
+        app.on_key(ctrl('u'), &mut None);
+        assert_eq!(app.file, "");
+        app.paste("/nowhere/x.pdf\n");
+        assert_eq!(app.file, "/nowhere/x.pdf");
+    }
+
+    #[test]
+    fn files_dropped_on_the_print_tab() {
+        let dir = std::env::temp_dir().join(format!("printertui-paste-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a b.pdf"), dir.join("c;d.pdf"));
+        std::fs::write(&a, "x").unwrap();
+        std::fs::write(&b, "x").unwrap();
+        let mut app = app();
+        app.sel = COPIES;
+        // dropped files replace the ones to print; the rest of the screen is not typed into
+        app.paste(&format!("'{}' '{}' ", a.display(), b.display()));
+        assert_eq!(app.sel, FILE);
+        assert_eq!(split_files(&app.file), [a.to_string_lossy(), b.to_string_lossy()]);
+        assert_eq!(app.copies, 1);
+        // text that names no file changes nothing
+        app.paste("jjjjq");
+        assert!(app.status.starts_with(t().error));
+        assert_eq!(split_files(&app.file).len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

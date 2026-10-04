@@ -97,7 +97,8 @@ fn player(path: &std::path::Path) {
 fn player(path: &std::path::Path) {
     use std::process::{Command, Stdio};
     for (cmd, args) in [("pw-play", &[][..]), ("paplay", &[][..]), ("aplay", &["-q"][..])] {
-        if Command::new(cmd).args(args).arg(path).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok() {
+        // a player that is installed but has no sound server to talk to fails: try the next one
+        if Command::new(cmd).args(args).arg(path).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()) {
             return;
         }
     }

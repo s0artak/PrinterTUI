@@ -247,7 +247,7 @@ pub fn add_printer(name: &str, uri: &str) -> Result<(), String> {
 
 /// macOS: the system's file dialog (cancelling it picks nothing).
 #[cfg(target_os = "macos")]
-pub fn pick_files() -> Vec<String> {
+pub fn pick_files() -> Option<Vec<String>> {
     let script = [
         "activate",
         "set picked to choose file with prompt \"PrinterTUI\" with multiple selections allowed",
@@ -258,13 +258,41 @@ pub fn pick_files() -> Vec<String> {
         "return out",
     ];
     let args: Vec<&str> = script.iter().flat_map(|l| ["-e", *l]).collect();
-    run("osascript", &args).map_or(Vec::new(), |out| lines(&out))
+    Some(run("osascript", &args).map_or(Vec::new(), |out| lines(&out)))
 }
 
-/// Opens the first installed terminal file manager as a picker, returns the selected files.
-/// Needs the terminal in normal mode.
+/// Linux: the files picked, None when there is nothing to pick them with. On a desktop (not over
+/// SSH) its own dialog: KDE's kdialog, else GNOME's zenity; then the first terminal file manager
+/// installed, then fzf. Needs the terminal in normal mode. Cancelling picks nothing.
 #[cfg(not(target_os = "macos"))]
-pub fn pick_files() -> Vec<String> {
+pub fn pick_files() -> Option<Vec<String>> {
+    use std::process::Stdio;
+    let var = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    let docs = documents_dir().filter(|d| d.is_dir()).or_else(std::env::home_dir).unwrap_or_else(|| ".".into());
+    // a dialog's exit code 1 is a cancel; anything it cannot start falls through to the next one
+    let dialog = |cmd: &str, args: &[String]| -> Option<Vec<String>> {
+        let out = Command::new(cmd).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+        match out.status.code() {
+            Some(0) => Some(lines(&String::from_utf8_lossy(&out.stdout))),
+            Some(1) => Some(Vec::new()),
+            _ => None,
+        }
+    };
+    if (var("WAYLAND_DISPLAY") || var("DISPLAY")) && !var("SSH_CONNECTION") && !var("SSH_TTY") {
+        let kde = std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.to_uppercase().contains("KDE"));
+        let kdialog = || dialog("kdialog", &["--getopenfilename".into(), docs.to_string_lossy().into(), "--multiple".into(), "--separate-output".into()]);
+        let zenity = || {
+            let start = format!("{}/", docs.to_string_lossy());
+            dialog(
+                "zenity",
+                &["--file-selection".into(), "--multiple".into(), "--separator=\n".into(), "--title=PrinterTUI".into(), format!("--filename={start}")],
+            )
+        };
+        let picked = if kde { kdialog().or_else(zenity) } else { zenity().or_else(kdialog) };
+        if picked.is_some() {
+            return picked;
+        }
+    }
     let out = std::env::temp_dir().join(format!("printertui-pick-{}", std::process::id()));
     let o = out.to_str().unwrap_or_default();
     let pickers: [(&str, Vec<String>); 4] = [
@@ -274,14 +302,16 @@ pub fn pick_files() -> Vec<String> {
         ("nnn", vec!["-p".into(), o.into()]),
     ];
     for (cmd, args) in pickers {
-        if Command::new(cmd).args(&args).status().is_ok() {
+        if Command::new(cmd).args(&args).current_dir(&docs).status().is_ok() {
             let picked = std::fs::read_to_string(&out).unwrap_or_default();
             let _ = std::fs::remove_file(&out);
-            return lines(&picked);
+            return Some(lines(&picked));
         }
     }
-    // fzf draws on the tty and prints the choices on stdout
-    Command::new("fzf").arg("-m").stdout(std::process::Stdio::piped()).output().map_or(Vec::new(), |out| lines(&String::from_utf8_lossy(&out.stdout)))
+    // fzf lists the files below the folder it runs in, draws on the terminal (stderr) and prints
+    // the choices on stdout
+    let fzf = Command::new("fzf").arg("-m").current_dir(&docs).stdin(Stdio::inherit()).stderr(Stdio::inherit()).stdout(Stdio::piped()).output().ok()?;
+    Some(lines(&String::from_utf8_lossy(&fzf.stdout)).into_iter().map(|f| docs.join(f).to_string_lossy().into_owned()).collect())
 }
 
 /// One path per line (nnn may separate them with NUL).

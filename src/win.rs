@@ -585,16 +585,17 @@ impl raw_window_handle::HasDisplayHandle for Console {
     }
 }
 
-/// The Windows file dialog.
-pub fn pick_files() -> Vec<String> {
-    rfd::FileDialog::new()
+/// The Windows file dialog (cancelling it picks nothing).
+pub fn pick_files() -> Option<Vec<String>> {
+    let picked = rfd::FileDialog::new()
         .set_parent(&Console)
         .set_title("Files to print")
         .pick_files()
         .unwrap_or_default()
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
-        .collect()
+        .collect();
+    Some(picked)
 }
 
 /// Scanners Windows knows (USB, and network scanners it added itself) as ("wia:<id>", name).

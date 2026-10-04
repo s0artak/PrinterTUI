@@ -444,6 +444,82 @@ pub fn split_files(field: &str) -> Vec<String> {
     files
 }
 
+/// Paths for the File field, the way split_files reads them back: in quotes when they hold a ';'
+/// or start with a quote.
+pub fn join_files(files: &[String]) -> String {
+    let quoted = |f: &String| match f.contains(';') || f.starts_with(['"', '\'']) {
+        true if f.contains('"') => format!("'{f}'"),
+        true => format!("\"{f}\""),
+        false => f.clone(),
+    };
+    files.iter().map(quoted).collect::<Vec<_>>().join("; ")
+}
+
+/// The files in text pasted into the terminal, as a file manager or terminal drops them: a plain
+/// path, 'quoted' or "quoted" paths, paths with backslash-escaped spaces (WezTerm, Ghostty), or
+/// file:// URIs with %20 escapes (copied files), one or several per line.
+pub fn dropped_paths(text: &str) -> Vec<String> {
+    let is_file = |p: &str| std::path::Path::new(p).is_file();
+    let text = text.trim();
+    if is_file(text) {
+        return vec![text.to_string()];
+    }
+    let mut paths = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if is_file(line) {
+            paths.push(line.to_string());
+            continue;
+        }
+        paths.extend(shell_words(line).into_iter().map(|w| file_uri_path(&w).unwrap_or(w)));
+    }
+    paths
+}
+
+/// A line split into words as a shell reads it: quotes group, a backslash escapes the next
+/// character (not on Windows, where it separates folders).
+fn shell_words(line: &str) -> Vec<String> {
+    let (mut words, mut word, mut quote, mut chars) = (Vec::new(), None::<String>, None, line.chars());
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                word.get_or_insert_default();
+            }
+            (q, '\\') if cfg!(unix) && q != Some('\'') => {
+                if let Some(next) = chars.next() {
+                    word.get_or_insert_default().push(next);
+                }
+            }
+            (None, c) if c.is_whitespace() => words.extend(word.take()),
+            (_, c) => word.get_or_insert_default().push(c),
+        }
+    }
+    words.extend(word);
+    words
+}
+
+/// The path of a file:// URI, its %XX escapes decoded: file:///home/ana/Mis%20documentos/a.pdf.
+fn file_uri_path(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let path = rest.strip_prefix("localhost").unwrap_or(rest);
+    let bytes = path.as_bytes();
+    let (mut out, mut i) = (Vec::new(), 0);
+    while i < bytes.len() {
+        match (bytes[i], path.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// Expands "1-3,7,9-" into a sorted page list. Empty or "all" means every page.
 pub fn parse_ranges(spec: &str, total: u32) -> Result<Vec<u32>, String> {
     let spec = spec.trim();
@@ -961,6 +1037,15 @@ pub fn thumbnail(image: &str) -> Result<Thumb, String> {
     Ok((400, h as usize, small.into_raw()))
 }
 
+/// A PNG made smaller to fit in `max_w` x `max_h` pixels (never larger), as the terminal shows it.
+pub fn fit_png(path: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, String> {
+    let img = open(path)?;
+    let img = if img.width() > max_w || img.height() > max_h { img.resize(max_w.max(1), max_h.max(1), FilterType::Triangle) } else { img };
+    let mut png = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut png, ImageFormat::Png).map_err(|e| format!("{path}: {e}"))?;
+    Ok(png.into_inner())
+}
+
 /// 3x3 minimum filter: dark strokes grow by one pixel.
 fn erode(img: &GrayImage) -> GrayImage {
     let (w, h) = img.dimensions();
@@ -1198,6 +1283,21 @@ pub fn base64(data: &[u8]) -> String {
 pub fn kitty(control: &str, payload: &str, tmux: bool) -> String {
     let cmd = format!("\x1b_G{control};{payload}\x1b\\");
     if tmux { format!("\x1bPtmux;{}\x1b\\", cmd.replace('\x1b', "\x1b\x1b")) } else { cmd }
+}
+
+/// A kitty graphics command whose payload goes in the protocol's chunks of 4096 bytes, as an
+/// image sent as data must.
+pub fn kitty_chunks(control: &str, payload: &str, tmux: bool) -> String {
+    let chunks: Vec<&str> = payload.as_bytes().chunks(4096).map(|c| std::str::from_utf8(c).unwrap_or_default()).collect();
+    if chunks.len() <= 1 {
+        return kitty(control, payload, tmux);
+    }
+    let last = chunks.len() - 1;
+    let control = |i: usize| match i {
+        0 => format!("{control},m=1"),
+        _ => format!("q=2,m={}", u8::from(i < last)),
+    };
+    chunks.iter().enumerate().map(|(i, c)| kitty(&control(i), c, tmux)).collect()
 }
 
 /// Encodes an 8-bit grayscale image buffer into a Sixel escape sequence (16 gray levels with run-length encoding).
@@ -1513,12 +1613,38 @@ fn job_ids_in_any_language() {
 }
 
 #[test]
+fn files_dropped_into_the_terminal() {
+    let dir = std::env::temp_dir().join(format!("printertui-drop-test-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("Mis documentos")).unwrap();
+    let file = dir.join("Mis documentos").join("informe final.pdf");
+    std::fs::write(&file, "x").unwrap();
+    let path = file.to_string_lossy().into_owned();
+    // as it is, quoted (VTE, foot), file:// URI (copied in a file manager)
+    assert_eq!(dropped_paths(&format!("{path}\n")), [path.as_str()]);
+    assert_eq!(dropped_paths(&format!("'{path}' ")), [path.as_str()]);
+    let uri = format!("file://{}", path.replace(' ', "%20"));
+    assert_eq!(dropped_paths(&uri), [path.as_str()]);
+    // several files, one URI per line
+    assert_eq!(dropped_paths(&format!("{uri}\r\n{uri}\n")), [path.as_str(), path.as_str()]);
+    #[cfg(unix)]
+    {
+        // WezTerm and Ghostty escape the spaces, and drop several files on one line
+        let escaped = path.replace(' ', "\\ ");
+        assert_eq!(dropped_paths(&format!("{escaped} {escaped}")), [path.as_str(), path.as_str()]);
+        assert_eq!(shell_words(r#"a 'b c' "d\"e" f\ g"#), ["a", "b c", "d\"e", "f g"]);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn file_field_paths() {
     assert_eq!(split_files(" a.pdf; b.pdf ;"), ["a.pdf", "b.pdf"]);
     assert_eq!(split_files("\"C:\\Users\\Ana Pérez\\doc.pdf\""), ["C:\\Users\\Ana Pérez\\doc.pdf"]);
     assert_eq!(split_files("\"C:\\a b.pdf\" \"C:\\c.pdf\"; d.txt"), ["C:\\a b.pdf", "C:\\c.pdf", "d.txt"]);
     assert_eq!(split_files("'/home/ana/my file.pdf'"), ["/home/ana/my file.pdf"]);
     assert_eq!(split_files("Ana's notes.txt"), ["Ana's notes.txt"]);
+    let files = ["a b.pdf", "x;y.pdf", "'quoted'.pdf", "\"both\";.pdf", "Ana's notes.txt"].map(String::from);
+    assert_eq!(split_files(&join_files(&files)), files);
 }
 
 #[test]
@@ -1640,4 +1766,18 @@ fn test_sixel_encode() {
     assert!(six.starts_with("\x1bPq\"1;1;12;12"));
     assert!(six.ends_with("\x1b\\"));
     assert!(six.contains("#0"));
+}
+
+#[test]
+fn large_images_go_to_kitty_in_chunks() {
+    assert_eq!(kitty_chunks("a=T", "QUJD", false), "\x1b_Ga=T;QUJD\x1b\\");
+    let payload = "A".repeat(4096 * 2 + 8);
+    let out = kitty_chunks("a=T,i=1", &payload, false);
+    let parts: Vec<&str> = out.split("\x1b\\").filter(|p| !p.is_empty()).collect();
+    assert_eq!(parts.len(), 3);
+    assert!(parts[0].starts_with("\x1b_Ga=T,i=1,m=1;"));
+    assert!(parts[1].starts_with("\x1b_Gq=2,m=1;"));
+    assert_eq!(parts[2], "\x1b_Gq=2,m=0;AAAAAAAA");
+    // through tmux, each chunk is passed on by itself
+    assert_eq!(kitty_chunks("a=T", &payload, true).matches("\x1bPtmux;").count(), 3);
 }
