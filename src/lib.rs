@@ -7,6 +7,7 @@ mod unix;
 pub use unix::*;
 #[cfg(windows)]
 mod win;
+mod glyphless;
 #[cfg(windows)]
 pub use win::*;
 
@@ -858,11 +859,12 @@ fn win_ansi(text: &str) -> Vec<u8> {
 }
 
 /// One PDF page per image; `dpi` sets the page size (pixels / dpi). `words[i]`, when given, is laid
-/// invisibly over page i so the PDF can be searched and copied from.
+/// invisibly over page i, in any language, so the PDF can be searched and copied from.
 pub fn images_to_pdf(pages: &[String], dpi: u32, words: &[Vec<Word>]) -> Result<Vec<u8>, String> {
     let mut pdf = Pdf::new();
     let (catalog, tree, font) = (Ref::new(1), Ref::new(2), Ref::new(3));
     let mut kids = Vec::new();
+    let mut letters = glyphless::Letters::default();
     let pt = 72.0 / dpi as f32;
     for (i, path) in pages.iter().enumerate() {
         let (page_id, image_id, content_id) = (Ref::new(3 * i as i32 + 4), Ref::new(3 * i as i32 + 5), Ref::new(3 * i as i32 + 6));
@@ -885,21 +887,28 @@ pub fn images_to_pdf(pages: &[String], dpi: u32, words: &[Vec<Word>]) -> Result<
         if let Some(words) = words.get(i).filter(|w| !w.is_empty()) {
             content.begin_text().set_text_rendering_mode(TextRenderingMode::Invisible);
             for word in words {
-                // Helvetica's average glyph is about half the font size wide; stretch it to the box
+                // every glyph is half the font size wide: stretched to the word's box
                 let size = word.h * pt;
-                let text = win_ansi(&word.text);
-                let natural = 0.5 * size * text.len() as f32;
+                let natural = glyphless::GLYPH_WIDTH / 1000.0 * size * word.text.chars().count() as f32;
                 content.set_font(Name(b"F0"), size).set_horizontal_scaling(100.0 * word.w * pt / natural.max(0.01));
                 // baseline a fifth of the box above its bottom edge
                 content.set_text_matrix([1.0, 0.0, 0.0, 1.0, word.x * pt, ph - (word.y + 0.8 * word.h) * pt]);
-                content.show(Str(&text));
+                // a PDF holds right-to-left words (Arabic, Hebrew) as they are drawn, left to right
+                let rtl = word.text.chars().any(|c| matches!(c as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF));
+                let text: String = if rtl { word.text.chars().rev().collect() } else { word.text.clone() };
+                content.show(Str(&letters.encode(&text)));
             }
             content.end_text();
         }
         pdf.stream(content_id, &content.finish());
         kids.push(page_id);
     }
-    pdf.type1_font(font).base_font(Name(b"Helvetica")).encoding_predefined(Name(b"WinAnsiEncoding"));
+    if letters.is_empty() {
+        // nothing uses it, but the pages name it
+        pdf.type1_font(font).base_font(Name(b"Helvetica"));
+    } else {
+        letters.write(&mut pdf, font, 3 * pages.len() as i32 + 4);
+    }
     pdf.catalog(catalog).pages(tree);
     pdf.pages(tree).count(kids.len() as i32).kids(kids);
     Ok(pdf.finish())
@@ -1300,13 +1309,21 @@ fn searchable_pdf_text_layer() {
     std::fs::create_dir_all(&dir).unwrap();
     let img = dir.join("p").to_string_lossy().into_owned();
     DynamicImage::ImageLuma8(GrayImage::from_pixel(1200, 300, Luma([255]))).save_with_format(&img, ImageFormat::Png).unwrap();
-    let words = vec![Word { text: "Hola".into(), x: 50.0, y: 100.0, w: 200.0, h: 60.0 }, Word { text: "cañón".into(), x: 300.0, y: 100.0, w: 250.0, h: 60.0 }];
+    // Latin, Chinese, Russian, Hindi and Arabic, as the OCR of the app's languages finds them
+    let texts = ["Hola", "cañón", "你好", "Привет", "नमस्ते", "مرحبا"];
+    let words: Vec<Word> = texts.iter().enumerate().map(|(i, t)| Word { text: t.to_string(), x: 20.0 + 190.0 * i as f32, y: 100.0, w: 170.0, h: 60.0 }).collect();
     let pdf = dir.join("out.pdf");
     std::fs::write(&pdf, images_to_pdf(&[img], 150, &[words]).unwrap()).unwrap();
     assert_eq!(page_count(&pdf.to_string_lossy()), Some(1));
     // pdftotext (poppler) reads the text back, when installed
+    #[cfg(unix)]
+    let _one = unix::SPAWNS.lock().unwrap_or_else(|e| e.into_inner());
     if let Ok(text) = run("pdftotext", &["-enc", "UTF-8", &pdf.to_string_lossy(), "-"]) {
-        assert!(text.contains("Hola") && text.contains("cañón"), "{text}");
+        // without the marks around right-to-left text
+        let text = text.replace(['\u{202B}', '\u{202C}'], "");
+        for t in texts {
+            assert!(text.contains(t), "{t} in {text}");
+        }
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }

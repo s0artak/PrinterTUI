@@ -1109,8 +1109,9 @@ impl App {
                 };
                 let want = Some((png, area.width, area.height));
                 if want != self.sent && area.width > 0 && area.height > 0 {
-                    let max_w = (area.width as usize).saturating_sub(1) * 10;
-                    let max_h = (area.height as usize) * 18;
+                    let (cell_w, cell_h) = sixel_cell();
+                    let max_w = (area.width as usize).saturating_sub(1) * cell_w;
+                    let max_h = (area.height as usize) * cell_h;
                     if max_w > 0 && max_h > 0 && *w > 0 && *h > 0 {
                         let scale = (max_w as f32 / *w as f32).min(max_h as f32 / *h as f32);
                         let ow = ((*w as f32 * scale) as usize).clamp(10, max_w);
@@ -1120,7 +1121,7 @@ impl App {
                             let sixel = sixel_encode(ow, oh, &small);
                             let mut buf = String::new();
                             clear(&mut buf);
-                            let cols_used = ((ow as f32 / 10.0).ceil() as u16).min(area.width);
+                            let cols_used = ((ow as f32 / cell_w as f32).ceil() as u16).min(area.width);
                             let offset_x = (area.width.saturating_sub(cols_used)) / 2;
                             let x = area.x + 1 + offset_x;
                             let y = area.y + 1;
@@ -1536,6 +1537,17 @@ fn kitty_graphics() -> Option<bool> {
         return (known(&outer) && (passthrough == "on" || passthrough == "all")).then_some(true);
     }
     (known(&var("TERM")) || known(&var("TERM_PROGRAM")) || !var("KITTY_WINDOW_ID").is_empty()).then_some(false)
+}
+
+/// The size of a character cell in Sixel pixels: what the terminal reports, else Windows
+/// Terminal's fixed 10 x 20 (it scales images from that to its font, as the VT340 did), else a
+/// small guess, so the image is at worst a little small, never spilling out of the preview.
+fn sixel_cell() -> (usize, usize) {
+    match ratatui::crossterm::terminal::window_size() {
+        Ok(s) if s.width > 0 && s.height > 0 && s.columns > 0 && s.rows > 0 => ((s.width / s.columns).max(1) as usize, (s.height / s.rows).max(1) as usize),
+        _ if std::env::var_os("WT_SESSION").is_some() => (10, 20),
+        _ => (8, 16),
+    }
 }
 
 fn detect_graphics() -> Graphics {
