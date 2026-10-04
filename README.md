@@ -45,9 +45,12 @@ printertui [file]
 | `j` / `k`, `gg` / `G` | Move |
 | `h` / `l` | Change option |
 | `H` / `L` | Previous / next page in the preview |
-| `i` | Type in File, Pages, Save as or Scan folder (Esc to finish) |
+| `i` | Type in File, Pages, Save as or Scan folder (Esc to finish; Ctrl+U clears, Ctrl+W deletes a word) |
 | Enter | Pick files or pages, print, scan, save, copy |
+| Esc | Stop a scan |
 | `q` | Quit |
+
+On Linux and macOS, files dragged onto the terminal (or paths pasted into it) become the files to print, and on Linux Enter on File opens zenity or kdialog on a desktop, else yazi, lf, ranger, nnn or fzf in the terminal.
 
 On the Scan tab's Page row:
 
