@@ -112,11 +112,37 @@ pub fn printer_labels(queues: &[String]) -> Vec<String> {
     let all = installed();
     queues
         .iter()
-        .map(|q| match all.iter().find(|(name, ..)| name == q).and_then(|(_, port, ..)| port_host(port)) {
-            Some(host) => format!("{q} ({host})"),
+        .map(|q| match all.iter().find(|(name, ..)| name == q).and_then(|(_, port, ..)| printer_uri(q, port)).as_deref().and_then(uri_host) {
+            Some((_, host)) => format!("{q} ({host})"),
             None => q.clone(),
         })
         .collect()
+}
+
+/// The IPP address of a network printer: from its port ("IP_192.168.1.46"), or for the ones this
+/// app added, whose port is just "WSD-<id>", from the note it made then.
+fn printer_uri(queue: &str, port: &str) -> Option<String> {
+    port_host(port).map(|host| format!("ipp://{host}/ipp/print")).or_else(|| added().into_iter().find(|(name, _)| name == queue).map(|(_, uri)| uri))
+}
+
+/// Where the printers this app added are noted, with their address: next to the settings.
+fn added_file() -> Option<std::path::PathBuf> {
+    Some(config_path()?.with_file_name("printers"))
+}
+
+/// The printers this app added, as (name, IPP address): one "name<TAB>address" line each.
+fn added() -> Vec<(String, String)> {
+    let text = added_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+    text.lines().filter_map(|l| l.split_once('\t')).map(|(n, u)| (n.to_string(), u.to_string())).collect()
+}
+
+fn note_added(name: &str, uri: &str) {
+    let Some(file) = added_file() else { return };
+    let mut list: Vec<(String, String)> = added().into_iter().filter(|(n, _)| n != name).collect();
+    list.push((name.to_string(), uri.to_string()));
+    let text: String = list.iter().map(|(n, u)| format!("{n}\t{u}\n")).collect();
+    let _ = file.parent().map(std::fs::create_dir_all);
+    let _ = std::fs::write(file, text);
 }
 
 /// Hosts of the installed network printers, to try as eSCL scanners.
@@ -172,16 +198,28 @@ fn pdfium() -> Result<&'static Pdfium, String> {
     }
     const DLL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pdfium.dll"));
     let dir = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join("printertui");
-    let path = dir.join("pdfium-7881.dll");
-    if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(DLL.len() as u64) {
-        std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, DLL)).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut path = dir.join("pdfium-7881.dll");
+    // byte for byte, so a damaged or half-written copy is never loaded
+    if std::fs::read(&path).ok().as_deref() != Some(DLL) {
+        let err = |e: std::io::Error| format!("{}: {e}", dir.display());
+        std::fs::create_dir_all(&dir).map_err(err)?;
+        let tmp = dir.join(format!("pdfium-7881-{}.dll", std::process::id()));
+        std::fs::write(&tmp, DLL).map_err(err)?;
+        // another PrinterTUI may have the old copy loaded, and Windows will not replace it then:
+        // this one loads its own copy
+        match std::fs::rename(&tmp, &path) {
+            Ok(()) => {}
+            Err(_) => path = tmp,
+        }
     }
     let bindings = Pdfium::bind_to_library(&path).map_err(|e| format!("pdfium: {e}"))?;
     Ok(PDFIUM.get_or_init(|| Pdfium::new(bindings)))
 }
 
-/// Printer settings for the job: paper, color, and always one-sided (double-sided is done by hand).
-fn devmode(printer: &str, job: &Job) -> Result<Vec<u64>, String> {
+/// Printer settings for the job: paper, color, copies, the sheet turned sideways for 2 and 6
+/// pages per sheet, and always one-sided (double-sided is done by hand). Also returns whether
+/// the driver makes the copies itself, as asked; else each copy is drawn again.
+fn devmode(printer: &str, job: &Job) -> Result<(Vec<u64>, bool), String> {
     let name = wide(printer);
     with_printer(printer, |h| unsafe {
         let size = DocumentPropertiesW(None, h, PCWSTR(name.as_ptr()), None, None, 0);
@@ -190,7 +228,9 @@ fn devmode(printer: &str, job: &Job) -> Result<Vec<u64>, String> {
         }
         let mut buf = vec![0u64; (size as usize).div_ceil(8)];
         let dm = buf.as_mut_ptr() as *mut DEVMODEW;
-        DocumentPropertiesW(None, h, PCWSTR(name.as_ptr()), Some(dm), None, DM_OUT_BUFFER.0);
+        if DocumentPropertiesW(None, h, PCWSTR(name.as_ptr()), Some(dm), None, DM_OUT_BUFFER.0) < 0 {
+            return Err(format!("{printer}: cannot read its settings"));
+        }
         let paper = match job.paper {
             "Letter" => DMPAPER_LETTER,
             "Legal" => DMPAPER_LEGAL,
@@ -198,16 +238,26 @@ fn devmode(printer: &str, job: &Job) -> Result<Vec<u64>, String> {
             "A3" => DMPAPER_A3,
             _ => DMPAPER_A4,
         };
+        let copies = job.copies.clamp(1, i16::MAX as u32) as i16;
+        let (_, _, landscape) = sheet_grid(job.per_sheet);
         (*dm).Anonymous1.Anonymous1.dmPaperSize = paper as i16;
+        (*dm).Anonymous1.Anonymous1.dmOrientation = if landscape { DMORIENT_LANDSCAPE } else { DMORIENT_PORTRAIT } as i16;
+        (*dm).Anonymous1.Anonymous1.dmCopies = copies;
+        (*dm).dmCollate = if job.collate { DMCOLLATE_TRUE } else { DMCOLLATE_FALSE };
         (*dm).dmDuplex = DMDUP_SIMPLEX;
-        (*dm).dmFields |= DM_PAPERSIZE | DM_DUPLEX;
-        if !job.color {
-            (*dm).dmColor = DMCOLOR_MONOCHROME;
-            (*dm).dmFields |= DM_COLOR;
-        }
+        // color is asked for either way: a driver may print gray unless told
+        (*dm).dmColor = if job.color { DMCOLOR_COLOR } else { DMCOLOR_MONOCHROME };
+        (*dm).dmFields |= DM_PAPERSIZE | DM_ORIENTATION | DM_COPIES | DM_COLLATE | DM_DUPLEX | DM_COLOR;
         // let the driver check the changes against what the printer can do
-        DocumentPropertiesW(None, h, PCWSTR(name.as_ptr()), Some(dm), Some(dm), DM_IN_BUFFER.0 | DM_OUT_BUFFER.0);
-        Ok(buf)
+        if DocumentPropertiesW(None, h, PCWSTR(name.as_ptr()), Some(dm), Some(dm), DM_IN_BUFFER.0 | DM_OUT_BUFFER.0) < 0 {
+            return Err(format!("{printer}: refused the print settings"));
+        }
+        // a driver that cannot make copies (or collate them) puts its own values back
+        let kept = (*dm).Anonymous1.Anonymous1.dmCopies == copies && (copies == 1 || !job.collate || (*dm).dmCollate == DMCOLLATE_TRUE);
+        if !kept {
+            (*dm).Anonymous1.Anonymous1.dmCopies = 1;
+        }
+        Ok((buf, kept))
     })?
 }
 
@@ -222,14 +272,14 @@ fn print_pdf(job: &Job, output: Option<&str>) -> Result<u32, String> {
     if job.reverse {
         sheets.reverse();
     }
-    let copies = job.copies.max(1) as usize;
+    let (dm, driver_copies) = devmode(&job.printer, job)?;
+    let copies = if driver_copies { 1 } else { job.copies.max(1) as usize };
     let order: Vec<&[u32]> = if job.collate {
         (0..copies).flat_map(|_| sheets.iter().copied()).collect()
     } else {
         sheets.iter().flat_map(|s| std::iter::repeat_n(*s, copies)).collect()
     };
 
-    let dm = devmode(&job.printer, job)?;
     let name = wide(&job.printer);
     let hdc = unsafe { CreateDCW(windows::core::w!("WINSPOOL"), PCWSTR(name.as_ptr()), PCWSTR::null(), Some(dm.as_ptr() as *const DEVMODEW)) };
     if hdc.is_invalid() {
@@ -258,32 +308,37 @@ fn print_pdf(job: &Job, output: Option<&str>) -> Result<u32, String> {
     res
 }
 
-/// One sheet side: its pages in a grid, each rendered at up to 300 dpi and scaled to its cell.
+/// One sheet side: its pages placed by `place_pages`, each rendered at up to 300 dpi.
 fn draw_sheet(hdc: HDC, doc: &PdfDocument, sheet: &[u32], job: &Job) -> Result<(), String> {
     let cap = |i| unsafe { GetDeviceCaps(Some(hdc), i) };
-    let (width, height, dpi) = (cap(HORZRES), cap(VERTRES), cap(LOGPIXELSX).max(72));
-    let (cols, rows) = grid(job.per_sheet);
-    let (cols, rows) = (cols as i32, rows as i32);
-    let (cell_w, cell_h) = (width / cols, height / rows);
+    let dpi = (cap(LOGPIXELSX).max(72) as f32, cap(LOGPIXELSY).max(72) as f32);
     // rendering at the printer's full resolution would need hundreds of MB per page
-    let scale = (300.0 / dpi as f32).min(1.0);
+    let render_dpi = dpi.0.max(dpi.1).min(300.0);
+    let pages = sheet
+        .iter()
+        .map(|&n| doc.pages().get((n - 1) as PdfPageIndex).map_err(|e| format!("page {n}: {e}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let sizes: Vec<(f32, f32)> = pages.iter().map(|p| (p.width().value, p.height().value)).collect();
+    let places = place_pages(&sizes, job.per_sheet, (cap(HORZRES), cap(VERTRES)), dpi);
     if unsafe { StartPage(hdc) } <= 0 {
         return Err("The printer stopped accepting pages".into());
     }
     unsafe { SetStretchBltMode(hdc, HALFTONE) };
-    for (k, &n) in sheet.iter().enumerate() {
-        let page = doc.pages().get((n - 1) as PdfPageIndex).map_err(|e| format!("page {n}: {e}"))?;
-        let config = PdfRenderConfig::new()
-            .set_maximum_width((cell_w as f32 * scale) as Pixels)
-            .set_maximum_height((cell_h as f32 * scale) as Pixels)
+    for ((page, &n), &(x, y, dw, dh, turn)) in pages.iter().zip(sheet).zip(&places) {
+        // pixels for the page at render_dpi, on the paper's scale
+        let factor = dw as f32 / dpi.0 * render_dpi / if turn { page.height().value } else { page.width().value };
+        let mut config = PdfRenderConfig::new()
+            .scale_page_by_factor(factor)
             .set_format(PdfBitmapFormat::BGRA)
             .use_grayscale_rendering(!job.color)
+            .use_print_quality(true)
             .render_form_data(true);
+        if turn {
+            // a quarter turn to the left: the top of the page along the left edge
+            config = config.rotate(PdfPageRenderRotation::Degrees270, true);
+        }
         let bitmap = page.render_with_config(&config).map_err(|e| format!("page {n}: {e}"))?;
         let (bw, bh) = (bitmap.width(), bitmap.height());
-        let (dw, dh) = ((bw as f32 / scale) as i32, (bh as f32 / scale) as i32);
-        let (col, row) = (k as i32 % cols, k as i32 / cols);
-        let (x, y) = (col * cell_w + (cell_w - dw) / 2, row * cell_h + (cell_h - dh) / 2);
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -318,13 +373,13 @@ const PROBLEMS: [(u32, &str); 8] = [
 ];
 
 /// The printer's problems from the spooler, and its ink asked over IPP when it is on the network.
-// ponytail: printers added by URL only (a "WSD-..." port) have no address here, so no ink
+// ponytail: network printers Windows added by itself (a "WSD-..." port) have no address here, so no ink
 pub fn printer_state(queue: &str) -> PrinterState {
     let Some((_, port, _, status)) = installed().into_iter().find(|(name, ..)| name == queue) else {
         return PrinterState::default();
     };
-    let mut state = port_host(&port)
-        .and_then(|host| ipp_attributes(&format!("ipp://{host}/ipp/print"), &STATE_ATTRIBUTES).ok())
+    let mut state = printer_uri(queue, &port)
+        .and_then(|uri| ipp_attributes(&uri, &STATE_ATTRIBUTES).ok())
         .map_or_else(PrinterState::default, |attrs| PrinterState::from(&attrs));
     for (bit, problem) in PROBLEMS {
         if status & bit != 0 && !state.problems.iter().any(|p| p == problem) {
@@ -497,12 +552,36 @@ pub fn add_printer(name: &str, uri: &str) -> Result<(), String> {
         return Err(format!("{name}: {reason}"));
     }
     res?;
-    if printers().contains(&name) { Ok(()) } else { Err(format!("Windows did not add {name}")) }
+    if !printers().contains(&name) {
+        return Err(format!("Windows did not add {name}"));
+    }
+    note_added(&name, uri);
+    Ok(())
+}
+
+/// The console window, as the file dialog's owner, so the dialog opens in front of the terminal
+/// instead of behind it (Windows Terminal hands out a stand-in window for just this).
+struct Console;
+
+impl raw_window_handle::HasWindowHandle for Console {
+    fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        use raw_window_handle::{HandleError, RawWindowHandle, Win32WindowHandle, WindowHandle};
+        let hwnd = unsafe { windows::Win32::System::Console::GetConsoleWindow() };
+        let hwnd = std::num::NonZeroIsize::new(hwnd.0 as isize).ok_or(HandleError::Unavailable)?;
+        Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::Win32(Win32WindowHandle::new(hwnd))) })
+    }
+}
+
+impl raw_window_handle::HasDisplayHandle for Console {
+    fn display_handle(&self) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Ok(raw_window_handle::DisplayHandle::windows())
+    }
 }
 
 /// The Windows file dialog.
 pub fn pick_files() -> Vec<String> {
     rfd::FileDialog::new()
+        .set_parent(&Console)
         .set_title("Files to print")
         .pick_files()
         .unwrap_or_default()
@@ -624,17 +703,33 @@ fn prints_to_microsoft_print_to_pdf() {
         printer: PRINTER.into(), file: src.to_string_lossy().into_owned(), color: false, paper: "A4",
         pages: Some("1-4".into()), reverse: true, copies: 1, collate: true, per_sheet: 2,
     };
-    print_pdf(&job, Some(&out.to_string_lossy())).unwrap();
-    // the spooler writes the file after EndDoc returns
-    let out = out.to_string_lossy().into_owned();
-    for _ in 0..50 {
-        if page_count(&out).is_some() {
-            break;
+    // the spooler writes the file after EndDoc returns; returns how the first sheet looks
+    let print = |job: &Job, out: &std::path::Path| {
+        print_pdf(job, Some(&out.to_string_lossy())).unwrap();
+        let out = out.to_string_lossy().into_owned();
+        for _ in 0..50 {
+            if page_count(&out).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    // 4 pages, 2 per sheet side
-    assert_eq!(page_count(&out), Some(2));
+        let png = format!("{out}.png");
+        render_page(&out, 1, &png).unwrap();
+        (page_count(&out), image::open(&png).unwrap().to_luma8())
+    };
+    let dark = |img: &image::GrayImage, x: f32, y: f32| img.get_pixel((x * img.width() as f32) as u32, (y * img.height() as f32) as u32)[0] < 150;
+
+    // 4 pages, 2 per sheet side: the sheet sideways, each page filling its half (not a stamp in the middle)
+    let (pages, sheet) = print(&job, &out);
+    assert_eq!(pages, Some(2));
+    assert!(sheet.width() > sheet.height());
+    assert!(dark(&sheet, 0.05, 0.5) && dark(&sheet, 0.25, 0.1) && dark(&sheet, 0.95, 0.5));
+
+    // one 6 x 8 inch page to a sheet prints at its own size: 6 of A4's 8.27 inches across
+    let one = Job { pages: Some("1".into()), per_sheet: 1, ..job };
+    let (_, sheet) = print(&one, &dir.join("one.pdf"));
+    assert!(sheet.height() > sheet.width());
+    assert!(dark(&sheet, 0.2, 0.5) && dark(&sheet, 0.8, 0.5) && !dark(&sheet, 0.08, 0.5) && !dark(&sheet, 0.92, 0.5));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

@@ -1631,6 +1631,7 @@ dependencies = [
  "pdf-writer",
  "pdfium-render",
  "ratatui",
+ "raw-window-handle",
  "rfd",
  "sha2 0.11.0",
  "unicode-width",

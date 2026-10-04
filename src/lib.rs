@@ -230,9 +230,8 @@ fn page_box(doc: &lopdf::Document, page: lopdf::ObjectId) -> Option<[f64; 4]> {
     None
 }
 
-/// A photo (PNG or JPEG) as a one-page PDF that fills the paper, turned whichever way it prints
-/// larger: the print system shrinks big pages to the paper, but prints small ones as they are.
-// ponytail: only CUPS turns a sideways photo to fit; on Windows it prints upright and smaller
+/// A photo as a one-page PDF that fills the paper, turned whichever way it prints larger: the
+/// print system shrinks big pages to the paper (turning sideways ones), but prints small ones as they are.
 fn photo_pdf(file: &str, paper: &str) -> Result<String, String> {
     let out = work_dir(file)?.join(format!("photo-{paper}.pdf"));
     if !fresh(file, &out) {
@@ -323,32 +322,60 @@ pub fn image_size(path: &str) -> Result<(u32, u32), String> {
     image::ImageReader::open(path).and_then(|r| r.with_guessed_format()).map_err(|e| format!("{path}: {e}"))?.into_dimensions().map_err(|e| format!("{path}: {e}"))
 }
 
-/// Pages per sheet side as (columns, rows) on upright paper.
-pub fn grid(per_sheet: u32) -> (u32, u32) {
+/// Pages per sheet side as (columns, rows, sideways): 2 and 6 go on a sheet turned sideways,
+/// side by side, as CUPS lays them out (and Windows prints them, see win.rs).
+pub fn sheet_grid(per_sheet: u32) -> (u32, u32, bool) {
     match per_sheet {
-        2 => (1, 2),
-        4 => (2, 2),
-        6 => (2, 3),
-        9 => (3, 3),
-        16 => (4, 4),
-        _ => (1, 1),
+        2 => (2, 1, true),
+        4 => (2, 2, false),
+        6 => (3, 2, true),
+        9 => (3, 3, false),
+        16 => (4, 4, false),
+        _ => (1, 1, false),
     }
 }
 
+/// Where each page of a sheet side goes, in the printer's dots: (x, y, width, height, turned).
+/// `area` is the printable area in dots and `dpi` the dots per inch across and down, which need
+/// not be the same (600 x 1200 dpi). A page turns a quarter when it then fits its cell better (a
+/// landscape page on upright paper). One to a sheet it prints at its own size when that fits
+/// and is shrunk to fit when not, as CUPS does; several to a sheet they fill their cells.
+#[cfg(any(windows, test))]
+fn place_pages(pages: &[(f32, f32)], per_sheet: u32, area: (i32, i32), dpi: (f32, f32)) -> Vec<(i32, i32, i32, i32, bool)> {
+    let (cols, rows, _) = sheet_grid(per_sheet);
+    let (cell_w, cell_h) = (area.0 / cols as i32, area.1 / rows as i32);
+    // the cell in inches
+    let (cw, ch) = (cell_w as f32 / dpi.0, cell_h as f32 / dpi.1);
+    pages
+        .iter()
+        .enumerate()
+        .map(|(k, &(pw, ph))| {
+            // the page in inches, as it lands on the paper
+            let turn = (pw > ph) != (cw > ch);
+            let (w, h) = if turn { (ph / 72.0, pw / 72.0) } else { (pw / 72.0, ph / 72.0) };
+            let fit = (cw / w).min(ch / h);
+            let scale = if per_sheet == 1 { fit.min(1.0) } else { fit };
+            let (dw, dh) = ((w * scale * dpi.0) as i32, (h * scale * dpi.1) as i32);
+            let (col, row) = (k as i32 % cols as i32, k as i32 / cols as i32);
+            (col * cell_w + (cell_w - dw) / 2, row * cell_h + (cell_h - dh) / 2, dw, dh, turn)
+        })
+        .collect()
+}
+
 /// One sheet side for the preview: the page images in their grid, left to right and top to
-/// bottom. CUPS turns the sheet sideways for 2 and 6 per sheet; Windows keeps it upright.
+/// bottom, each turned a quarter to the left when it then fits its cell better.
 pub fn sheet_png(pages: &[String], paper: &str, per_sheet: u32, out: &str) -> Result<(), String> {
-    let (mut cols, mut rows) = grid(per_sheet);
-    let (mut pw, mut ph) = paper_inches(paper);
-    if cfg!(unix) && matches!(per_sheet, 2 | 6) {
-        (cols, rows, pw, ph) = (rows, cols, ph, pw);
-    }
+    let (cols, rows, sideways) = sheet_grid(per_sheet);
+    let (pw, ph) = paper_inches(paper);
+    let (pw, ph) = if sideways { (ph, pw) } else { (pw, ph) };
     let px = 1400.0 / pw.max(ph);
     let (w, h) = ((pw * px) as u32, (ph * px) as u32);
     let (cw, ch) = (w / cols, h / rows);
     let mut sheet = image::RgbImage::from_pixel(w, h, image::Rgb([255, 255, 255]));
     for (k, page) in pages.iter().enumerate() {
-        let img = open(page)?.resize(cw - 8, ch - 8, FilterType::Triangle).to_rgb8();
+        let img = open(page)?;
+        let img = if (img.width() > img.height()) != (cw > ch) { img.rotate270() } else { img };
+        let img = img.resize(cw - 8, ch - 8, FilterType::Triangle).to_rgb8();
         let (x, y) = ((k as u32 % cols) * cw + (cw - img.width()) / 2, (k as u32 / cols) * ch + (ch - img.height()) / 2);
         image::imageops::overlay(&mut sheet, &img, x.into(), y.into());
         // an outline, or white pages vanish into the white sheet
@@ -1088,14 +1115,39 @@ fn photo_fills_the_paper_and_sheets_hold_their_pages() {
     assert!((w - 842.0).abs() < 5.0 && h < 595.0, "{w} x {h}");
 
     let sheet = dir.join("sheet.png").to_string_lossy().into_owned();
-    sheet_png(&[wide.clone(), wide.clone(), wide], "A4", 4, &sheet).unwrap();
+    sheet_png(&[wide.clone(), wide.clone(), wide.clone()], "A4", 4, &sheet).unwrap();
     let img = open(&sheet).unwrap().to_luma8();
     // upright sheet, 2x2: three cells hold a black page, the bottom right one stays white
     let (sw, sh) = img.dimensions();
     assert!(sh > sw);
     assert!(img.get_pixel(sw / 4, sh / 4)[0] < 50 && img.get_pixel(sw * 3 / 4, sh / 4)[0] < 50 && img.get_pixel(sw / 4, sh * 3 / 4)[0] < 50);
     assert!(img.get_pixel(sw * 3 / 4, sh * 3 / 4)[0] > 200);
+    // two to a sheet: the sheet sideways, a page on each half
+    sheet_png(&[wide.clone(), wide], "A4", 2, &sheet).unwrap();
+    let img = open(&sheet).unwrap().to_luma8();
+    let (sw, sh) = img.dimensions();
+    assert!(sw > sh && img.get_pixel(sw / 4, sh / 2)[0] < 50 && img.get_pixel(sw * 3 / 4, sh / 2)[0] < 50);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn pages_on_the_printer() {
+    // A4 printable area at 600 dpi, and an A4 page (595 x 842 pt): a bit too big, so shrunk to fit
+    let a4 = (4800, 6800);
+    let [(x, y, w, h, turned)] = place_pages(&[(595.0, 842.0)], 1, a4, (600.0, 600.0))[..] else { panic!() };
+    assert!(!turned && (4700..=4800).contains(&w) && h <= 6800 && x >= 0 && y >= 0, "{w} x {h}");
+    // an A6 page prints at its own size, in the middle
+    let [(x, _, w, h, _)] = place_pages(&[(298.0, 420.0)], 1, a4, (600.0, 600.0))[..] else { panic!() };
+    assert!((w - 2483).abs() < 3 && (h - 3500).abs() < 3 && (x - (4800 - w) / 2).abs() <= 1, "{w} x {h}");
+    // a landscape page turns on upright paper, and fills the width
+    let [(_, _, w, h, turned)] = place_pages(&[(842.0, 595.0)], 1, a4, (600.0, 600.0))[..] else { panic!() };
+    assert!(turned && h > w && w > 4600, "{w} x {h}");
+    // 1200 dpi down and 600 across: twice the dots down for the same inches, not a squashed page
+    let [(_, _, w, h, _)] = place_pages(&[(298.0, 420.0)], 1, (4800, 13600), (600.0, 1200.0))[..] else { panic!() };
+    assert!((w - 2483).abs() < 3 && (h - 7000).abs() < 4, "{w} x {h}");
+    // two to a sideways sheet (its area wider than tall): side by side, each filling its half
+    let places = place_pages(&[(595.0, 842.0), (595.0, 842.0)], 2, (6800, 4800), (600.0, 600.0));
+    assert!(places[0].0 < 3400 && places[1].0 >= 3400 && places.iter().all(|p| !p.4 && p.3 > 4700), "{places:?}");
 }
 
 #[test]
