@@ -29,7 +29,7 @@ Or with [Scoop](https://scoop.sh): `scoop install https://github.com/s0artak/Pri
 
 Run the same command again to update or uninstall (`... | sh -s uninstall` uninstalls directly).
 
-macOS and Windows need nothing else. On Linux the installer adds CUPS. Optional: LibreOffice (other documents), SANE (USB scanners), Tesseract (searchable PDFs on Linux).
+macOS and Windows need nothing else. On Linux the installer adds CUPS (and on Arch Avahi, to find printers on the network) and puts `printertui` in /usr/local/bin, or in ~/.local/bin without root (`PRINTERTUI_BIN_DIR=<folder>` picks another). It asks for sudo only when something is missing, and on image-based systems (Fedora Silverblue, NixOS, SteamOS) it installs no packages but says what to add. Optional: LibreOffice (other documents; also from Flathub or the Snap Store), SANE (USB scanners), Tesseract (searchable PDFs on Linux).
 
 Development on Arch: `bash test/dev-setup-arch.sh`. Before a commit, as CI checks: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`. `sh test/installer-preview.sh [fresh|jam|smudge]` (and `pwsh test/installer-preview.ps1` for Windows' installer) runs the installer without changing anything.
 
