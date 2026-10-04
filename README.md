@@ -4,7 +4,7 @@ Terminal app to print and scan on Linux, macOS and Windows.
 
 [![PrinterTUI demo](docs/demo.gif)](docs/demo.mp4)
 
-- Prints PDFs, photos (JPEG, PNG, BMP, GIF, TIFF, WebP; HEIC and AVIF on macOS and Windows), text files, and other documents through LibreOffice.
+- Prints PDFs, photos (JPEG, PNG, BMP, GIF, TIFF, WebP; HEIC and AVIF on macOS, and on Windows with its free HEIF and AV1 extensions), text files, and other documents through LibreOffice.
 - Preview of the pages as they will print; scale 25-200%, pages per sheet, copies, paper, color.
 - Manual double-sided printing for printers without a duplexer.
 - Scans from network printers (eSCL), SANE or Windows; saves PDF, searchable PDF (in any language) or PNG; copies (scan and print).
