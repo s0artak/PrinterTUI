@@ -353,7 +353,6 @@ pub fn render_page(pdf: &str, page: u32, png: &str) -> Result<(), String> {
 /// Prints a job, returns "request id is <id> (<printer>)" like `lp` does.
 pub fn submit(job: &Job) -> Result<String, String> {
     let id = print_pdf(job, None)?;
-    JOBS.lock().unwrap().push(id.to_string());
     Ok(format!("request id is {id} ({})", job.printer))
 }
 
@@ -418,15 +417,32 @@ pub fn discover() -> Vec<(String, String)> {
 }
 
 /// Adds an IPP printer with Windows' own IPP driver; Windows asks for administrator rights.
+/// The name and address can come from anyone on the network, so they only reach PowerShell as
+/// quoted literals inside base64-encoded scripts.
 pub fn add_printer(name: &str, uri: &str) -> Result<(), String> {
-    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
-    let add = format!("Add-Printer -Name {} -IppURL {}", quote(name), quote(uri));
-    let elevate = format!(
-        "$p = Start-Process powershell -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile','-Command',{}; exit $p.ExitCode",
-        quote(&add)
+    check_uri(uri)?;
+    let name: String = name.chars().filter(|c| !c.is_control()).collect();
+    // the elevated PowerShell has no window to show an error in, so it leaves it in a file
+    let why = std::env::temp_dir().join(format!("printertui-add-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&why);
+    let add = format!(
+        "$ErrorActionPreference = 'Stop'; try {{ Add-Printer -Name {} -IppURL {} }} catch {{ [IO.File]::WriteAllText({}, $_.Exception.Message); exit 1 }}",
+        ps_quote(&name),
+        ps_quote(uri),
+        ps_quote(&why.to_string_lossy())
     );
-    run("powershell", &["-NoProfile", "-Command", &elevate])?;
-    if printers().iter().any(|p| p == name) { Ok(()) } else { Err(format!("Windows did not add {name}")) }
+    let elevate = format!(
+        "try {{ $p = Start-Process powershell -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{}'; exit $p.ExitCode }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}",
+        ps_encoded(&add)
+    );
+    let res = run("powershell", &["-NoProfile", "-NonInteractive", "-EncodedCommand", &ps_encoded(&elevate)]);
+    let reason = std::fs::read_to_string(&why).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let _ = std::fs::remove_file(&why);
+    if let Some(reason) = reason {
+        return Err(format!("{name}: {reason}"));
+    }
+    res?;
+    if printers().contains(&name) { Ok(()) } else { Err(format!("Windows did not add {name}")) }
 }
 
 /// The Windows file dialog.

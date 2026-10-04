@@ -19,13 +19,10 @@ pub fn printers() -> Vec<String> {
         .lines()
         .map(str::to_string)
         .collect();
-    if let Some(def) = run("lpstat", &["-d"])
-        .ok()
-        .and_then(|s| s.rsplit(": ").next().map(str::to_string))
+    if let Some(def) = run("lpstat", &["-d"]).ok().and_then(|s| s.rsplit(": ").next().map(str::to_string))
+        && let Some(i) = list.iter().position(|p| *p == def)
     {
-        if let Some(i) = list.iter().position(|p| *p == def) {
-            list.swap(0, i);
-        }
+        list.swap(0, i);
     }
     list
 }
@@ -90,11 +87,7 @@ pub fn printer_labels(queues: &[String]) -> Vec<String> {
 pub fn submit(job: &Job) -> Result<String, String> {
     let args = lp_args(job);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = run("lp", &args)?;
-    if let Some(id) = job_id(&out) {
-        JOBS.lock().unwrap().push(id.to_string());
-    }
-    Ok(out)
+    run("lp", &args)
 }
 
 /// True while the job is still pending, held or printing.

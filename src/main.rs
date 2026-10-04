@@ -70,7 +70,6 @@ struct ScannedPage {
     thumb: Thumb,
 }
 
-type Thumb = (usize, usize, Vec<u8>);
 
 /// What the Print tab preview shows: the n-th sheet side of the first file as it will print.
 #[derive(Clone, PartialEq)]
@@ -93,6 +92,8 @@ struct PrintView {
     title: String,
 }
 
+// one Mode at a time, so the big duplex variant costs nothing
+#[allow(clippy::large_enum_variant)]
 enum Mode {
     Main,
     /// Editing the selected text field (vim-style, entered with `i`).
@@ -103,8 +104,9 @@ enum Mode {
     /// Page selector: one checkbox per page of the first file.
     Pages(Vec<bool>, ListState),
     /// Manual duplex: `job` is the front job while it is still printing, `steps` the flip
-    /// instructions shown after it, `back` the back-side job, `files[next..]` the files still to print.
-    Flip { job: Option<String>, steps: String, back: Job, files: Vec<String>, next: usize },
+    /// instructions shown after it, `back` the back-side job, `files[next..]` the files still to
+    /// print with `print`'s settings.
+    Flip { job: Option<String>, steps: String, back: Job, files: Vec<String>, next: usize, print: PrintSettings },
     /// Print queue popup: (job number, description), refreshed every second.
     Queue(Vec<(String, String)>, ListState),
 }
@@ -149,8 +151,14 @@ struct App {
     scans: Vec<ScannedPage>,
     /// Page shown in the preview and edited by the Page row.
     cur: usize,
-    /// Slow work (scanning, converting, discovery) runs in a thread so the UI keeps drawing.
+    /// Slow work (scanning, converting, printing, discovery) runs in a thread so the UI keeps drawing.
     busy: Option<(String, mpsc::Receiver<Done>)>,
+    /// The busy work is sending a print, which quitting waits for.
+    sending: bool,
+    /// Quit once the print being sent is in the printer's queue.
+    quit_after: bool,
+    /// The print queue / duplex front job check running in the background.
+    polling: Option<mpsc::Receiver<Done>>,
     /// A scan is running (the printer shows its scan light).
     scanning: bool,
     /// Redraw the whole screen: another language can leave letters of different widths behind.
@@ -213,6 +221,9 @@ fn main() -> std::io::Result<()> {
         scans: Vec::new(),
         cur: 0,
         busy: None,
+        sending: false,
+        quit_after: false,
+        polling: None,
         scanning: false,
         clear: false,
         lang: String::new(),
@@ -301,7 +312,11 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     loop {
         if let Some(done) = app.busy.as_ref().and_then(|(_, rx)| finished(rx)) {
             app.busy = None;
+            app.sending = false;
             done(app);
+            if app.quit_after {
+                return Ok(());
+            }
         }
         if let Some(done) = app.editing.as_ref().and_then(finished) {
             app.editing = None;
@@ -315,20 +330,13 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
             app.checking = None;
             done(app);
         }
+        if let Some(done) = app.polling.as_ref().and_then(finished) {
+            app.polling = None;
+            done(app);
+        }
         app.check_printer();
         app.sync_view();
-        if app.last_poll.elapsed() >= Duration::from_secs(1) {
-            app.last_poll = Instant::now();
-            if let Mode::Flip { job, steps, .. } = &mut app.mode
-                && job.as_deref().is_some_and(|id| !job_active(id))
-            {
-                *job = None;
-                app.status = std::mem::take(steps);
-            }
-            if let Mode::Queue(jobs, _) = &mut app.mode {
-                *jobs = queue();
-            }
-        }
+        app.poll_jobs();
         if app.status != app.heard {
             app.heard = app.status.clone();
             if app.status.starts_with(t().error) {
@@ -387,6 +395,13 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                         }
                     }
                     KeyCode::Char(c) if app.tab == Tab::Scan && app.sel == PAGE && !app.scans.is_empty() && app.page_key(c, dd) => {}
+                    // a print still being sent would be lost: wait for it, unless asked twice
+                    KeyCode::Esc | KeyCode::Char('q') if app.sending && !app.quit_after => {
+                        app.quit_after = true;
+                        if let Some((msg, _)) = &mut app.busy {
+                            *msg = t().sending_first.into();
+                        }
+                    }
                     KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
                     KeyCode::Up | KeyCode::Char('k') => app.sel = app.sel.checked_sub(1).unwrap_or(app.last()),
                     KeyCode::Down | KeyCode::Char('j') => app.sel = (app.sel + 1) % (app.last() + 1),
@@ -521,7 +536,9 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                                 Ok(()) => fill(t().cancelled, &[("desc", &desc)]),
                                 Err(e) => failed(e),
                             };
-                            *jobs = queue();
+                            // the list catches up at the next check, which is due right away
+                            jobs.retain(|(j, _)| *j != id);
+                            app.last_poll = app.last_poll.checked_sub(Duration::from_secs(1)).unwrap_or(app.last_poll);
                         }
                     }
                     _ => {}
@@ -531,10 +548,7 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                         app.status = t().back_cancelled.into();
                         app.mode = Mode::Main;
                     }
-                    KeyCode::Enter if job.is_none() => {
-                        let res = app.back_side();
-                        app.show(res);
-                    }
+                    KeyCode::Enter if job.is_none() => app.back_side(),
                     _ => {}
                 },
             }
@@ -634,7 +648,7 @@ impl App {
         *term = init();
         self.status = match res {
             Ok(()) => fill(t().added, &[("name", &name)]),
-            Err(e) => e,
+            Err(e) => failed(e),
         };
         self.set_printers(printers());
         self.printer = self.printers.iter().position(|p| p == name).unwrap_or(0);
@@ -892,10 +906,23 @@ impl App {
     }
 
 
-    fn job(&self, file: &str, pages: Option<String>, reverse: bool, collate: bool) -> Job {
-        Job {
-            printer: self.printers[self.printer].clone(), file: file.into(), color: self.color, paper: PAPERS[self.paper], pages, reverse,
-            copies: self.copies, collate, per_sheet: PER_SHEET[self.per_sheet],
+    /// The Print tab's settings for a print, copied when it starts, as it is sent in the background.
+    fn print_settings(&self) -> PrintSettings {
+        PrintSettings {
+            job: Job {
+                printer: self.printers.get(self.printer).cloned().unwrap_or_default(),
+                file: String::new(),
+                color: self.color,
+                paper: PAPERS[self.paper],
+                pages: None,
+                reverse: false,
+                copies: self.copies,
+                collate: true,
+                per_sheet: PER_SHEET[self.per_sheet],
+            },
+            pages: self.pages.clone(),
+            duplex: self.duplex,
+            reverse_back: self.reverse_back,
         }
     }
 
@@ -911,83 +938,143 @@ impl App {
         Ok(files)
     }
 
-    /// Converts the files to PDF in the background, then sends the jobs.
+    /// Runs `work`, which sends a print, in the background; quitting waits for it.
+    fn send(&mut self, msg: impl Into<String>, work: impl FnOnce() -> Done + Send + 'static) {
+        self.spawn(msg, work);
+        self.sending = true;
+    }
+
+    /// Converts the files to PDF and sends the jobs, in the background (drawing the pages for the
+    /// printer takes a while on Windows).
     fn try_print(&mut self) {
         let files = match self.files() {
             Ok(f) => f,
             Err(e) => return self.show(Err(e)),
         };
         let (scale, paper) = (SCALES[self.scale], PAPERS[self.paper]);
-        self.spawn(t().preparing, move || {
-            let pdfs: Result<Vec<String>, String> = files.iter().map(|f| printable(f, scale, paper)).collect();
-            Box::new(move |app: &mut App| {
-                let res = pdfs.and_then(|p| app.print_pdfs(p));
-                app.show(res)
-            })
+        let print = self.print_settings();
+        self.send(t().preparing, move || {
+            let res = files.iter().map(|f| printable(f, scale, paper)).collect::<Result<Vec<_>, _>>().and_then(|pdfs| print_pdfs(&print, pdfs));
+            Box::new(move |app: &mut App| app.printed(res))
         });
     }
 
-    fn print_pdfs(&mut self, pdfs: Vec<String>) -> Result<String, String> {
-        if self.duplex {
-            return self.duplex(pdfs, 0, String::new());
-        }
-        let pages = self.pages.trim();
-        let all = pages.is_empty() || pages == "all";
-        // checked against each PDF: CUPS takes page-ranges beyond the last page without a word
-        let sent: Result<Vec<String>, String> = pdfs
-            .iter()
-            .map(|p| {
-                let range = if all { None } else { Some(join(&parse_ranges(pages, page_count(p).ok_or(t().unreadable_pdf)?)?)) };
-                submit(&self.job(p, range, false, true))
-            })
-            .collect();
-        Ok(sent?.join("\n"))
+    /// Sends the back side the person turned over, then the next files.
+    fn back_side(&mut self) {
+        let Mode::Flip { back, files, next, print, .. } = std::mem::replace(&mut self.mode, Mode::Main) else { return };
+        self.send(t().preparing, move || {
+            let res = submit(&back).and_then(|id| duplex(&print, files, next, fill(t().back_sent, &[("id", &id)]) + "\n\n"));
+            Box::new(move |app: &mut App| app.printed(res))
+        });
     }
 
-    /// Prints the front of files[i..] until one needs flipping, then waits in Mode::Flip.
-    fn duplex(&mut self, files: Vec<String>, mut i: usize, mut done: String) -> Result<String, String> {
-        self.mode = Mode::Main;
-        while let Some(file) = files.get(i) {
-            i += 1;
-            let head = if files.len() > 1 { fill(t().file_of, &[("i", &i), ("n", &files.len()), ("name", &name(file))]) + "\n" } else { String::new() };
-            let pdf = file.clone();
-            let total = page_count(&pdf).ok_or(t().unreadable_pdf)?;
-            // page-ranges picks pages before number-up groups them, so split whole sheet sides
-            let pages = parse_ranges(&self.pages, total)?;
-            let sides: Vec<&[u32]> = pages.chunks(PER_SHEET[self.per_sheet] as usize).collect();
-            let (front, back) = split_duplex(&sides);
-            // Collated copies would leave a sheet without back side inside every copy when odd.
-            let odd = front.len() > back.len();
-            let (front, back) = (front.concat(), back.concat());
-            let id = submit(&self.job(&pdf, Some(join(&front)), false, !odd))?;
-            if back.is_empty() {
-                done += &format!("{head}{}\n\n", fill(t().one_page, &[("id", &id)]));
-                continue;
+    /// A sent print's result: the status, and the duplex popup when the stack has to be turned.
+    fn printed(&mut self, res: Result<(String, Option<Mode>), String>) {
+        let res = res.map(|(status, flip)| {
+            if let Some(flip) = flip {
+                self.mode = flip;
             }
-            let aside = match (odd, self.copies) {
-                (false, _) => String::new(),
-                (true, 1) => t().aside_one.into(),
-                (true, n) => fill(t().aside_many, &[("n", &n)]),
-            };
-            let sent = fill(t().front_sent, &[("id", &id)]);
-            let steps = format!("{done}{head}{sent}\n\n{}", fill(t().flip_steps, &[("aside", &aside)]));
-            let wait = format!("{done}{head}{sent}\n\n{}", t().printing_front);
-            // unparsable lp output: "" is never listed as active, so the steps show right away
-            let job = Some(job_id(&id).unwrap_or_default().to_string());
-            let back = self.job(&pdf, Some(join(&back)), self.reverse_back, !odd);
-            self.mode = Mode::Flip { job, steps, back, files, next: i };
-            return Ok(wait);
-        }
-        Ok(done.trim_end().to_string())
+            status
+        });
+        self.show(res);
     }
 
-    fn back_side(&mut self) -> Result<String, String> {
-        let Mode::Flip { back, files, next, .. } = std::mem::replace(&mut self.mode, Mode::Main) else {
-            return Ok(String::new());
+    /// Every second while they show: checks whether the duplex front job is done, and refreshes
+    /// the print queue popup, in the background (a shared printer can take a while to answer).
+    fn poll_jobs(&mut self) {
+        if self.polling.is_some() || self.last_poll.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        let front = match &self.mode {
+            Mode::Flip { job: Some(id), .. } => Some(id.clone()),
+            _ => None,
         };
-        let id = submit(&back)?;
-        self.duplex(files, next, fill(t().back_sent, &[("id", &id)]) + "\n\n")
+        let refresh = matches!(self.mode, Mode::Queue(..));
+        if front.is_none() && !refresh {
+            return;
+        }
+        self.last_poll = Instant::now();
+        self.polling = Some(task(move || {
+            let printed = front.filter(|id| !job_active(id));
+            let jobs = refresh.then(queue);
+            Box::new(move |app: &mut App| {
+                if let Mode::Flip { job, steps, .. } = &mut app.mode
+                    && printed.is_some()
+                    && *job == printed
+                {
+                    *job = None;
+                    app.status = std::mem::take(steps);
+                }
+                if let (Mode::Queue(list, _), Some(jobs)) = (&mut app.mode, jobs) {
+                    *list = jobs;
+                }
+            })
+        }));
     }
+}
+
+/// The Print tab's settings for one print.
+#[derive(Clone)]
+struct PrintSettings {
+    /// Printer, color, paper, copies and pages per sheet; each file gets its own name and pages.
+    job: Job,
+    pages: String,
+    duplex: bool,
+    reverse_back: bool,
+}
+
+/// Sends the PDFs; with manual duplex, their front sides until one needs turning over.
+/// Returns the status, and the Flip mode to wait in for that.
+fn print_pdfs(print: &PrintSettings, pdfs: Vec<String>) -> Result<(String, Option<Mode>), String> {
+    if print.duplex {
+        return duplex(print, pdfs, 0, String::new());
+    }
+    let pages = print.pages.trim();
+    let all = pages.is_empty() || pages == "all";
+    // checked against each PDF: CUPS takes page-ranges beyond the last page without a word
+    let sent: Result<Vec<String>, String> = pdfs
+        .iter()
+        .map(|p| {
+            let range = if all { None } else { Some(join(&parse_ranges(pages, page_count(p).ok_or(t().unreadable_pdf)?)?)) };
+            submit(&Job { file: p.clone(), pages: range, ..print.job.clone() })
+        })
+        .collect();
+    Ok((sent?.join("\n"), None))
+}
+
+/// Prints the front of files[i..] until one needs flipping, then waits in Mode::Flip.
+fn duplex(print: &PrintSettings, files: Vec<String>, mut i: usize, mut done: String) -> Result<(String, Option<Mode>), String> {
+    while let Some(file) = files.get(i) {
+        i += 1;
+        let head = if files.len() > 1 { fill(t().file_of, &[("i", &i), ("n", &files.len()), ("name", &name(file))]) + "\n" } else { String::new() };
+        let pdf = file.clone();
+        let total = page_count(&pdf).ok_or(t().unreadable_pdf)?;
+        // page-ranges picks pages before number-up groups them, so split whole sheet sides
+        let pages = parse_ranges(&print.pages, total)?;
+        let sides: Vec<&[u32]> = pages.chunks(print.job.per_sheet as usize).collect();
+        let (front, back) = split_duplex(&sides);
+        // Collated copies would leave a sheet without back side inside every copy when odd.
+        let odd = front.len() > back.len();
+        let (front, back) = (front.concat(), back.concat());
+        let id = submit(&Job { file: pdf.clone(), pages: Some(join(&front)), collate: !odd, ..print.job.clone() })?;
+        if back.is_empty() {
+            done += &format!("{head}{}\n\n", fill(t().one_page, &[("id", &id)]));
+            continue;
+        }
+        let aside = match (odd, print.job.copies) {
+            (false, _) => String::new(),
+            (true, 1) => t().aside_one.into(),
+            (true, n) => fill(t().aside_many, &[("n", &n)]),
+        };
+        let sent = fill(t().front_sent, &[("id", &id)]);
+        let steps = format!("{done}{head}{sent}\n\n{}", fill(t().flip_steps, &[("aside", &aside)]));
+        let wait = format!("{done}{head}{sent}\n\n{}", t().printing_front);
+        // unparsable lp output: "" is never listed as active, so the steps show right away
+        let job = Some(job_id(&id).unwrap_or_default().to_string());
+        let back = Job { file: pdf, pages: Some(join(&back)), reverse: print.reverse_back, collate: !odd, ..print.job.clone() };
+        return Ok((wait, Some(Mode::Flip { job, steps, back, files, next: i, print: print.clone() })));
+    }
+    Ok((done.trim_end().to_string(), None))
 }
 
 impl App {
@@ -1026,7 +1113,7 @@ impl App {
                     if max_w > 0 && max_h > 0 && *w > 0 && *h > 0 {
                         let scale = (max_w as f32 / *w as f32).min(max_h as f32 / *h as f32);
                         let ow = ((*w as f32 * scale) as usize).clamp(10, max_w);
-                        let oh = (((((*h as f32 * scale) as usize) + 5) / 6 * 6).max(6)).min(max_h / 6 * 6);
+                        let oh = (((*h as f32 * scale) as usize).div_ceil(6) * 6).max(6).min(max_h / 6 * 6);
                         if ow > 0 && oh > 0 {
                             let small = downscale(*w, *h, px, ow, oh);
                             let sixel = sixel_encode(ow, oh, &small);
@@ -1369,8 +1456,8 @@ impl App {
         }
         let pdf = std::env::temp_dir().join("printertui-scan").join("copy.pdf");
         let (dpi, scale, paper) = (SCAN_DPI[self.scan_dpi], SCALES[self.scale], PAPERS[self.paper]);
-        let job = self.job("", None, false, true);
-        self.spawn(t().printing_copy, move || {
+        let job = self.print_settings().job;
+        self.send(t().printing_copy, move || {
             let res = images_to_pdf(&files, dpi, &[])
                 .and_then(|data| std::fs::write(&pdf, data).map_err(|e| format!("{}: {e}", pdf.display())))
                 .and_then(|_| printable(&pdf.to_string_lossy(), scale, paper))

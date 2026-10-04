@@ -18,9 +18,9 @@ use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref, Str};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
-/// Running child pids, and CUPS job ids / eSCL job urls this process started; `stop_all` ends them.
+/// Running child pids, and the eSCL scan job urls this process started; `stop_all` ends them.
 static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-static JOBS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static SCAN_JOBS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 pub const PAPERS: [&str; 5] = ["A4", "Letter", "Legal", "A5", "A3"];
 /// Pages per sheet side (`number-up`).
@@ -41,10 +41,46 @@ fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
     let out = child.wait_with_output();
     CHILDREN.lock().unwrap().retain(|&p| p != pid);
     let out = out.map_err(|e| format!("{cmd}: {e}"))?;
+    let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
     if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        return Ok(text(&out.stdout));
+    }
+    // a tool that fails without a word still gets an error that says something
+    let err = [text(&out.stderr), text(&out.stdout)].into_iter().find(|e| !e.is_empty());
+    Err(err.unwrap_or_else(|| format!("{cmd}: {}", out.status)))
+}
+
+/// A PowerShell string literal. PowerShell ends a '...' string at the typographic quotes ‘ ’ ‚ ‛
+/// as well as at ', so all of them are doubled: no name or address can end it early.
+#[cfg(any(windows, test))]
+fn ps_quote(s: &str) -> String {
+    let mut out = String::from("'");
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
+/// A script for `powershell -EncodedCommand`: base64 of its UTF-16 text, which no command line can misread.
+#[cfg(any(windows, test))]
+fn ps_encoded(script: &str) -> String {
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64(&utf16)
+}
+
+/// A printer address to hand to the system: ipp, ipps, http or https, in printable ASCII without
+/// quotes, so an address announced on the network cannot carry anything else.
+#[cfg(any(windows, test))]
+fn check_uri(uri: &str) -> Result<(), String> {
+    let scheme = matches!(uri_host(uri), Some(("ipp" | "ipps" | "http" | "https", _)));
+    if scheme && uri.chars().all(|c| c.is_ascii_graphic() && !matches!(c, '\'' | '"' | '`')) {
+        Ok(())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        Err(format!("Not a printer address: {uri}"))
     }
 }
 
@@ -368,19 +404,15 @@ pub fn parse_config(text: &str) -> Vec<(&str, &str)> {
     text.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect()
 }
 
-/// On quit: cancels this session's unfinished print and scan jobs and kills running tools
-/// (their children first, e.g. LibreOffice's soffice.bin, so none are left orphaned).
+/// On quit: kills running tools (their children first, e.g. LibreOffice's soffice.bin, so none
+/// are left orphaned) and cancels the scan running on the scanner. Print jobs already sent keep
+/// printing, as with any other app; the queue popup and the system can still cancel them.
 pub fn stop_all() {
     let pids = CHILDREN.lock().unwrap().clone();
     if !pids.is_empty() {
         kill_tree(&pids);
     }
-    let jobs = std::mem::take(&mut *JOBS.lock().unwrap());
-    let (scans, prints): (Vec<String>, Vec<String>) = jobs.into_iter().partition(|j| j.starts_with("http"));
-    for id in prints.iter().filter(|id| job_active(id)) {
-        let _ = cancel_job(id);
-    }
-    for job in scans {
+    for job in std::mem::take(&mut *SCAN_JOBS.lock().unwrap()) {
         let _ = minreq::delete(job).with_timeout(2).send();
     }
 }
@@ -596,11 +628,11 @@ fn escl_scan(url: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
     let job = res.header("location").map(str::trim).ok_or("The scanner did not return a scan job")?;
     // Location may be relative to the scanner ("/eSCL/ScanJobs/..."), keep scheme://host from the url
     let job = if job.starts_with('/') { format!("{}{job}", url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/")) } else { job.to_string() };
-    JOBS.lock().unwrap().push(job.clone());
+    SCAN_JOBS.lock().unwrap().push(job.clone());
     // the scanner answers 503 until the page is ready
     let res = retry_busy(30, || minreq::get(format!("{job}/NextDocument")).with_timeout(600).send())
         .and_then(|page| std::fs::write(out, page.as_bytes()).map_err(|e| e.to_string()));
-    JOBS.lock().unwrap().retain(|j| *j != job);
+    SCAN_JOBS.lock().unwrap().retain(|j| *j != job);
     res.map_err(|e| format!("Could not download the scanned page: {e}"))
 }
 
@@ -645,9 +677,12 @@ fn save_png(img: &DynamicImage, path: &str) -> Result<(), String> {
     img.save_with_format(path, ImageFormat::Png).map_err(|e| format!("{path}: {e}"))
 }
 
-/// Grayscale thumbnail of an image as (width, height, pixels), plus `<image>.preview.png`
-/// in full quality for terminals with the kitty graphics protocol.
-pub fn thumbnail(image: &str) -> Result<(usize, usize, Vec<u8>), String> {
+/// A grayscale thumbnail: width, height and pixels.
+pub type Thumb = (usize, usize, Vec<u8>);
+
+/// Grayscale thumbnail of an image, plus `<image>.preview.png` in full quality for terminals
+/// with the kitty graphics protocol.
+pub fn thumbnail(image: &str) -> Result<Thumb, String> {
     let img = open(image)?;
     save_png(&img.resize(1200, u32::MAX, FilterType::Triangle), &format!("{image}.preview.png"))?;
     // thicken text before shrinking, or it fades to near-white at terminal resolution
@@ -896,7 +931,7 @@ pub const FILTERS: [&str; 3] = ["Original", "Gray", "B&W"];
 
 /// Rotates (degrees clockwise) and filters a scanned page, always starting from the original scan.
 /// Returns the edited file (the original itself when there is nothing to do) and its thumbnail.
-pub fn edit_page(orig: &str, rot: u16, filter: usize) -> Result<(String, (usize, usize, Vec<u8>)), String> {
+pub fn edit_page(orig: &str, rot: u16, filter: usize) -> Result<(String, Thumb), String> {
     let out = if rot == 0 && filter == 0 {
         orig.to_string()
     } else {
@@ -1013,6 +1048,36 @@ fn text_files_print_without_libreoffice() {
     assert!(plain_text(&dir.join("a.html").to_string_lossy()).is_none());
     assert!(plain_text(&pdf).is_none());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn printer_names_stay_inside_powershell_strings() {
+    assert_eq!(ps_quote("HP 'Tank'"), "'HP ''Tank'''");
+    // a name announced on the network that tries to end the string with a typographic quote
+    assert_eq!(ps_quote("Tank\u{2019}; calc; #"), "'Tank\u{2019}\u{2019}; calc; #'");
+    for q in ['\'', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
+        let quoted = ps_quote(&format!("a{q}b{q}{q}c"));
+        let inner: String = quoted.chars().skip(1).take(quoted.chars().count() - 2).collect();
+        // inside, quotes only come in pairs, which PowerShell reads as one quote and not as the end
+        assert!(inner.split(|c: char| c != q).all(|run| run.chars().count() % 2 == 0), "{quoted}");
+    }
+    assert_eq!(ps_encoded("A"), base64(&[0x41, 0]));
+    assert!(check_uri("ipp://192.168.1.46:631/ipp/print").is_ok());
+    assert!(check_uri("ipps://HP4A8B2C.local/ipp/print").is_ok());
+    assert!(check_uri("ipp://x/ipp/print'; calc").is_err());
+    assert!(check_uri("ipp://x/ipp print").is_err());
+    assert!(check_uri("file:///C:/Windows").is_err());
+}
+
+#[test]
+fn failing_tools_say_why() {
+    #[cfg(unix)]
+    let _one = unix::SPAWNS.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(unix)]
+    let err = run("sh", &["-c", "exit 3"]).unwrap_err();
+    #[cfg(windows)]
+    let err = run("cmd", &["/C", "exit 3"]).unwrap_err();
+    assert!(err.contains('3'), "{err}");
 }
 
 #[test]
