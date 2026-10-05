@@ -413,13 +413,14 @@ pub type IppAttributes = std::collections::HashMap<String, Vec<IppValue>>;
 /// What the printer state shows: ink, and the problems that need a person.
 pub const STATE_ATTRIBUTES: [&str; 5] = ["printer-state", "printer-state-reasons", "marker-colors", "marker-levels", "marker-low-levels"];
 
-/// Asks a printer for attributes over IPP (Get-Printer-Attributes). `url` is its ipp://,
-/// ipps:// or http:// address; the request goes over plain HTTP, port 631 unless one is given.
-pub fn ipp_attributes(url: &str, names: &[&str]) -> Result<IppAttributes, String> {
+/// Asks a printer for attributes over IPP (Get-Printer-Attributes), or about one of its jobs
+/// (Get-Job-Attributes). `url` is its ipp://, ipps:// or http:// address; the request goes over
+/// plain HTTP, port 631 unless one is given.
+pub fn ipp_attributes(url: &str, job: Option<i32>, names: &[&str]) -> Result<IppAttributes, String> {
     let (_, rest) = url.split_once("://").ok_or(format!("Bad printer address: {url}"))?;
     let (authority, path) = rest.find('/').map_or((rest, "/ipp/print"), |i| (&rest[..i], &rest[i..]));
     let authority = if authority.contains(':') { authority.to_string() } else { format!("{authority}:631") };
-    let mut body = vec![1, 1, 0, 0x0B, 0, 0, 0, 1, 0x01];
+    let mut body = vec![1, 1, 0, if job.is_some() { 0x09 } else { 0x0B }, 0, 0, 0, 1, 0x01];
     let mut attr = |tag: u8, name: &str, value: &[u8]| {
         body.push(tag);
         body.extend((name.len() as u16).to_be_bytes());
@@ -430,6 +431,9 @@ pub fn ipp_attributes(url: &str, names: &[&str]) -> Result<IppAttributes, String
     attr(0x47, "attributes-charset", b"utf-8");
     attr(0x48, "attributes-natural-language", b"en");
     attr(0x45, "printer-uri", format!("ipp://{authority}{path}").as_bytes());
+    if let Some(id) = job {
+        attr(0x21, "job-id", &id.to_be_bytes());
+    }
     for (i, name) in names.iter().enumerate() {
         // more values of the same attribute have no name
         attr(0x44, if i == 0 { "requested-attributes" } else { "" }, name.as_bytes());

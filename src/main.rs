@@ -103,8 +103,9 @@ enum Mode {
     /// Page selector: one checkbox per page of the first file.
     Pages(Vec<bool>, ListState),
     /// Manual duplex: `job` is the front job while it is still printing, `steps` the flip
-    /// instructions shown after it, `back` the back-side job, `files[next..]` the files still to print.
-    Flip { job: Option<String>, steps: String, back: Job, files: Vec<String>, next: usize },
+    /// instructions shown after it, `back` the back-side job and its page count, `files[next..]`
+    /// the files still to print.
+    Flip { job: Option<String>, steps: String, back: (Job, usize), files: Vec<String>, next: usize },
     /// Print queue popup: (job number, description), refreshed every second.
     Queue(Vec<(String, String)>, ListState),
 }
@@ -175,6 +176,8 @@ struct App {
     heard: String,
     /// What the printer is doing.
     act: Act,
+    /// Jobs being printed, as (job id, sheet sides, sides printed so far).
+    printing: Vec<(String, u32, u32)>,
     mode: Mode,
 }
 
@@ -228,6 +231,7 @@ fn main() -> std::io::Result<()> {
         status: String::new(),
         heard: String::new(),
         act: Act::Idle,
+        printing: Vec::new(),
         mode: Mode::Main,
     };
     app.set_printers(printers());
@@ -328,6 +332,13 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
             if let Mode::Queue(jobs, _) = &mut app.mode {
                 *jobs = queue();
             }
+            if !app.printing.is_empty() {
+                app.follow_jobs();
+            }
+        }
+        // pages keep coming out while the jobs print, also after a hop or a jam
+        if !app.printing.is_empty() && app.act.done() {
+            app.act = Act::Print(Instant::now(), 0);
         }
         if app.status != app.heard {
             app.heard = app.status.clone();
@@ -832,16 +843,17 @@ impl App {
         });
     }
 
-    /// A print's result: pages come out of the printer, or the status says what went wrong.
+    /// A print's result: pages come out of the printer until its jobs are done (the sound plays
+    /// once), or the status says what went wrong.
     fn show(&mut self, res: Result<String, String>) {
         if res.is_ok() {
-            self.act = Act::Print(Instant::now(), self.copies.clamp(1, 3));
+            self.act = Act::Print(Instant::now(), if self.printing.is_empty() { 1 } else { 0 });
             sound::play(Sound::Print);
         }
         self.status = match res {
             Ok(s) => match self.save() {
                 Ok(()) => s,
-                Err(e) => format!("{s}\n\n{}", fill(t().settings_not_saved, &[("e", &e)])),
+                Err(e) => format!("{s}\n\n{}", fill(t().settings_not_saved, &[("e", &e)])).trim_start().into(),
             },
             Err(e) => failed(e),
         }
@@ -927,21 +939,68 @@ impl App {
         });
     }
 
+    /// Sends a job and follows it in the bubble; `pages` is how many it prints, before number-up and copies.
+    fn send(&mut self, job: &Job, pages: usize) -> Result<String, String> {
+        let out = submit(job)?;
+        self.follow(&out, job, pages);
+        Ok(out)
+    }
+
+    fn follow(&mut self, lp_out: &str, job: &Job, pages: usize) {
+        if let Some(id) = job_id(lp_out) {
+            self.printing.push((id.into(), pages.div_ceil(job.per_sheet as usize) as u32 * job.copies, 0));
+        }
+    }
+
+    /// Asks how the jobs being printed are doing. Once all are done, a last page comes out and
+    /// the printer says so; not when one was cancelled, or before the flip in a manual duplex.
+    fn follow_jobs(&mut self) {
+        let states: Vec<(i32, u32)> = self.printing.iter().map(|(id, ..)| job_progress(id)).collect();
+        // 7 canceled, 8 aborted, 9 completed
+        if states.iter().all(|(state, _)| *state >= 7) {
+            let ok = states.iter().all(|(state, _)| *state == 9);
+            self.printing.clear();
+            self.act = if ok { Act::Print(Instant::now(), 1) } else { Act::Idle };
+            if ok && !matches!(self.mode, Mode::Flip { .. }) && !self.status.starts_with(t().error) {
+                self.status = t().printed.into();
+            }
+            return;
+        }
+        for ((_, sides, done), (state, n)) in self.printing.iter_mut().zip(states) {
+            *done = if state >= 7 { *sides } else { n.min(*sides) };
+        }
+    }
+
+    /// The bubble while printing: the page coming out of all that were sent, a bar, and any news.
+    fn progress(&self) -> String {
+        let (done, total) = self.printing.iter().fold((0, 0), |(d, t), (_, sides, n)| (d + n, t + sides));
+        let total = total.max(1);
+        let bar = (10 * done / total) as usize;
+        let page = fill(t().printing_page, &[("i", &(done + 1).min(total)), ("n", &total)]);
+        let mut text = format!("{page}\n{}{}", "█".repeat(bar), "░".repeat(10 - bar));
+        // in a manual duplex the status is the popup's text
+        let news = Some(self.status.clone()).filter(|s| !s.is_empty() && !matches!(self.mode, Mode::Flip { .. }));
+        for s in [news, self.complaint()].into_iter().flatten() {
+            text += &format!("\n\n{s}");
+        }
+        text
+    }
+
     fn print_pdfs(&mut self, pdfs: Vec<String>) -> Result<String, String> {
         if self.duplex {
             return self.duplex(pdfs, 0, String::new());
         }
-        let pages = self.pages.trim();
+        let pages = self.pages.trim().to_string();
         let all = pages.is_empty() || pages == "all";
-        // checked against each PDF: CUPS takes page-ranges beyond the last page without a word
-        let sent: Result<Vec<String>, String> = pdfs
-            .iter()
-            .map(|p| {
-                let range = if all { None } else { Some(join(&parse_ranges(pages, page_count(p).ok_or(t().unreadable_pdf)?)?)) };
-                submit(&self.job(p, range, false, true))
-            })
-            .collect();
-        Ok(sent?.join("\n"))
+        for p in &pdfs {
+            let total = page_count(p);
+            // checked against each PDF: CUPS takes page-ranges beyond the last page without a word
+            let range = if all { None } else { Some(parse_ranges(&pages, total.ok_or(t().unreadable_pdf)?)?) };
+            let n = range.as_ref().map_or(total.unwrap_or(1) as usize, Vec::len);
+            let job = self.job(p, range.map(|r| join(&r)), false, true);
+            self.send(&job, n)?;
+        }
+        Ok(String::new())
     }
 
     /// Prints the front of files[i..] until one needs flipping, then waits in Mode::Flip.
@@ -959,9 +1018,9 @@ impl App {
             // Collated copies would leave a sheet without back side inside every copy when odd.
             let odd = front.len() > back.len();
             let (front, back) = (front.concat(), back.concat());
-            let id = submit(&self.job(&pdf, Some(join(&front)), false, !odd))?;
+            let id = self.send(&self.job(&pdf, Some(join(&front)), false, !odd), front.len())?;
             if back.is_empty() {
-                done += &format!("{head}{}\n\n", fill(t().one_page, &[("id", &id)]));
+                done += &format!("{head}{}\n\n", fill(t().one_page, &[("id", &job_no(&id))]));
                 continue;
             }
             let aside = match (odd, self.copies) {
@@ -969,12 +1028,12 @@ impl App {
                 (true, 1) => t().aside_one.into(),
                 (true, n) => fill(t().aside_many, &[("n", &n)]),
             };
-            let sent = fill(t().front_sent, &[("id", &id)]);
+            let sent = fill(t().front_sent, &[("id", &job_no(&id))]);
             let steps = format!("{done}{head}{sent}\n\n{}", fill(t().flip_steps, &[("aside", &aside)]));
             let wait = format!("{done}{head}{sent}\n\n{}", t().printing_front);
             // unparsable lp output: "" is never listed as active, so the steps show right away
             let job = Some(job_id(&id).unwrap_or_default().to_string());
-            let back = self.job(&pdf, Some(join(&back)), self.reverse_back, !odd);
+            let back = (self.job(&pdf, Some(join(&back)), self.reverse_back, !odd), back.len());
             self.mode = Mode::Flip { job, steps, back, files, next: i };
             return Ok(wait);
         }
@@ -985,8 +1044,8 @@ impl App {
         let Mode::Flip { back, files, next, .. } = std::mem::replace(&mut self.mode, Mode::Main) else {
             return Ok(String::new());
         };
-        let id = submit(&back)?;
-        self.duplex(files, next, fill(t().back_sent, &[("id", &id)]) + "\n\n")
+        let id = self.send(&back.0, back.1)?;
+        self.duplex(files, next, fill(t().back_sent, &[("id", &job_no(&id))]) + "\n\n")
     }
 }
 
@@ -1374,8 +1433,13 @@ impl App {
             let res = images_to_pdf(&files, dpi, &[])
                 .and_then(|data| std::fs::write(&pdf, data).map_err(|e| format!("{}: {e}", pdf.display())))
                 .and_then(|_| printable(&pdf.to_string_lossy(), scale, paper))
-                .and_then(|file| submit(&Job { file, ..job }));
-            Box::new(move |app: &mut App| app.show(res.map(|id| fill(t().copy_sent, &[("id", &id)]))))
+                .and_then(|file| submit(&Job { file, ..job.clone() }));
+            Box::new(move |app: &mut App| {
+                if let Ok(out) = &res {
+                    app.follow(out, &job, files.len());
+                }
+                app.show(res.map(|_| String::new()))
+            })
         });
     }
 
@@ -1641,6 +1705,11 @@ fn draw(f: &mut Frame, app: &App) {
     }
 }
 
+/// "#16" from lp's "request id is Smart_Tank-16 (1 file(s))", as the print queue lists it.
+fn job_no(lp_out: &str) -> String {
+    format!("#{}", job_id(lp_out).and_then(|id| id.rsplit('-').next()).unwrap_or("?"))
+}
+
 /// "Error: ..." in the current language; the printer jams on it.
 fn failed(e: impl std::fmt::Display) -> String {
     format!("{}: {e}", t().error)
@@ -1768,6 +1837,7 @@ fn draw_stage(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Some((msg, _)) => (format!("{msg}..."), if app.scanning { Work::Scan } else { Work::Busy }),
         None if app.editing.is_some() => (format!("{}...", t().editing_page), Work::Busy),
         None if app.viewing.is_some() && app.tab == Tab::Print && app.status.is_empty() => (format!("{}...", t().drawing_preview), Work::Busy),
+        None if !app.printing.is_empty() && !matches!(app.mode, Mode::Flip { job: None, .. }) => (app.progress(), Work::None),
         None if matches!(app.mode, Mode::Flip { .. }) => (t().flip_time.into(), Work::None),
         None if app.status.is_empty() => (app.complaint().unwrap_or_else(|| app.chat()), Work::None),
         None => (app.status.clone(), Work::None),

@@ -324,7 +324,7 @@ pub fn printer_state(queue: &str) -> PrinterState {
         return PrinterState::default();
     };
     let mut state = port_host(&port)
-        .and_then(|host| ipp_attributes(&format!("ipp://{host}/ipp/print"), &STATE_ATTRIBUTES).ok())
+        .and_then(|host| ipp_attributes(&format!("ipp://{host}/ipp/print"), None, &STATE_ATTRIBUTES).ok())
         .map_or_else(PrinterState::default, |attrs| PrinterState::from(&attrs));
     for (bit, problem) in PROBLEMS {
         if status & bit != 0 && !state.problems.iter().any(|p| p == problem) {
@@ -367,6 +367,12 @@ pub fn job_active(id: &str) -> bool {
         needed > 0
     })
     .unwrap_or(false)
+}
+
+/// A job's state as IPP numbers it (5 printing, 9 done) and the sheet sides printed so far.
+// ponytail: no page count yet, JOB_INFO_1.PagesPrinted has it; a cancelled job counts as done
+pub fn job_progress(id: &str) -> (i32, u32) {
+    (if job_active(id) { 5 } else { 9 }, 0)
 }
 
 /// Unfinished jobs on all printers as (job id, "file  (owner, printer, pages)") for the queue popup.

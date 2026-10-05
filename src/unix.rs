@@ -63,7 +63,7 @@ pub fn printer_state(queue: &str) -> PrinterState {
     if !matches!(uri_host(&uri), Some(("ipp" | "ipps" | "http", _))) {
         return cups_state(&opts);
     }
-    ipp_attributes(&uri, &STATE_ATTRIBUTES).map_or_else(
+    ipp_attributes(&uri, None, &STATE_ATTRIBUTES).map_or_else(
         |_| {
             let mut state = cups_state(&opts);
             state.problems.push("offline".into());
@@ -101,6 +101,21 @@ pub fn submit(job: &Job) -> Result<String, String> {
 pub fn job_active(id: &str) -> bool {
     run("lpstat", &["-W", "not-completed", "-o"])
         .is_ok_and(|s| s.lines().any(|l| l.split_whitespace().next() == Some(id)))
+}
+
+/// A job's IPP state (3 pending ... 5 printing, 7 canceled, 8 aborted, 9 completed) and the sheet
+/// sides printed so far, as CUPS hears them from the printer; only the state if CUPS cannot be asked.
+pub fn job_progress(id: &str) -> (i32, u32) {
+    let ask = || {
+        let (queue, n) = id.rsplit_once('-')?;
+        let attrs = ipp_attributes(&format!("ipp://localhost/printers/{queue}"), Some(n.parse().ok()?), &["job-state", "job-impressions-completed"]).ok()?;
+        let int = |k| match attrs.get(k)?.first()? {
+            IppValue::Int(v) => Some(*v),
+            IppValue::Text(_) => None,
+        };
+        Some((int("job-state")?, int("job-impressions-completed").unwrap_or(0).max(0) as u32))
+    };
+    ask().unwrap_or_else(|| (if job_active(id) { 5 } else { 9 }, 0))
 }
 
 /// Unfinished jobs on all printers as (job number, "file  size  position") for the queue popup.

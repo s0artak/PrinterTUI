@@ -145,7 +145,7 @@ pub enum Act {
     Idle,
     /// A setting changed: a little hop.
     Hop(Instant),
-    /// A job was sent: this many pages come out.
+    /// A job was sent: this many pages come out, or (0) pages keep coming until it is done.
     Print(Instant, u32),
     /// Something went wrong: paper jam.
     Jam(Instant),
@@ -157,7 +157,7 @@ impl Act {
         match *self {
             Act::Idle => true,
             Act::Hop(at) => at.elapsed() > Duration::from_millis(300),
-            Act::Print(at, n) => at.elapsed().as_millis() > FRAME * PAGE * n as u128,
+            Act::Print(at, n) => n > 0 && at.elapsed().as_millis() > FRAME * PAGE * n as u128,
             Act::Jam(at) => at.elapsed().as_millis() > FRAME * 10,
         }
     }
@@ -205,7 +205,7 @@ pub fn printer(act: Act, work: Work, mood: Mood, ms: u128) -> Vec<Line<'static>>
         }
         Act::Print(at, n) => {
             let e = at.elapsed().as_millis() / FRAME;
-            if e / PAGE < n as u128 {
+            if n == 0 || e / PAGE < n as u128 {
                 out = (e % PAGE) as usize;
                 lights = if e.is_multiple_of(2) { ('G', 'g') } else { ('g', 'G') };
             } else {
@@ -384,7 +384,7 @@ fn printer_frames() {
     // out of paper: the tray on top is empty
     let empty = printer(Act::Idle, Work::None, Mood::NoPaper, 0);
     assert!(empty[0].spans.iter().all(|s| s.content.trim().is_empty()));
-    assert!(Act::Print(at, 2).done() && !Act::Print(Instant::now(), 1).done());
+    assert!(Act::Print(at, 2).done() && !Act::Print(Instant::now(), 1).done() && !Act::Print(at, 0).done());
     // a jam: the crumpled page, and red lights once the shaking stops
     let jam = printer(Act::Jam(at), Work::None, Mood::Fine, 0);
     assert_eq!(jam.len(), 8);
