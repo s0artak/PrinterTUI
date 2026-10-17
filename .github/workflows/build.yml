@@ -63,21 +63,19 @@ jobs:
           if ((Wrap 'aaaa bbbbb' 9).Count -ne 2) { exit 1 }
       - if: matrix.test
         run: cargo test --release --target ${{ matrix.target }}
-      # the print path end to end: CUPS with a queue that writes to a file, through --print
+      # the print path end to end: CUPS sends the job, through --print, to a "printer" that is nc
+      # (a socket queue: a file: queue never wrote its file on the runner)
       - if: matrix.test && runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y cups
-          # the file: device is off by default
-          sudo sed -i 's|^#*FileDevice.*|FileDevice Yes|' /etc/cups/cups-files.conf
-          grep -q '^FileDevice' /etc/cups/cups-files.conf || echo 'FileDevice Yes' | sudo tee -a /etc/cups/cups-files.conf
-          sudo systemctl restart cups || sudo cupsd
-          sudo lpadmin -p smoke -E -v file:/tmp/printertui-smoke -m raw
+          sudo lpadmin -p smoke -E -v socket://127.0.0.1:9100 -m raw
+          nc -d -l 127.0.0.1 9100 > printed.pdf &
           mkdir -p ~/.config/printertui
           echo printer=smoke > ~/.config/printertui/config
           ./target/${{ matrix.target }}/release/printertui --print test/one-page.pdf
-          for i in $(seq 20); do test -s /tmp/printertui-smoke && break; sleep 0.5; done
-          test "$(head -c 4 /tmp/printertui-smoke)" = '%PDF'
+          for i in $(seq 60); do cmp -s test/one-page.pdf printed.pdf && exit 0; sleep 0.5; done
+          lpstat -l -o; sudo tail -30 /var/log/cups/error_log; exit 1
       - run: cp target/${{ matrix.target }}/release/printertui${{ matrix.exe }} ${{ matrix.name }}
       # install.sh and install.ps1 refuse a binary that does not match this
       - run: (sha256sum ${{ matrix.name }} || shasum -a 256 ${{ matrix.name }}) > ${{ matrix.name }}.sha256
