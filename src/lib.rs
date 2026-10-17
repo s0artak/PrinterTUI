@@ -21,6 +21,8 @@ use std::sync::Mutex;
 /// Running child pids, and CUPS job ids / eSCL job urls this process started; `stop_all` ends them.
 static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static JOBS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// One document conversion at a time: LibreOffice locks its profile, so runs in parallel can fail.
+static CONVERT: Mutex<()> = Mutex::new(());
 
 pub const PAPERS: [&str; 5] = ["A4", "Letter", "Legal", "A5", "A3"];
 /// Pages per sheet side (`number-up`).
@@ -94,6 +96,11 @@ pub fn to_pdf(file: &str) -> Result<String, String> {
     let d = dir.to_str().ok_or("Bad temp dir")?;
     let stem = std::path::Path::new(file).file_stem().ok_or("Bad file name")?;
     let pdf = dir.join(stem).with_extension("pdf").to_string_lossy().into_owned();
+    if fresh(file, pdf.as_ref()) && page_count(&pdf).is_some() {
+        return Ok(pdf);
+    }
+    let _one = CONVERT.lock().unwrap_or_else(|e| e.into_inner());
+    // a conversion that finished while this one waited may have written the PDF already
     if fresh(file, pdf.as_ref()) && page_count(&pdf).is_some() {
         return Ok(pdf);
     }
@@ -345,6 +352,8 @@ pub struct Job {
     pub printer: String,
     pub file: String,
     pub color: bool,
+    /// Print both sides in the printer itself instead of by hand.
+    pub sides: bool,
     pub paper: &'static str,
     pub pages: Option<String>,
     pub reverse: bool,
@@ -540,6 +549,8 @@ impl PrinterState {
 
 pub const SCAN_MODES: [&str; 2] = ["Color", "Gray"];
 pub const SCAN_DPI: [u32; 3] = [150, 300, 600];
+/// What a scanner reads from: the glass, or the document feeder.
+pub const SCAN_SOURCES: [&str; 2] = ["Flatbed", "Feeder"];
 /// Save formats: one PDF, one PDF with a text layer (OCR), or one PNG per page.
 pub const SCAN_FORMATS: [&str; 3] = ["PDF", "OCR", "PNG"];
 
@@ -564,22 +575,43 @@ pub fn scanners(full: bool) -> Vec<(String, String)> {
             }
         }
     }
+    // testing without a scanner (test/printer-debug.sh): one that "scans" this image
+    if let Some(page) = std::env::var_os("PRINTERTUI_FAKE_SCAN") {
+        found.insert(0, (format!("file:{}", page.to_string_lossy()), "Fake scanner".into()));
+    }
     found
 }
 
-/// Scans one page from the flatbed into an image file (PNG or JPEG). `escl:<url>` devices are
-/// driven directly over HTTP, which also works on macOS where there is no SANE AirScan backend;
-/// any other device goes through the system (SANE's `scanimage`, or Windows' scanner API).
-pub fn scan(device: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
+/// Scans one page from the glass or the document feeder into an image file (PNG or JPEG).
+/// `escl:<url>` devices are driven directly over HTTP, which also works on macOS where there is
+/// no SANE AirScan backend; any other device goes through the system (SANE's `scanimage`, or
+/// Windows' scanner API).
+pub fn scan(device: &str, mode: &str, dpi: u32, out: &str, source: &str) -> Result<(), String> {
+    if let Some(page) = device.strip_prefix("file:") {
+        // the fake scanner has no feeder; refusing beats looping on it forever
+        if source == "Feeder" {
+            return Err("The test scanner has no document feeder".into());
+        }
+        return fake_scan(page, mode, dpi, out);
+    }
     match device.strip_prefix("escl:") {
-        Some(url) => escl_scan(url, mode, dpi, out),
-        None => scan_local(device, mode, dpi, out),
+        Some(url) => escl_scan(url, mode, dpi, out, source),
+        None => scan_local(device, mode, dpi, out, source),
     }
 }
 
+/// The fake scanner: the image as an A4 page at that resolution, after a pause like a real scan.
+fn fake_scan(page: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let img = open(page)?.resize_exact(2480 * dpi / 300, 3508 * dpi / 300, image::imageops::FilterType::Triangle);
+    save_png(&if mode == "Gray" { img.grayscale() } else { img }, out)
+}
+
 /// eSCL (AirScan): POST the settings to ScanJobs, then download the page from the job's NextDocument.
-fn escl_scan(url: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
+fn escl_scan(url: &str, mode: &str, dpi: u32, out: &str, source: &str) -> Result<(), String> {
     let color = if mode == "Gray" { "Grayscale8" } else { "RGB24" };
+    // eSCL's own name for the glass, ours for the feeder
+    let source = if source == "Feeder" { "Feeder" } else { "Platen" };
     // A4 in 1/300 inch
     let settings = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -587,7 +619,7 @@ fn escl_scan(url: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
 <pwg:Version>2.0</pwg:Version>
 <scan:Intent>Document</scan:Intent>
 <pwg:ScanRegions><pwg:ScanRegion><pwg:Height>3508</pwg:Height><pwg:Width>2480</pwg:Width><pwg:XOffset>0</pwg:XOffset><pwg:YOffset>0</pwg:YOffset><pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits></pwg:ScanRegion></pwg:ScanRegions>
-<pwg:InputSource>Platen</pwg:InputSource>
+<pwg:InputSource>{source}</pwg:InputSource>
 <scan:ColorMode>{color}</scan:ColorMode>
 <scan:XResolution>{dpi}</scan:XResolution>
 <scan:YResolution>{dpi}</scan:YResolution>
@@ -791,10 +823,29 @@ pub fn downscale(w: usize, h: usize, px: &[u8], ow: usize, oh: usize) -> Vec<u8>
     out
 }
 
-/// Saves scanned pages as one PDF, or as `out.png` / `out-1.png`, `out-2.png`... Returns the written paths.
-pub fn save_scans(pages: &[String], out: &str, format: &str, dpi: u32) -> Result<Vec<String>, String> {
+/// `out`, or `out-2`, `out-3`... when its files are taken: a save never overwrites an older scan.
+fn free_name(out: &str, format: &str, pages: usize) -> String {
+    let ext = if format == "PNG" { "png" } else { "pdf" };
+    let exists = |base: &str| {
+        let mut names = vec![format!("{base}.{ext}")];
+        if format == "PNG" && pages > 1 {
+            names.extend((1..=pages).map(|i| format!("{base}-{i}.{ext}")));
+        }
+        names.iter().any(|p| std::path::Path::new(p).exists())
+    };
+    if !exists(out) {
+        return out.to_string();
+    }
+    (2..).map(|n| format!("{out}-{n}")).find(|c| !exists(c)).unwrap_or_default()
+}
+
+/// Saves scanned pages as one PDF, one searchable PDF (the text read in `lang`), or as
+/// `out.png` / `out-1.png`, `out-2.png`... Returns the written paths.
+pub fn save_scans(pages: &[String], out: &str, format: &str, dpi: u32, lang: &str) -> Result<Vec<String>, String> {
+    // saving again with the same name numbers the new file (out-2, out-3...) instead of overwriting the old one
+    let out = free_name(out, format, pages.len());
     if format == "OCR" {
-        return ocr_pdf(pages, out, dpi);
+        return ocr_pdf(pages, &out, dpi, lang);
     }
     if format == "PDF" {
         let path = format!("{out}.pdf");
@@ -932,7 +983,7 @@ fn pages_to_pdf_and_back() {
     // a color PNG and a gray JPEG, like SANE and eSCL scans (no file extension)
     DynamicImage::ImageRgb8(image::RgbImage::from_pixel(300, 150, image::Rgb([200, 30, 30]))).save_with_format(p("a"), ImageFormat::Png).unwrap();
     DynamicImage::ImageLuma8(GrayImage::from_pixel(150, 300, Luma([90]))).save_with_format(p("b"), ImageFormat::Jpeg).unwrap();
-    let pdf = save_scans(&[p("a"), p("b")], &p("out"), "PDF", 150).unwrap().remove(0);
+    let pdf = save_scans(&[p("a"), p("b")], &p("out"), "PDF", 150, "en").unwrap().remove(0);
     assert_eq!(page_count(&pdf), Some(2));
     assert_eq!(page_count(&p("a")), None);
 
@@ -942,6 +993,31 @@ fn pages_to_pdf_and_back() {
     assert!(img.to_luma8().pixels().all(|v| v[0] == 0 || v[0] == 255));
     assert_eq!((w, px.len()), (400, w * h));
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn saving_again_numbers_the_file() {
+    let dir = std::env::temp_dir().join(format!("printertui-save-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("scan").to_string_lossy().into_owned();
+    assert_eq!(free_name(&out, "PDF", 1), out);
+    std::fs::write(format!("{out}.pdf"), b"old").unwrap();
+    assert_eq!(free_name(&out, "PDF", 1), format!("{out}-2"));
+    std::fs::write(format!("{out}-2.pdf"), b"old").unwrap();
+    assert_eq!(free_name(&out, "PDF", 1), format!("{out}-3"));
+    // a PNG set counts every page (and the single-page name): the leftover scan-2-2.png
+    // takes both the scan-2 and the scan-2-2 bases, so the new set goes to scan-2-3
+    let png = dir.join("scan-2").to_string_lossy().into_owned();
+    std::fs::write(format!("{png}-2.png"), b"old").unwrap();
+    assert_eq!(free_name(&png, "PNG", 2), format!("{png}-3"));
+    assert_eq!(std::fs::read(format!("{out}.pdf")).unwrap(), b"old");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_fake_scanner_has_no_feeder() {
+    // refusing keeps the feeder loop from scanning that device forever
+    assert!(scan("file:/nonexistent.png", "Color", 75, "/tmp/none.png", "Feeder").is_err());
 }
 
 #[test]

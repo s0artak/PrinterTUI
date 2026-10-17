@@ -17,7 +17,7 @@ use windows::Security::Cryptography::CryptographicBuffer;
 use windows::Storage::StorageFolder;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Graphics::Printing::*;
-use windows::Win32::Storage::Xps::{AbortDoc, EndDoc, EndPage, StartDocW, StartPage, DOCINFOW};
+use windows::Win32::Storage::Xps::{AbortDoc, DC_DUPLEX, DeviceCapabilitiesW, EndDoc, EndPage, StartDocW, StartPage, DOCINFOW};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
 
@@ -119,6 +119,14 @@ pub fn printer_labels(queues: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// True when the printer's driver says it turns the sheet itself (so Double-sided needs no flipping).
+pub fn supports_duplex(printer: &str) -> bool {
+    let Some((_, port, ..)) = installed().into_iter().find(|(name, ..)| name == printer) else { return false };
+    let (name, port) = (wide(printer), wide(&port));
+    // DC_DUPLEX: 1 when the driver can print on both sides
+    unsafe { DeviceCapabilitiesW(PCWSTR(name.as_ptr()), PCWSTR(port.as_ptr()), DC_DUPLEX, None, None) == 1 }
+}
+
 /// Hosts of the installed network printers, to try as eSCL scanners.
 pub fn printer_hosts() -> Vec<String> {
     let mut hosts: Vec<String> = installed().iter().filter_map(|(_, port, ..)| port_host(port)).collect();
@@ -180,7 +188,8 @@ fn pdfium() -> Result<&'static Pdfium, String> {
     Ok(PDFIUM.get_or_init(|| Pdfium::new(bindings)))
 }
 
-/// Printer settings for the job: paper, color, and always one-sided (double-sided is done by hand).
+/// Printer settings for the job: paper, color, and the sides (the printer's own duplexer, or
+/// one side at a time).
 fn devmode(printer: &str, job: &Job) -> Result<Vec<u64>, String> {
     let name = wide(printer);
     with_printer(printer, |h| unsafe {
@@ -199,7 +208,7 @@ fn devmode(printer: &str, job: &Job) -> Result<Vec<u64>, String> {
             _ => DMPAPER_A4,
         };
         (*dm).Anonymous1.Anonymous1.dmPaperSize = paper as i16;
-        (*dm).dmDuplex = DMDUP_SIMPLEX;
+        (*dm).dmDuplex = if job.sides { DMDUP_VERTICAL } else { DMDUP_SIMPLEX };
         (*dm).dmFields |= DM_PAPERSIZE | DM_DUPLEX;
         if !job.color {
             (*dm).dmColor = DMCOLOR_MONOCHROME;
@@ -455,20 +464,30 @@ pub fn local_scanners() -> Vec<(String, String)> {
     find().unwrap_or_default()
 }
 
-/// Scans one page from the flatbed with Windows' scanner API into `out`.
-pub fn scan_local(device: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
+/// Scans one page from the glass or the document feeder with Windows' scanner API into `out`.
+pub fn scan_local(device: &str, mode: &str, dpi: u32, out: &str, source: &str) -> Result<(), String> {
     let id = device.strip_prefix("wia:").ok_or(format!("Unknown scanner {device}"))?;
     let dir = std::env::temp_dir().join(format!("printertui-wia-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let scan = || -> windows::core::Result<String> {
         let scanner = ImageScanner::FromIdAsync(&HSTRING::from(id))?.join()?;
-        let flatbed = scanner.FlatbedConfiguration()?;
-        flatbed.SetColorMode(if mode == "Gray" { ImageScannerColorMode::Grayscale } else { ImageScannerColorMode::Color })?;
-        flatbed.SetDesiredResolution(ImageScannerResolution { DpiX: dpi as f32, DpiY: dpi as f32 })?;
-        let format = if flatbed.IsFormatSupported(ImageScannerFormat::Png)? { ImageScannerFormat::Png } else { ImageScannerFormat::Jpeg };
-        flatbed.SetFormat(format)?;
         let folder = StorageFolder::GetFolderFromPathAsync(&HSTRING::from(dir.as_os_str()))?.join()?;
-        let result = scanner.ScanFilesToFolderAsync(ImageScannerScanSource::Flatbed, &folder)?.join()?;
+        // the glass and the feeder are configured apart (and typed apart in Rust)
+        let result = if source == "Feeder" {
+            let feeder = scanner.FeederConfiguration()?;
+            feeder.SetColorMode(if mode == "Gray" { ImageScannerColorMode::Grayscale } else { ImageScannerColorMode::Color })?;
+            feeder.SetDesiredResolution(ImageScannerResolution { DpiX: dpi as f32, DpiY: dpi as f32 })?;
+            let format = if feeder.IsFormatSupported(ImageScannerFormat::Png)? { ImageScannerFormat::Png } else { ImageScannerFormat::Jpeg };
+            feeder.SetFormat(format)?;
+            scanner.ScanFilesToFolderAsync(ImageScannerScanSource::Feeder, &folder)?.join()?
+        } else {
+            let flatbed = scanner.FlatbedConfiguration()?;
+            flatbed.SetColorMode(if mode == "Gray" { ImageScannerColorMode::Grayscale } else { ImageScannerColorMode::Color })?;
+            flatbed.SetDesiredResolution(ImageScannerResolution { DpiX: dpi as f32, DpiY: dpi as f32 })?;
+            let format = if flatbed.IsFormatSupported(ImageScannerFormat::Png)? { ImageScannerFormat::Png } else { ImageScannerFormat::Jpeg };
+            flatbed.SetFormat(format)?;
+            scanner.ScanFilesToFolderAsync(ImageScannerScanSource::Flatbed, &folder)?.join()?
+        };
         Ok(result.ScannedFiles()?.GetAt(0)?.Path()?.to_string())
     };
     // Windows picks the file name; move the page where the caller wants it
@@ -500,8 +519,9 @@ pub fn timestamp() -> String {
     format!("{}-{:02}-{:02}_{:02}{:02}{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond)
 }
 
-/// Searchable PDF with Windows' built-in OCR in the user's language, laid invisibly over the pages.
-pub fn ocr_pdf(pages: &[String], out: &str, dpi: u32) -> Result<Vec<String>, String> {
+/// Searchable PDF with Windows' built-in OCR in the user's profile languages, laid invisibly
+/// over the pages (the app's language does not pick the engine: Windows has no per-language one).
+pub fn ocr_pdf(pages: &[String], out: &str, dpi: u32, _lang: &str) -> Result<Vec<String>, String> {
     let engine = OcrEngine::TryCreateFromUserProfileLanguages().map_err(|_| {
         "Searchable PDF needs a Windows OCR language: Settings > Time & language > Language, add your language with 'Optical character recognition'".to_string()
     })?;
@@ -556,7 +576,7 @@ fn prints_to_microsoft_print_to_pdf() {
     let img = img.to_string_lossy().into_owned();
     std::fs::write(&src, images_to_pdf(&[img.clone(), img.clone(), img.clone(), img], 100, &[]).unwrap()).unwrap();
     let job = Job {
-        printer: PRINTER.into(), file: src.to_string_lossy().into_owned(), color: false, paper: "A4",
+        printer: PRINTER.into(), file: src.to_string_lossy().into_owned(), color: false, sides: false, paper: "A4",
         pages: Some("1-4".into()), reverse: true, copies: 1, collate: true, per_sheet: 2,
     };
     print_pdf(&job, Some(&out.to_string_lossy())).unwrap();

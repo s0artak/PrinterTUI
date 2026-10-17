@@ -706,6 +706,8 @@ function Install-PrinterTUI([bool]$libreoffice, [bool]$onDesktop) {
     W "`n"
     Say "$($T.put) $dir"
     Step "move $tmp $exe" {
+        # Windows cannot replace a running exe; stop the app first, as the uninstaller does
+        Get-Process printertui -ErrorAction SilentlyContinue | Stop-Process -Force
         New-Item -ItemType Directory -Force $dir | Out-Null
         Move-Item -Force $tmp $exe
     }

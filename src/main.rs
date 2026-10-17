@@ -24,8 +24,10 @@ type Done = Box<dyn FnOnce(&mut App) + Send>;
 
 /// Rows of the Print, Scan and Settings forms.
 const ROWS: usize = 13;
-const SCAN_ROWS: usize = 10;
+const SCAN_ROWS: usize = 11;
 const SETTINGS_ROWS: usize = 6;
+/// The last files printed kept for the File row's h/l.
+const RECENT: usize = 5;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -52,12 +54,12 @@ const PRINT: usize = 10;
 const ADD: usize = 11;
 const QUEUE: usize = 12;
 
-const SAVE_AS: usize = 4;
-const SCAN: usize = 5;
-const PAGE: usize = 6;
-const SAVE: usize = 7;
-const COPY: usize = 8;
-const DISCARD: usize = 9;
+const SAVE_AS: usize = 5;
+const SCAN: usize = 6;
+const PAGE: usize = 7;
+const SAVE: usize = 8;
+const COPY: usize = 9;
+const DISCARD: usize = 10;
 
 /// A scanned page: edits are always applied to the original scan.
 struct ScannedPage {
@@ -72,7 +74,7 @@ struct ScannedPage {
 
 type Thumb = (usize, usize, Vec<u8>);
 
-/// What the Print tab preview shows: the n-th sheet side of the first file as it will print.
+/// What the Print tab preview shows: the n-th sheet side of one of the files as it will print.
 #[derive(Clone, PartialEq)]
 struct ViewKey {
     file: String,
@@ -119,9 +121,13 @@ struct App {
     checked: Instant,
     printer: usize,
     file: String,
+    /// Files that printed, most recent first (the File row's h/l).
+    recent: Vec<String>,
     color: bool,
     duplex: bool,
     reverse_back: bool,
+    /// One-sided: last page (and file) first, for printers that stack the pages face up.
+    reverse: bool,
     pages: String,
     paper: usize,
     copies: u32,
@@ -135,19 +141,23 @@ struct App {
     graphics_pref: usize,
     /// Where scans are saved by default; empty for ~/Documents.
     scan_folder: String,
-    /// Print tab preview for its key (or why there is none), the render running, and the page asked for.
+    /// Print tab preview for its key (or why there is none), the render running, and the file and page asked for.
     view: Option<(ViewKey, Result<PrintView, String>)>,
     viewing: Option<(ViewKey, mpsc::Receiver<Done>)>,
+    view_file: usize,
     view_page: usize,
     /// None until the Scan tab is first opened (discovery takes a few seconds).
     scanners: Option<Vec<(String, String)>>,
     scanner: usize,
     scanner_pref: String,
+    scan_source: usize,
     scan_mode: usize,
     scan_dpi: usize,
     scan_format: usize,
     save_as: String,
     scans: Vec<ScannedPage>,
+    /// The pages of the last Discard, brought back with `u` while none are left.
+    discarded: Vec<ScannedPage>,
     /// Page shown in the preview and edited by the Page row.
     cur: usize,
     /// Slow work (scanning, converting, discovery) runs in a thread so the UI keeps drawing.
@@ -182,66 +192,21 @@ struct App {
 }
 
 fn main() -> std::io::Result<()> {
-    let mut app = App {
-        printers: Vec::new(),
-        labels: Vec::new(),
-        state: None,
-        checking: None,
-        checked: Instant::now(),
-        printer: 0,
-        file: std::env::args().nth(1).unwrap_or_default(),
-        color: false,
-        duplex: false,
-        reverse_back: false,
-        pages: String::new(),
-        paper: 0,
-        copies: 1,
-        per_sheet: 0,
-        scale: SCALES.iter().position(|s| *s == 100).unwrap_or(0),
-        tab: if std::env::args().any(|a| a == "--scan") { Tab::Scan } else { Tab::Print },
-        theme: 0,
-        mascot: true,
-        graphics_pref: 0,
-        scan_folder: String::new(),
-        view: None,
-        viewing: None,
-        view_page: 0,
-        scanners: None,
-        scanner: 0,
-        scanner_pref: String::new(),
-        scan_mode: 0,
-        scan_dpi: 1,
-        scan_format: 0,
-        save_as: String::new(),
-        scans: Vec::new(),
-        cur: 0,
-        busy: None,
-        scanning: false,
-        clear: false,
-        lang: String::new(),
-        editing: None,
-        graphics: detect_graphics(),
-        preview_area: Cell::default(),
-        form_area: Cell::default(),
-        popup_area: Cell::default(),
-        sent: None,
-        started: Instant::now(),
-        last_poll: Instant::now(),
-        sel: 0,
-        status: String::new(),
-        heard: String::new(),
-        act: Act::Idle,
-        printing: Vec::new(),
-        mode: Mode::Main,
-    };
-    app.set_printers(printers());
-    if let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) {
-        for (k, v) in parse_config(&text) {
-            app.apply(k, v);
-        }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
     }
-    // set by the installer from the language picked in its menu
-    app.apply_settings();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("printertui {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if let Some(i) = args.iter().position(|a| a == "--print") {
+        return print_files(&args[i + 1..]);
+    }
+    // the files to print, `;`-separated like the File field
+    let file = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<_>>().join("; ");
+    let mut app = new_app(args.iter().any(|a| a == "--scan"), file);
     app.save_as = default_scan_name(&app.scan_folder);
     sound::play(Sound::Boot);
     if app.printers.is_empty() {
@@ -279,6 +244,127 @@ fn main() -> std::io::Result<()> {
     restore();
     stop_all();
     res
+}
+
+/// A fresh app with its saved settings read in; no terminal needed yet (the installer sets `lang`).
+fn new_app(scan: bool, file: String) -> App {
+    let mut app = App {
+        printers: Vec::new(),
+        labels: Vec::new(),
+        state: None,
+        checking: None,
+        checked: Instant::now(),
+        printer: 0,
+        file,
+        recent: Vec::new(),
+        color: false,
+        duplex: false,
+        reverse_back: false,
+        reverse: false,
+        pages: String::new(),
+        paper: default_paper(),
+        copies: 1,
+        per_sheet: 0,
+        scale: SCALES.iter().position(|s| *s == 100).unwrap_or(0),
+        tab: if scan { Tab::Scan } else { Tab::Print },
+        theme: 0,
+        mascot: true,
+        graphics_pref: 0,
+        scan_folder: String::new(),
+        view: None,
+        viewing: None,
+        view_file: 0,
+        view_page: 0,
+        scanners: None,
+        scanner: 0,
+        scanner_pref: String::new(),
+        scan_source: 0,
+        scan_mode: 0,
+        scan_dpi: 1,
+        scan_format: 0,
+        save_as: String::new(),
+        scans: Vec::new(),
+        discarded: Vec::new(),
+        cur: 0,
+        busy: None,
+        scanning: false,
+        clear: false,
+        lang: String::new(),
+        editing: None,
+        graphics: detect_graphics(),
+        preview_area: Cell::default(),
+        form_area: Cell::default(),
+        popup_area: Cell::default(),
+        sent: None,
+        started: Instant::now(),
+        last_poll: Instant::now(),
+        sel: 0,
+        status: String::new(),
+        heard: String::new(),
+        act: Act::Idle,
+        printing: Vec::new(),
+        mode: Mode::Main,
+    };
+    app.set_printers(printers());
+    if let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        for (k, v) in parse_config(&text) {
+            app.apply(k, v);
+        }
+    }
+    app.apply_settings();
+    app
+}
+
+/// The command line, in English (the app's own texts follow the settings).
+fn print_help() {
+    println!(
+        "\
+PrinterTUI {}
+
+usage: printertui [file...]          open, with these files loaded
+       printertui --scan             open on the Scan tab
+       printertui --print [file...]  print with the saved settings and exit
+       printertui --version
+       printertui --help
+
+Files are PDFs, photos, text or documents (LibreOffice); several are printed in
+order. In the app, Tab changes tab, j/k move, h/l change, Enter picks or prints,
+i types, q quits.",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+/// `--print`: prints with the saved settings, no UI; the exit code says how it went.
+fn print_files(args: &[String]) -> std::io::Result<()> {
+    let files: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).map(|f| expand_home(f)).collect();
+    let mut app = new_app(false, files.join("; "));
+    match print_now(&mut app) {
+        Ok(out) => {
+            println!("{out}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1)
+        }
+    }
+}
+
+fn print_now(app: &mut App) -> Result<String, String> {
+    let files = app.files()?;
+    let (scale, paper) = (SCALES[app.scale], PAPERS[app.paper]);
+    let auto = app.auto_duplex();
+    if app.duplex && !auto {
+        return Err("Manual double-sided needs the app: run printertui and print there.".into());
+    }
+    let mut out = Vec::new();
+    for f in &files {
+        let pdf = printable(f, scale, paper)?;
+        let mut job = app.job(&pdf, None, app.reverse && !auto, true);
+        job.sides = auto;
+        out.push(submit(&job)?);
+    }
+    Ok(out.join("\n"))
 }
 
 /// Mouse clicks on Windows, where people expect them; elsewhere the terminal keeps its own text selection.
@@ -391,11 +477,27 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                         let n = app.scans.len();
                         app.cur = (app.cur + if c == 'L' { 1 } else { n - 1 }) % n;
                     }
-                    // H/L browse the preview pages on the Print tab
+                    // H/L browse the preview pages on the Print tab, on into the next or previous file
                     KeyCode::Char(c @ ('H' | 'L')) if app.tab == Tab::Print => {
-                        if let Some((_, Ok(v))) = &app.view {
-                            app.view_page = (v.idx + if c == 'L' { 1 } else { v.count - 1 }) % v.count;
+                        // a file that cannot be shown counts as one page, so it can be left
+                        let (idx, count) = match &app.view {
+                            Some((_, Ok(v))) => (v.idx, v.count),
+                            _ => (0, 1),
+                        };
+                        let files = split_files(&app.file).len().max(1);
+                        match c {
+                            'L' if idx + 1 < count => app.view_page = idx + 1,
+                            'L' => (app.view_file, app.view_page) = ((app.view_file + 1) % files, 0),
+                            _ if idx > 0 => app.view_page = idx - 1,
+                            // render_view shows the last page for anything past it
+                            _ => (app.view_file, app.view_page) = ((app.view_file + files - 1) % files, usize::MAX),
                         }
+                    }
+                    // bring back the pages the last Discard put away
+                    KeyCode::Char('u') if app.tab == Tab::Scan && app.scans.is_empty() && !app.discarded.is_empty() => {
+                        app.scans = std::mem::take(&mut app.discarded);
+                        app.cur = app.scans.len() - 1;
+                        app.status = t().loaded_last.into();
                     }
                     KeyCode::Char(c) if app.tab == Tab::Scan && app.sel == PAGE && !app.scans.is_empty() && app.page_key(c, dd) => {}
                     KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
@@ -716,9 +818,10 @@ impl App {
         if self.tab == Tab::Scan {
             match self.sel {
                 0 => self.scanner = step(self.scanner, self.scanners.as_ref().map_or(0, Vec::len)),
-                1 => self.scan_mode = step(self.scan_mode, SCAN_MODES.len()),
-                2 => self.scan_dpi = step(self.scan_dpi, SCAN_DPI.len()),
-                3 => self.scan_format = step(self.scan_format, SCAN_FORMATS.len()),
+                1 => self.scan_source = step(self.scan_source, SCAN_SOURCES.len()),
+                2 => self.scan_mode = step(self.scan_mode, SCAN_MODES.len()),
+                3 => self.scan_dpi = step(self.scan_dpi, SCAN_DPI.len()),
+                4 => self.scan_format = step(self.scan_format, SCAN_FORMATS.len()),
                 PAGE => self.cur = step(self.cur, self.scans.len()),
                 _ => {}
             }
@@ -726,8 +829,15 @@ impl App {
         }
         match self.sel {
             0 => self.printer = step(self.printer, self.printers.len()),
+            FILE if !self.recent.is_empty() => {
+                // h/l walk the files that printed
+                let n = self.recent.len();
+                let i = self.recent.iter().position(|f| *f == self.file).unwrap_or(if fwd { n - 1 } else { 0 });
+                self.file = self.recent[step(i, n)].clone();
+            }
             2 => self.color = !self.color,
             3 => self.duplex = !self.duplex,
+            4 if !self.duplex => self.reverse = !self.reverse,
             4 => self.reverse_back = !self.reverse_back,
             6 => self.paper = step(self.paper, PAPERS.len()),
             7 => self.copies = if fwd { self.copies + 1 } else { (self.copies - 1).max(1) },
@@ -758,9 +868,10 @@ impl App {
         if self.tab == Tab::Scan {
             return match row {
                 0 => pick(self.scanners.as_ref().and_then(|l| l.get(self.scanner)).map_or(t().none, |(_, d)| d.as_str())),
-                1 => pick(t().scan_modes[self.scan_mode]),
-                2 => pick(&format!("{} dpi", SCAN_DPI[self.scan_dpi])),
-                3 => pick(match SCAN_FORMATS[self.scan_format] {
+                1 => pick(t().scan_sources[self.scan_source]),
+                2 => pick(t().scan_modes[self.scan_mode]),
+                3 => pick(&format!("{} dpi", SCAN_DPI[self.scan_dpi])),
+                4 => pick(match SCAN_FORMATS[self.scan_format] {
                     "PDF" => t().fmt_pdf,
                     "OCR" => t().fmt_ocr,
                     _ => t().fmt_png,
@@ -810,6 +921,7 @@ impl App {
             },
             2 => pick(if self.color { t().color } else { t().grayscale }),
             3 => pick(if self.duplex { t().double_sided } else { t().single_sided }),
+            4 if !self.duplex => pick(if self.reverse { t().reversed } else { t().normal }),
             4 => pick(if self.reverse_back { t().reversed } else { t().normal }),
             PAGES if self.pages.is_empty() && !matches!(self.mode, Mode::Insert) => t().all.into(),
             PAGES => self.pages.clone(),
@@ -860,21 +972,25 @@ impl App {
     }
 
     /// Remembers the settings: the Print and Scan ones after a print or scan (not the file or
-    /// page range), the Settings tab's as they change.
+    /// page range, but the files that printed stay as recents), the Settings tab's as they change.
     fn save(&self) -> std::io::Result<()> {
         let path = config_path().ok_or(std::io::Error::other("HOME is not set"))?;
         std::fs::create_dir_all(path.parent().unwrap_or(&path))?;
-        std::fs::write(path, format!(
-            "printer={}\ncolor={}\nduplex={}\nreverse_back={}\npaper={}\ncopies={}\nper_sheet={}\nscale={}\n\
-             scanner={}\nscan_mode={}\nscan_dpi={}\nscan_format={}\n\
+        let mut text = format!(
+            "printer={}\ncolor={}\nduplex={}\nreverse_back={}\nreverse={}\npaper={}\ncopies={}\nper_sheet={}\nscale={}\n\
+             scanner={}\nscan_source={}\nscan_mode={}\nscan_dpi={}\nscan_format={}\n\
              lang={}\ntheme={}\nvolume={}\nmascot={}\ngraphics={}\nscan_folder={}\n",
             self.printers.get(self.printer).map_or("", String::as_str),
-            self.color, self.duplex, self.reverse_back, PAPERS[self.paper], self.copies, PER_SHEET[self.per_sheet], SCALES[self.scale],
+            self.color, self.duplex, self.reverse_back, self.reverse, PAPERS[self.paper], self.copies, PER_SHEET[self.per_sheet], SCALES[self.scale],
             self.scanners.as_ref().and_then(|l| l.get(self.scanner)).map_or(self.scanner_pref.as_str(), |(d, _)| d.as_str()),
-            SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi], SCAN_FORMATS[self.scan_format],
+            SCAN_SOURCES[self.scan_source], SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi], SCAN_FORMATS[self.scan_format],
             // an empty language follows the system's
             self.lang, pet::THEMES[self.theme].0, sound::volume(), self.mascot, GRAPHICS_PREFS[self.graphics_pref], self.scan_folder,
-        ))
+        );
+        for f in &self.recent {
+            text.push_str(&format!("recent={f}\n"));
+        }
+        std::fs::write(path, text)
     }
 
     /// Applies one saved setting; unknown keys and invalid values are ignored.
@@ -885,6 +1001,7 @@ impl App {
             "color" => self.color = b.unwrap_or(self.color),
             "duplex" => self.duplex = b.unwrap_or(self.duplex),
             "reverse_back" => self.reverse_back = b.unwrap_or(self.reverse_back),
+            "reverse" => self.reverse = b.unwrap_or(self.reverse),
             "paper" => self.paper = PAPERS.iter().position(|p| *p == v).unwrap_or(self.paper),
             "copies" => self.copies = v.parse().ok().filter(|n| *n > 0).unwrap_or(self.copies),
             "per_sheet" => self.per_sheet = PER_SHEET.iter().position(|n| n.to_string() == v).unwrap_or(self.per_sheet),
@@ -896,9 +1013,12 @@ impl App {
             "scan_folder" => self.scan_folder = v.to_string(),
             "scale" => self.scale = SCALES.iter().position(|n| n.to_string() == v).unwrap_or(self.scale),
             "scanner" => self.scanner_pref = v.to_string(),
+            "scan_source" => self.scan_source = SCAN_SOURCES.iter().position(|s| *s == v).unwrap_or(self.scan_source),
             "scan_mode" => self.scan_mode = SCAN_MODES.iter().position(|m| *m == v).unwrap_or(self.scan_mode),
             "scan_dpi" => self.scan_dpi = SCAN_DPI.iter().position(|d| d.to_string() == v).unwrap_or(self.scan_dpi),
             "scan_format" => self.scan_format = SCAN_FORMATS.iter().position(|f| *f == v).unwrap_or(self.scan_format),
+            // the files that printed, as the config lists them (most recent first)
+            "recent" if !self.recent.iter().any(|f| f == v) && self.recent.len() < RECENT => self.recent.push(v.to_string()),
             _ => {}
         }
     }
@@ -906,7 +1026,7 @@ impl App {
 
     fn job(&self, file: &str, pages: Option<String>, reverse: bool, collate: bool) -> Job {
         Job {
-            printer: self.printers[self.printer].clone(), file: file.into(), color: self.color, paper: PAPERS[self.paper], pages, reverse,
+            printer: self.printers[self.printer].clone(), file: file.into(), color: self.color, sides: false, paper: PAPERS[self.paper], pages, reverse,
             copies: self.copies, collate, per_sheet: PER_SHEET[self.per_sheet],
         }
     }
@@ -934,9 +1054,26 @@ impl App {
             let pdfs: Result<Vec<String>, String> = files.iter().map(|f| printable(f, scale, paper)).collect();
             Box::new(move |app: &mut App| {
                 let res = pdfs.and_then(|p| app.print_pdfs(p));
+                if res.is_ok() {
+                    app.remember(&files);
+                }
                 app.show(res)
             })
         });
+    }
+
+    /// The files that printed, most recent first, for the File row's h/l.
+    fn remember(&mut self, files: &[String]) {
+        for f in files.iter().rev() {
+            self.recent.retain(|r| r != f);
+            self.recent.insert(0, f.clone());
+        }
+        self.recent.truncate(RECENT);
+    }
+
+    /// True when the selected printer prints both sides by itself, so Double-sided needs no flipping.
+    fn auto_duplex(&self) -> bool {
+        self.duplex && self.printers.get(self.printer).is_some_and(|q| supports_duplex(q))
     }
 
     /// Sends a job and follows it in the bubble; `pages` is how many it prints, before number-up and copies.
@@ -987,17 +1124,22 @@ impl App {
     }
 
     fn print_pdfs(&mut self, pdfs: Vec<String>) -> Result<String, String> {
-        if self.duplex {
+        // a printer with its own duplexer gets one job printing both sides; the rest flip by hand
+        let auto = self.auto_duplex();
+        if self.duplex && !auto {
             return self.duplex(pdfs, 0, String::new());
         }
         let pages = self.pages.trim().to_string();
         let all = pages.is_empty() || pages == "all";
+        // the last file first too, so the whole stack comes out in order
+        let pdfs: Vec<String> = if self.reverse && !auto { pdfs.into_iter().rev().collect() } else { pdfs };
         for p in &pdfs {
             let total = page_count(p);
             // checked against each PDF: CUPS takes page-ranges beyond the last page without a word
             let range = if all { None } else { Some(parse_ranges(&pages, total.ok_or(t().unreadable_pdf)?)?) };
             let n = range.as_ref().map_or(total.unwrap_or(1) as usize, Vec::len);
-            let job = self.job(p, range.map(|r| join(&r)), false, true);
+            let mut job = self.job(p, range.map(|r| join(&r)), self.reverse && !auto, true);
+            job.sides = auto;
             self.send(&job, n)?;
         }
         Ok(String::new())
@@ -1122,15 +1264,19 @@ impl App {
         }
         if self.tab == Tab::Scan {
             let kept = self.scans.iter().filter(|p| p.keep).count();
+            let feeder = self.scan_source == 1;
             return match self.sel {
                 0 if self.scanners.as_ref().is_some_and(Vec::is_empty) => t().no_scanner_yet.into(),
                 0 => t().search_again.into(),
-                1 => fill(t().mode_chat, &[("mode", &t().scan_modes[self.scan_mode])]),
-                2 if SCAN_DPI[self.scan_dpi] >= 600 => n(t().dpi_high, &SCAN_DPI[self.scan_dpi]),
-                2 => n(t().dpi_chat, &SCAN_DPI[self.scan_dpi]),
-                3 if SCAN_FORMATS[self.scan_format] == "OCR" => t().ocr_chat.into(),
-                3 => t().format_chat.into(),
+                1 if feeder => t().source_chat.into(),
+                1 => t().scan_chat.into(),
+                2 => fill(t().mode_chat, &[("mode", &t().scan_modes[self.scan_mode])]),
+                3 if SCAN_DPI[self.scan_dpi] >= 600 => n(t().dpi_high, &SCAN_DPI[self.scan_dpi]),
+                3 => n(t().dpi_chat, &SCAN_DPI[self.scan_dpi]),
+                4 if SCAN_FORMATS[self.scan_format] == "OCR" => t().ocr_chat.into(),
+                4 => t().format_chat.into(),
                 SAVE_AS => t().save_as_chat.into(),
+                SCAN if feeder => t().source_chat.into(),
                 SCAN => t().scan_chat.into(),
                 PAGE if self.scans.is_empty() => t().pages_here.into(),
                 PAGE => t().page_keys.into(),
@@ -1153,6 +1299,7 @@ impl App {
             2 => t().grayscale_chat.into(),
             3 if self.duplex => t().duplex_chat.into(),
             3 => t().one_side.into(),
+            4 if !self.duplex => t().order_chat.into(),
             4 => t().back_order_chat.into(),
             PAGES => t().pages_chat.into(),
             6 => fill(t().paper_chat, &[("paper", &PAPERS[self.paper])]),
@@ -1269,7 +1416,9 @@ impl App {
         if self.tab != Tab::Print || matches!(self.mode, Mode::Insert) {
             return;
         }
-        let Some(file) = split_files(&self.file).first().map(|f| expand_home(f)) else {
+        let files = split_files(&self.file);
+        self.view_file = self.view_file.min(files.len().saturating_sub(1));
+        let Some(file) = files.get(self.view_file).map(|f| expand_home(f)) else {
             self.view = None;
             return;
         };
@@ -1281,11 +1430,12 @@ impl App {
             per_sheet: PER_SHEET[self.per_sheet],
             idx: self.view_page,
         };
-        if self.view.as_ref().is_some_and(|(k, _)| *k == key) || self.viewing.as_ref().is_some_and(|(k, _)| *k == key) {
+        if self.view.as_ref().is_some_and(|(k, _)| *k == key) || self.viewing.is_some() {
             return;
         }
         let k = key.clone();
-        // a newer render replaces a running one: dropping its receiver discards the result
+        // one render at a time: a running one is left to finish (it writes a shared PDF), and the
+        // next loop pass starts the render for the page wanted by then, so keypresses coalesce
         self.viewing = Some((key, task(move || {
             let res = render_view(&k);
             Box::new(move |app: &mut App| app.view = Some((k, res)))
@@ -1318,6 +1468,12 @@ impl App {
                 return true;
             }
             'd' => return true, // wait for the second d
+            's' => {
+                if self.busy.is_none() {
+                    self.scan_page(false, Some(self.scans[i].orig.clone()));
+                }
+                return true;
+            }
             _ => return false,
         }
         self.edit_page();
@@ -1362,11 +1518,12 @@ impl App {
     fn scan_enter(&mut self) {
         match self.sel {
             0 => self.find_scanners(true),
-            SCAN => self.scan_page(false),
+            SCAN => self.scan_page(false, None),
             SAVE => self.save_scans(),
             COPY => self.copy(),
             DISCARD => {
-                self.scans.clear();
+                // kept, not dropped: `u` brings them back while none are left
+                self.discarded = std::mem::take(&mut self.scans);
                 self.cur = 0;
                 self.status = t().discarded.into();
             }
@@ -1374,35 +1531,79 @@ impl App {
         }
     }
 
-    /// Scans a page; `then_copy` prints it right away (Copy with nothing scanned yet).
-    fn scan_page(&mut self, then_copy: bool) {
+    /// Scans a page; `then_copy` prints it right away (Copy with nothing scanned yet),
+    /// `retake` replaces the page scanned from that original instead of adding one. With the
+    /// document feeder, scanning goes to the end of the stack, one page after another.
+    fn scan_page(&mut self, then_copy: bool, retake: Option<String>) {
         let Some((device, _)) = self.scanners.as_ref().and_then(|l| l.get(self.scanner)).cloned() else {
             return self.status = failed(t().no_scanner_selected);
         };
         let dir = std::env::temp_dir().join("printertui-scan");
-        let n = self.scans.len() + 1;
+        let n = retake.as_ref().and_then(|o| self.scans.iter().position(|p| p.orig == *o)).unwrap_or(self.scans.len()) + 1;
         // unique name: pages can be deleted and reordered, and old edits must not be reused
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
-        let path = dir.join(format!("page-{stamp}")).to_string_lossy().into_owned();
         let (mode, dpi) = (SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi]);
+        let source = SCAN_SOURCES[self.scan_source];
+        // the feeder is read to the end of the stack; a retake is one page
+        let stack = source == "Feeder" && retake.is_none();
         self.scanning = true;
         sound::play(Sound::Scan);
         self.spawn(fill(t().scanning, &[("n", &n)]), move || {
-            let res = std::fs::create_dir_all(&dir)
-                .map_err(|e| e.to_string())
-                .and_then(|_| scan(&device, mode, dpi, &path))
-                .and_then(|_| thumbnail(&path));
+            // the pages of one feeder run share the stamp: page-<stamp>, page-<stamp>-1, ...
+            let res = std::fs::create_dir_all(&dir).map_err(|e| e.to_string()).and_then(|_| {
+                let mut pages = Vec::new();
+                loop {
+                    let path = match pages.len() {
+                        0 => dir.join(format!("page-{stamp}")),
+                        i => dir.join(format!("page-{stamp}-{i}")),
+                    }
+                    .to_string_lossy()
+                    .into_owned();
+                    match scan(&device, mode, dpi, &path, source).and_then(|_| thumbnail(&path)) {
+                        Ok(thumb) => pages.push((path, thumb)),
+                        // a scan that fails with nothing scanned yet is the real error; after a
+                        // page it means the feeder ran out, and the stack ended (on eSCL an empty
+                        // feeder can take a minute: 503 until retry_busy gives up)
+                        Err(e) if pages.is_empty() => return Err(e),
+                        Err(_) => break,
+                    }
+                    if !stack {
+                        break;
+                    }
+                }
+                Ok(pages)
+            });
             Box::new(move |app: &mut App| {
                 app.scanning = false;
                 app.status = match res {
-                    Ok(thumb) => {
-                        app.scans.push(ScannedPage { orig: path.clone(), file: path, rot: 0, filter: 0, keep: true, thumb });
-                        app.cur = app.scans.len() - 1;
+                    Ok(pages) => {
                         sound::play(Sound::Done);
+                        let m = pages.len();
+                        let mut pages = pages
+                            .into_iter()
+                            .map(|(path, thumb)| ScannedPage { orig: path.clone(), file: path, rot: 0, filter: 0, keep: true, thumb });
+                        // the page to retake may have been moved or deleted meanwhile
+                        if let Some(i) = retake.and_then(|o| app.scans.iter().position(|p| p.orig == o)) {
+                            if let Some(page) = pages.next() {
+                                app.scans[i] = page;
+                                app.cur = i;
+                            }
+                            return app.status = fill(t().page_rescanned, &[("n", &(i + 1))]);
+                        }
+                        app.scans.extend(pages);
+                        app.cur = app.scans.len() - 1;
                         if then_copy {
                             return app.copy();
                         }
-                        fill(t().scanned, &[("n", &n)])
+                        if stack {
+                            // the whole stack: what is ready on the Page row, not one page at a time
+                            match m {
+                                1 => t().ready_one.into(),
+                                m => fill(t().ready_many, &[("n", &m)]),
+                            }
+                        } else {
+                            fill(t().scanned, &[("n", &n)])
+                        }
                     }
                     Err(e) => failed(e),
                 }
@@ -1417,7 +1618,7 @@ impl App {
             return self.status = failed(t().no_printer_for_copy);
         }
         if self.scans.is_empty() {
-            return self.scan_page(true);
+            return self.scan_page(true, None);
         }
         let files: Vec<String> = self.scans.iter().filter(|p| p.keep).map(|p| p.file.clone()).collect();
         if files.is_empty() {
@@ -1454,8 +1655,10 @@ impl App {
         let out = expand_home(self.save_as.trim());
         let out = out.trim_end_matches(".pdf").trim_end_matches(".png").to_string();
         let (format, dpi) = (SCAN_FORMATS[self.scan_format], SCAN_DPI[self.scan_dpi]);
+        // the searchable PDF reads in the app's language
+        let lang = t().code;
         self.spawn(t().saving, move || {
-            let res = save_scans(&files, &out, format, dpi);
+            let res = save_scans(&files, &out, format, dpi, lang);
             Box::new(move |app: &mut App| {
                 app.status = match res {
                     Ok(written) => {
@@ -1553,6 +1756,24 @@ fn default_scan_name(folder: &str) -> String {
     format!("{folder}/scan-{}", timestamp())
 }
 
+/// A4 unless the computer's locale says a country that uses Letter.
+fn default_paper() -> usize {
+    let var = |k| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let locale = var("LC_PAPER").or_else(|| var("LC_ALL")).or_else(|| var("LANG")).unwrap_or_else(system_language);
+    paper_for(&region(&locale))
+}
+
+/// The country in a locale: "es_ES.UTF-8" and "en-US" both give "ES"/"US"; empty when there is none.
+fn region(locale: &str) -> String {
+    locale.split(['_', '-']).nth(1).map(|r| r.split('.').next().unwrap_or(r).to_ascii_uppercase()).unwrap_or_default()
+}
+
+/// The paper most people use there: Letter in the handful of countries that do, A4 elsewhere.
+fn paper_for(country: &str) -> usize {
+    let letter = ["US", "CA", "MX", "PH", "CL", "CO", "VE", "BO"].contains(&country);
+    if letter { PAPERS.iter().position(|p| *p == "Letter").unwrap_or(0) } else { 0 }
+}
+
 /// The preview for a key: the file as it will print (a PDF, scaled), one sheet side of its range.
 fn render_view(k: &ViewKey) -> Result<PrintView, String> {
     if !std::path::Path::new(&k.file).is_file() {
@@ -1616,7 +1837,7 @@ fn draw(f: &mut Frame, app: &App) {
     let [form, status] =
         Layout::vertical([Constraint::Length(rows as u16 + 2), Constraint::Min(3)]).areas(left);
 
-    let lines: Vec<Line> = (0..rows).map(|i| form_row(app, label(app.tab, i), i)).collect();
+    let lines: Vec<Line> = (0..rows).map(|i| form_row(app, label(app, i), i)).collect();
     let tab = |name: &'static str, on: bool| {
         Span::styled(format!(" {name} "), if on { Style::new().fg(WHITE).bg(ACCENT).bold() } else { Style::new().fg(theme().dim) })
     };
@@ -1633,7 +1854,7 @@ fn draw(f: &mut Frame, app: &App) {
         Mode::Address(_) => &[("Enter", t.k_add), ("Esc", t.k_cancel)],
         _ if app.tab == Tab::Settings && app.sel == FOLDER => &[("j/k", t.k_move), ("i", t.k_edit_text), ("Tab", t.k_print_scan), ("q", t.k_quit)],
         _ if app.tab == Tab::Settings => &[("j/k", t.k_move), ("h/l", t.k_change), ("Tab", t.k_print_scan), ("q", t.k_quit)],
-        _ if app.sel == PAGE && app.tab == Tab::Scan => &[("H/L", t.k_page), ("</>", t.k_move), ("r/R", t.k_rotate), ("f", t.k_filter), ("x", t.k_keep), ("dd", t.k_delete)],
+        _ if app.sel == PAGE && app.tab == Tab::Scan => &[("H/L", t.k_page), ("</>", t.k_move), ("r/R", t.k_rotate), ("f", t.k_filter), ("x", t.k_keep), ("s", t.k_retake), ("dd", t.k_delete)],
         _ if app.tab == Tab::Scan && !app.scans.is_empty() => &[("j/k", t.k_move), ("h/l", t.k_change), ("H/L", t.k_page), ("Enter", t.k_select), ("Tab", t.k_print_scan), ("q", t.k_quit)],
         _ if app.sel == PAGES && app.tab == Tab::Print => &[("j/k", t.k_move), ("Enter", t.k_pick_pages), ("i", t.k_type_range), ("q", t.k_quit)],
         _ if app.tab == Tab::Print => &[("j/k", t.k_move), ("h/l", t.k_change), ("H/L", t.k_preview_page), ("i", t.k_edit_text), ("Enter", t.k_select), ("Tab", t.k_print_scan), ("q", t.k_quit)],
@@ -1748,6 +1969,15 @@ fn bubble_wrapping() {
     assert_eq!(wrapped_rows(&"x".repeat(25), 10), 3);
 }
 
+#[test]
+fn paper_follows_the_locale() {
+    assert_eq!(region("es_ES.UTF-8"), "ES");
+    assert_eq!(region("en-US"), "US");
+    assert_eq!(region("C"), "");
+    assert_eq!(PAPERS[paper_for("US")], "Letter");
+    assert_eq!(PAPERS[paper_for("ES")], "A4");
+}
+
 /// The character at a screen column of `s`, for mouse clicks.
 fn char_at(s: &str, col: usize) -> Option<char> {
     let mut x = 0;
@@ -1758,11 +1988,12 @@ fn char_at(s: &str, col: usize) -> Option<char> {
 }
 
 /// A form row's label: Print tab rows past Scale and Scan tab buttons have none.
-fn label(tab: Tab, row: usize) -> &'static str {
-    match (tab, row) {
+fn label(app: &App, row: usize) -> &'static str {
+    match (app.tab, row) {
+        (Tab::Print, 4) if !app.duplex => t().order,
         (Tab::Print, 0..=9) => t().labels[row],
-        (Tab::Scan, 0..=4) => t().scan_labels[row],
-        (Tab::Scan, PAGE) => t().scan_labels[5],
+        (Tab::Scan, 0..=5) => t().scan_labels[row],
+        (Tab::Scan, PAGE) => t().scan_labels[6],
         (Tab::Settings, 0..SETTINGS_ROWS) => t().settings_labels[row],
         _ => "",
     }
@@ -1879,6 +2110,7 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
     let title = match (app.tab == Tab::Scan, app.scans.get(app.cur), &app.view) {
         (true, Some(p), _) => format!(" {}{} ", fill(t().preview_scan, &[("n", &(app.cur + 1)), ("all", &app.scans.len())]), if p.keep { "" } else { t().not_saved }),
+        (false, _, Some((k, Ok(v)))) if split_files(&app.file).len() > 1 => format!(" {}: {} · {} ", t().preview, name(&k.file), v.title),
         (false, _, Some((_, Ok(v)))) => format!(" {}: {} ", t().preview, v.title),
         _ => format!(" {} ", t().preview),
     };

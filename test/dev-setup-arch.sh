@@ -2,6 +2,7 @@
 # Development setup for PrinterTUI on Arch Linux (to just use the app, run install.sh instead).
 #   from a checkout:  bash test/dev-setup-arch.sh
 #   from scratch:     curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/test/dev-setup-arch.sh | bash
+#   with `fake` at the end (`| bash -s fake` from scratch): also step 6, to try scanning and printing without hardware
 #
 # What it does and where things go:
 #   1. pacman: git, gcc, rust (unless cargo exists), cups, cups-filters
@@ -11,6 +12,11 @@
 #   5. command      -> /usr/local/bin/printertui-dev, a symlink to that build.
 #                      `printertui` stays whatever install.sh put there; `printertui-dev` runs your
 #                      build (rebuild with `cargo build --release`). Both share ~/.config/printertui.
+#   6. fake only    -> scanner: SANE's test backend (enabled in /etc/sane.d/dll.conf, a color pattern
+#                      instead of a black page in /etc/sane.d/test.conf); find it with Enter on the
+#                      Scanner row. Printer "PDF" (cups-pdf): writes PDFs, see Out in /etc/cups/cups-pdf.conf.
+#                      Undo: sudo lpadmin -x PDF, and comment out `test` in dll.conf again.
+#                      Then `sh test/printer-debug.sh` adds a scanner that scans an article page.
 set -euo pipefail
 
 command -v pacman >/dev/null || {
@@ -21,8 +27,18 @@ command -v pacman >/dev/null || {
 pkgs=(git gcc cups cups-filters)
 # rust conflicts with rustup, only add it when there is no cargo yet
 command -v cargo >/dev/null || pkgs+=(rust)
+fake=${1:-}
+[[ $fake == fake ]] && pkgs+=(sane cups-pdf typst)
 sudo pacman -S --needed --noconfirm "${pkgs[@]}"
 sudo systemctl enable --now cups.socket
+
+if [[ $fake == fake ]]; then
+	sudo sed -i 's/^#test$/test/' /etc/sane.d/dll.conf
+	sudo sed -i 's/^test-picture .*/test-picture "Color pattern"/' /etc/sane.d/test.conf
+	# no `exit` in awk: lpinfo would get SIGPIPE and pipefail would stop the script
+	ppd=$(lpinfo -m | awk '/CUPS-PDF/ && !p++ {print $1}')
+	sudo lpadmin -p PDF -E -v cups-pdf:/ -m "$ppd"
+fi
 
 src=${BASH_SOURCE[0]:-}
 if [[ -f $src ]] && dir=$(git -C "$(dirname "$src")" rev-parse --show-toplevel 2>/dev/null); then

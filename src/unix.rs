@@ -97,6 +97,21 @@ pub fn submit(job: &Job) -> Result<String, String> {
     Ok(out)
 }
 
+/// True when CUPS says the printer turns the sheet itself, so Double-sided needs no flipping.
+pub fn supports_duplex(queue: &str) -> bool {
+    run("lpoptions", &["-p", queue, "-l"]).is_ok_and(|list| listing_has_duplex(&list))
+}
+
+/// `lpoptions -l` lists a queue's options; a sides (or PPD "Duplex") choice that prints two sides
+/// means the printer does it by itself.
+fn listing_has_duplex(list: &str) -> bool {
+    list.lines().any(|l| {
+        let key = l.split(['/', ':']).next().unwrap_or_default().trim().to_ascii_lowercase();
+        let l = l.to_ascii_lowercase();
+        (key == "sides" || key == "duplex") && (l.contains("two-sided") || l.contains("duplexnotumble") || l.contains("duplextumble"))
+    })
+}
+
 /// True while the job is still pending, held or printing.
 pub fn job_active(id: &str) -> bool {
     run("lpstat", &["-W", "not-completed", "-o"])
@@ -225,6 +240,10 @@ pub fn lp_args(job: &Job) -> Vec<String> {
         "-o".into(), format!("media={}", job.paper),
         "-o".into(), format!("print-color-mode={}", if job.color { "color" } else { "monochrome" }),
     ];
+    if job.sides {
+        // the paper is always upright here, so the sheet turns over its long edge
+        a.extend(["-o".into(), "sides=two-sided-long-edge".into()]);
+    }
     if let Some(p) = &job.pages {
         a.extend(["-o".into(), format!("page-ranges={p}")]);
     }
@@ -412,9 +431,31 @@ pub fn local_scanners() -> Vec<(String, String)> {
     sane.lines().filter_map(|l| l.split_once('\t')).map(|(d, v)| (d.to_string(), v.to_string())).collect()
 }
 
-pub fn scan_local(device: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
+pub fn scan_local(device: &str, mode: &str, dpi: u32, out: &str, source: &str) -> Result<(), String> {
     let dpi = dpi.to_string();
-    run("scanimage", &["-d", device, "--mode", mode, "--resolution", &dpi, "--format=png", "-o", out]).map(drop)
+    let mut args: Vec<String> =
+        vec!["-d".into(), device.into(), "--mode".into(), mode.into(), "--resolution".into(), dpi];
+    // the feeder has a name of its own ("ADF", "ADF Duplex", "Automatic Document Feeder"...);
+    // the glass is what scanimage uses when no source is given
+    if source == "Feeder" {
+        let help = run("scanimage", &["-d", device, "--help"])?;
+        let adf = adf_source(&help).ok_or("This scanner has no document feeder")?;
+        args.extend(["--source".into(), adf]);
+    }
+    args.extend(["--format=png".into(), "-o".into(), out.into()]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run("scanimage", &args).map(drop)
+}
+
+/// The first ADF source in `scanimage --help`, e.g. "ADF Front" in
+/// "    --source=Auto|ADF Front|ADF Back|Flatbed [Auto]"; backends name it "ADF", "ADF Duplex"
+/// or "Automatic Document Feeder".
+fn adf_source(help: &str) -> Option<String> {
+    let line = help.lines().find(|l| l.trim_start().starts_with("--source"))?;
+    line.split_once('=')?.1.split('[').next()?.split('|').map(str::trim).find(|c| {
+        let c = c.to_ascii_uppercase();
+        c.contains("ADF") || c.contains("FEEDER")
+    }).map(String::from)
 }
 
 /// Stops running tools, their children first (e.g. LibreOffice's soffice.bin) so none are left orphaned.
@@ -435,15 +476,15 @@ pub fn timestamp() -> String {
 }
 
 /// Searchable PDF: on macOS the system's text recognition (Vision), else tesseract, lays the
-/// recognised text invisibly over each page image.
-pub fn ocr_pdf(pages: &[String], out: &str, dpi: u32) -> Result<Vec<String>, String> {
+/// recognised text invisibly over each page image. `lang` is the app's language.
+pub fn ocr_pdf(pages: &[String], out: &str, dpi: u32, lang: &str) -> Result<Vec<String>, String> {
     #[cfg(target_os = "macos")]
     if let Ok(words) = vision_words(pages) {
         let path = format!("{out}.pdf");
         std::fs::write(&path, images_to_pdf(pages, dpi, &words)?).map_err(|e| format!("{path}: {e}"))?;
         return Ok(vec![path]);
     }
-    tesseract_pdf(pages, out, dpi)
+    tesseract_pdf(pages, out, dpi, lang)
 }
 
 /// The text lines Vision finds on each page, with their boxes in the image's pixels.
@@ -465,10 +506,10 @@ fn vision_words(pages: &[String]) -> Result<Vec<Vec<Word>>, String> {
     Ok(words)
 }
 
-fn tesseract_pdf(pages: &[String], out: &str, dpi: u32) -> Result<Vec<String>, String> {
+fn tesseract_pdf(pages: &[String], out: &str, dpi: u32, lang: &str) -> Result<Vec<String>, String> {
     let langs = run("tesseract", &["--list-langs"]).map_err(|_| "Searchable PDF needs tesseract (and tesseract-data-<language>)")?;
-    // ponytail: every installed language except osd; slower with many installed, add a picker then
-    let langs: Vec<&str> = langs.lines().skip(1).filter(|l| *l != "osd").collect();
+    let installed: Vec<&str> = langs.lines().skip(1).filter(|l| *l != "osd").collect();
+    let langs = ocr_langs(&installed, lang);
     let tmp = std::env::temp_dir().join(format!("printertui-ocr-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
     // JPEG copies keep the PDF small (tesseract embeds the images as they are), and a list file
@@ -490,6 +531,32 @@ fn tesseract_pdf(pages: &[String], out: &str, dpi: u32) -> Result<Vec<String>, S
     res.map(|_| vec![format!("{out}.pdf")])
 }
 
+/// Tesseract's name for the app's language, or None for languages it has no code for.
+fn tesseract_code(lang: &str) -> Option<&'static str> {
+    let code = lang.get(..2)?.to_ascii_lowercase();
+    Some(match code.as_str() {
+        "en" => "eng",
+        "zh" => "chi_sim",
+        "hi" => "hin",
+        "es" => "spa",
+        "ar" => "ara",
+        "fr" => "fra",
+        "bn" => "ben",
+        "pt" => "por",
+        "ru" => "rus",
+        "id" => "ind",
+        _ => return None,
+    })
+}
+
+/// The languages to read: the app's own when it is installed, every installed one otherwise.
+fn ocr_langs<'a>(installed: &'a [&'a str], lang: &str) -> Vec<&'a str> {
+    match tesseract_code(lang).filter(|c| installed.contains(c)) {
+        Some(code) => vec![code],
+        None => installed.to_vec(),
+    }
+}
+
 #[test]
 fn cups_copy_of_the_state() {
     let out = "device-uri=usb://x marker-colors=#00FFFF,#000000 marker-levels=80,-1 marker-low-levels=2,2 \
@@ -499,6 +566,42 @@ fn cups_copy_of_the_state() {
     assert_eq!(state.problems, ["media-jam", "stopped"]);
     assert_eq!(printer_label("q", out), "Tank");
     assert_eq!(cups_state("printer-info=x"), PrinterState::default());
+}
+
+#[test]
+fn duplex_is_read_from_the_queue_options() {
+    // CUPS' listing for a driverless printer, and one with a plain PPD
+    assert!(listing_has_duplex("PageSize/Media Size: A4\nsides/Sides: one-sided *two-sided-long-edge\n"));
+    assert!(listing_has_duplex("Duplex/2-Sided Printing: None *DuplexNoTumble DuplexTumble"));
+    assert!(!listing_has_duplex("sides/Sides: one-sided"));
+    assert!(!listing_has_duplex("PageSize/Media Size: A4"));
+    let job = Job {
+        printer: "q".into(), file: "f".into(), color: false, sides: true, paper: "A4",
+        pages: None, reverse: false, copies: 1, collate: true, per_sheet: 1,
+    };
+    assert!(lp_args(&job).contains(&"sides=two-sided-long-edge".to_string()));
+}
+
+#[test]
+fn the_feeder_source_comes_from_scanimage() {
+    let help = "Options:\n    --mode=Color|Gray [Color]\n    --source=Auto|ADF Front|ADF Back|Flatbed [Auto]\n";
+    assert_eq!(adf_source(help).as_deref(), Some("ADF Front"));
+    // other names backends use, and scanners with no feeder
+    assert_eq!(adf_source("    --source=Flatbed|Automatic Document Feeder [Flatbed]").as_deref(), Some("Automatic Document Feeder"));
+    assert_eq!(adf_source("    --source=Flatbed|Transparency Adapter [Flatbed]"), None);
+    assert_eq!(adf_source("Options:\n    --mode=Color|Gray"), None);
+}
+
+#[test]
+fn ocr_reads_in_the_apps_language() {
+    assert_eq!(tesseract_code("es"), Some("spa"));
+    assert_eq!(tesseract_code("zh"), Some("chi_sim"));
+    assert_eq!(tesseract_code("de"), None);
+    let installed = ["eng", "spa", "deu"];
+    // the app's language when tesseract has it; all of them when it has not
+    assert_eq!(ocr_langs(&installed, "es"), ["spa"]);
+    assert_eq!(ocr_langs(&installed, "fr"), installed);
+    assert_eq!(ocr_langs(&installed, "de"), installed);
 }
 
 /// PDFKit draws a page, and Vision reads back the text on it.
@@ -522,7 +625,7 @@ fn macos_draws_and_reads_pages() {
     // the box is near the top left of the page, where the text is
     let first = words[0].iter().find(|w| w.text.contains("HELLO")).unwrap();
     assert!(first.x < w as f32 / 3.0 && first.y < h as f32 / 5.0, "{} {}", first.x, first.y);
-    let searchable = ocr_pdf(&[png], &dir.join("out").to_string_lossy(), 100).unwrap().remove(0);
+    let searchable = ocr_pdf(&[png], &dir.join("out").to_string_lossy(), 100, "en").unwrap().remove(0);
     assert_eq!(page_count(&searchable), Some(1));
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -595,7 +698,7 @@ fn ocr_pdf_has_text() {
     std::fs::create_dir_all(&dir).unwrap();
     let (img, out) = (dir.join("p.png").to_string_lossy().into_owned(), dir.join("out").to_string_lossy().into_owned());
     run("magick", &["-size", "1200x300", "xc:white", "-pointsize", "72", "-annotate", "+50+180", "Hello printer", &img]).unwrap();
-    let pdf = save_scans(&[img], &out, "OCR", 150).unwrap().remove(0);
+    let pdf = save_scans(&[img], &out, "OCR", 150, "en").unwrap().remove(0);
     let text = run("pdftotext", &[&pdf, "-"]).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(text.contains("Hello printer"), "{text}");
