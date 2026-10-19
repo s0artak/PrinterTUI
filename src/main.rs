@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 type Done = Box<dyn FnOnce(&mut App) + Send>;
 
 /// Rows of the Print, Scan and Settings forms.
-const ROWS: usize = 13;
+const ROWS: usize = 14;
 const SCAN_ROWS: usize = 11;
 const SETTINGS_ROWS: usize = 6;
 /// The last files printed kept for the File row's h/l.
@@ -50,9 +50,10 @@ const GRAPHICS_PREFS: [&str; 4] = ["auto", "kitty", "sixel", "blocks"];
 const FILE: usize = 1;
 const PAGES: usize = 5;
 const SCALE: usize = 9;
-const PRINT: usize = 10;
-const ADD: usize = 11;
-const QUEUE: usize = 12;
+const QUALITY: usize = 10;
+const PRINT: usize = 11;
+const ADD: usize = 12;
+const QUEUE: usize = 13;
 
 const SAVE_AS: usize = 5;
 const SCAN: usize = 6;
@@ -133,6 +134,8 @@ struct App {
     copies: u32,
     per_sheet: usize,
     scale: usize,
+    /// Index in QUALITIES.
+    quality: usize,
     tab: Tab,
     /// Index in pet::THEMES.
     theme: usize,
@@ -266,6 +269,7 @@ fn new_app(scan: bool, file: String) -> App {
         copies: 1,
         per_sheet: 0,
         scale: SCALES.iter().position(|s| *s == 100).unwrap_or(0),
+        quality: 1,
         tab: if scan { Tab::Scan } else { Tab::Print },
         theme: 0,
         mascot: true,
@@ -843,6 +847,7 @@ impl App {
             7 => self.copies = if fwd { self.copies + 1 } else { (self.copies - 1).max(1) },
             8 => self.per_sheet = step(self.per_sheet, PER_SHEET.len()),
             SCALE => self.scale = step(self.scale, SCALES.len()),
+            QUALITY => self.quality = step(self.quality, QUALITIES.len()),
             _ => {}
         }
     }
@@ -929,6 +934,7 @@ impl App {
             7 => pick(&self.copies.to_string()),
             8 => pick(&PER_SHEET[self.per_sheet].to_string()),
             SCALE => pick(&format!("{}%", SCALES[self.scale])),
+            QUALITY => pick(t().qualities[self.quality]),
             PRINT => format!("[ {} ]", t().btn_print),
             ADD => format!("[ {} ]", t().btn_add),
             _ => format!("[ {} ]", t().btn_queue),
@@ -977,11 +983,11 @@ impl App {
         let path = config_path().ok_or(std::io::Error::other("HOME is not set"))?;
         std::fs::create_dir_all(path.parent().unwrap_or(&path))?;
         let mut text = format!(
-            "printer={}\ncolor={}\nduplex={}\nreverse_back={}\nreverse={}\npaper={}\ncopies={}\nper_sheet={}\nscale={}\n\
+            "printer={}\ncolor={}\nduplex={}\nreverse_back={}\nreverse={}\npaper={}\ncopies={}\nper_sheet={}\nscale={}\nquality={}\n\
              scanner={}\nscan_source={}\nscan_mode={}\nscan_dpi={}\nscan_format={}\n\
              lang={}\ntheme={}\nvolume={}\nmascot={}\ngraphics={}\nscan_folder={}\n",
             self.printers.get(self.printer).map_or("", String::as_str),
-            self.color, self.duplex, self.reverse_back, self.reverse, PAPERS[self.paper], self.copies, PER_SHEET[self.per_sheet], SCALES[self.scale],
+            self.color, self.duplex, self.reverse_back, self.reverse, PAPERS[self.paper], self.copies, PER_SHEET[self.per_sheet], SCALES[self.scale], QUALITIES[self.quality],
             self.scanners.as_ref().and_then(|l| l.get(self.scanner)).map_or(self.scanner_pref.as_str(), |(d, _)| d.as_str()),
             SCAN_SOURCES[self.scan_source], SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi], SCAN_FORMATS[self.scan_format],
             // an empty language follows the system's
@@ -1012,6 +1018,7 @@ impl App {
             "graphics" => self.graphics_pref = GRAPHICS_PREFS.iter().position(|g| *g == v).unwrap_or(self.graphics_pref),
             "scan_folder" => self.scan_folder = v.to_string(),
             "scale" => self.scale = SCALES.iter().position(|n| n.to_string() == v).unwrap_or(self.scale),
+            "quality" => self.quality = QUALITIES.iter().position(|q| *q == v).unwrap_or(self.quality),
             "scanner" => self.scanner_pref = v.to_string(),
             "scan_source" => self.scan_source = SCAN_SOURCES.iter().position(|s| *s == v).unwrap_or(self.scan_source),
             "scan_mode" => self.scan_mode = SCAN_MODES.iter().position(|m| *m == v).unwrap_or(self.scan_mode),
@@ -1027,7 +1034,7 @@ impl App {
     fn job(&self, file: &str, pages: Option<String>, reverse: bool, collate: bool) -> Job {
         Job {
             printer: self.printers[self.printer].clone(), file: file.into(), color: self.color, sides: false, paper: PAPERS[self.paper], pages, reverse,
-            copies: self.copies, collate, per_sheet: PER_SHEET[self.per_sheet],
+            copies: self.copies, collate, per_sheet: PER_SHEET[self.per_sheet], quality: 3 + self.quality as u32,
         }
     }
 
@@ -1313,6 +1320,7 @@ impl App {
                 s if s > 100 => n(t().scale_big, &s),
                 s => n(t().scale_small, &s),
             },
+            QUALITY => t().quality_chat[self.quality].into(),
             PRINT => t().print_chat.into(),
             ADD => t().add_chat.into(),
             _ => t().queue_chat.into(),
@@ -1991,7 +1999,7 @@ fn char_at(s: &str, col: usize) -> Option<char> {
 fn label(app: &App, row: usize) -> &'static str {
     match (app.tab, row) {
         (Tab::Print, 4) if !app.duplex => t().order,
-        (Tab::Print, 0..=9) => t().labels[row],
+        (Tab::Print, 0..=QUALITY) => t().labels[row],
         (Tab::Scan, 0..=5) => t().scan_labels[row],
         (Tab::Scan, PAGE) => t().scan_labels[6],
         (Tab::Settings, 0..SETTINGS_ROWS) => t().settings_labels[row],

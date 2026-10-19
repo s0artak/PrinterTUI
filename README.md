@@ -5,7 +5,7 @@ Terminal app to print and scan on Linux, macOS and Windows.
 [![PrinterTUI demo](docs/demo.gif)](docs/demo.mp4)
 
 - Prints PDFs, photos (JPEG, PNG; HEIC and other formats on macOS), text files, and other documents through LibreOffice.
-- Preview of the pages as they will print; scale 25-200%, pages per sheet, copies, paper, color.
+- Preview of the pages as they will print; scale 25-200%, pages per sheet, copies, paper, color, print quality (draft, normal, high).
 - Manual double-sided printing for printers without a duplexer, and the printer's own duplexer when it has one.
 - Scans from network printers (eSCL) or SANE, from the glass or the document feeder; saves PDF, searchable PDF (read in the app's language) or PNG; copies (scan and print).
 - Shows the printer's ink levels and problems (out of paper, jam, offline).

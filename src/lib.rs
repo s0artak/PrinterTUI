@@ -29,6 +29,8 @@ pub const PAPERS: [&str; 5] = ["A4", "Letter", "Legal", "A5", "A3"];
 pub const PER_SHEET: [u32; 6] = [1, 2, 4, 6, 9, 16];
 /// Content size in percent of the page, see `scale_pdf`.
 pub const SCALES: [u32; 9] = [25, 50, 75, 90, 100, 110, 125, 150, 200];
+/// Print quality; IPP's `print-quality` is 3 + the index (3 draft, 4 normal, 5 high).
+pub const QUALITIES: [&str; 3] = ["draft", "normal", "high"];
 
 fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
     let child = Command::new(cmd)
@@ -360,6 +362,8 @@ pub struct Job {
     pub copies: u32,
     pub collate: bool,
     pub per_sheet: u32,
+    /// IPP print-quality: 3 draft, 4 normal (the printer's default), 5 high.
+    pub quality: u32,
 }
 
 /// Settings file: $XDG_CONFIG_HOME/printertui/config, else ~/.config/printertui/config;

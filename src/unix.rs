@@ -256,6 +256,9 @@ pub fn lp_args(job: &Job) -> Vec<String> {
     if job.per_sheet > 1 {
         a.extend(["-o".into(), format!("number-up={}", job.per_sheet)]);
     }
+    if job.quality != 4 {
+        a.extend(["-o".into(), format!("print-quality={}", job.quality)]);
+    }
     a.extend(["--".into(), job.file.clone()]);
     a
 }
@@ -580,9 +583,11 @@ fn duplex_is_read_from_the_queue_options() {
     assert!(!listing_has_duplex("PageSize/Media Size: A4"));
     let job = Job {
         printer: "q".into(), file: "f".into(), color: false, sides: true, paper: "A4",
-        pages: None, reverse: false, copies: 1, collate: true, per_sheet: 1,
+        pages: None, reverse: false, copies: 1, collate: true, per_sheet: 1, quality: 5,
     };
     assert!(lp_args(&job).contains(&"sides=two-sided-long-edge".to_string()));
+    assert!(lp_args(&job).contains(&"print-quality=5".to_string()));
+    assert!(!lp_args(&Job { quality: 4, ..job }).iter().any(|a| a.starts_with("print-quality")));
 }
 
 #[test]

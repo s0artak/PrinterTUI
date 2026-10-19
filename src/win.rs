@@ -214,6 +214,11 @@ fn devmode(printer: &str, job: &Job) -> Result<Vec<u64>, String> {
             (*dm).dmColor = DMCOLOR_MONOCHROME;
             (*dm).dmFields |= DM_COLOR;
         }
+        // normal keeps the driver's own setting
+        if job.quality != 4 {
+            (*dm).Anonymous1.Anonymous1.dmPrintQuality = (if job.quality < 4 { DMRES_DRAFT } else { DMRES_HIGH }) as i16;
+            (*dm).dmFields |= DM_PRINTQUALITY;
+        }
         // let the driver check the changes against what the printer can do
         DocumentPropertiesW(None, h, PCWSTR(name.as_ptr()), Some(dm), Some(dm), DM_IN_BUFFER.0 | DM_OUT_BUFFER.0);
         Ok(buf)
@@ -577,7 +582,7 @@ fn prints_to_microsoft_print_to_pdf() {
     std::fs::write(&src, images_to_pdf(&[img.clone(), img.clone(), img.clone(), img], 100, &[]).unwrap()).unwrap();
     let job = Job {
         printer: PRINTER.into(), file: src.to_string_lossy().into_owned(), color: false, sides: false, paper: "A4",
-        pages: Some("1-4".into()), reverse: true, copies: 1, collate: true, per_sheet: 2,
+        pages: Some("1-4".into()), reverse: true, copies: 1, collate: true, per_sheet: 2, quality: 4,
     };
     print_pdf(&job, Some(&out.to_string_lossy())).unwrap();
     // the spooler writes the file after EndDoc returns
