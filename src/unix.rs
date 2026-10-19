@@ -387,7 +387,10 @@ fn bonjour_uri(uri: &str) -> Option<String> {
     if let Some(found) = known(&BONJOUR.lock().unwrap()) {
         return Some(found);
     }
-    let answer = run("ippfind", &["-T", "3", "_ipp._tcp,local.", "_ipps._tcp,local.", "--exec", "echo", "{service_name}|||{service_uri}", ";"]);
+    // only the uri's own type: ippfind reads "_ipp._tcp,local." as a subtype that nothing has,
+    // and with two types on Linux it often finds nothing within the timeout
+    let kind = if uri.contains("._ipps._tcp") { "_ipps._tcp" } else { "_ipp._tcp" };
+    let answer = run("ippfind", &["-T", "3", kind, "--exec", "echo", "{service_name}|||{service_uri}", ";"]);
     let mut list = BONJOUR.lock().unwrap();
     list.extend(bonjour_answers(&answer.unwrap_or_default()));
     known(&list)
