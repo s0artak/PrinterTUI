@@ -398,9 +398,11 @@ pub fn stop_all() {
     }
 }
 
-/// "request id is P-12 (1 file(s))" -> "P-12".
+/// "request id is P-12 (1 file(s))" -> "P-12". lp answers in the user's language
+/// ("la id solicitada es P-12 (1 archivo(s))"), there the id is the word ending in -number.
 pub fn job_id(lp_out: &str) -> Option<&str> {
-    lp_out.strip_prefix("request id is ")?.split_whitespace().next()
+    let queue_job = |w: &&str| w.rsplit_once('-').is_some_and(|(q, n)| !q.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    lp_out.strip_prefix("request id is ").and_then(|s| s.split_whitespace().next()).or_else(|| lp_out.split_whitespace().find(queue_job))
 }
 
 /// Printer name for a network printer at `host`: printer_192_168_1_46.
@@ -1102,6 +1104,18 @@ fn text_files_print_without_libreoffice() {
 #[test]
 fn config_with_a_byte_order_mark() {
     assert_eq!(parse_config("\u{feff}printer=Tank\r\nlang=es\n"), [("printer", "Tank"), ("lang", "es")]);
+}
+
+#[test]
+fn job_id_in_any_language() {
+    // what CUPS 2.4's lp says with LANG=es_ES, zh_CN, ru_RU and ja_JP
+    for out in ["request id is Smart_Tank-16 (1 file(s))", "la id solicitada es Smart_Tank-16 (1 archivo(s))", "请求 ID 为 Smart_Tank-16 (1 个文件)",
+                "id запроса Smart_Tank-16 (1 файл.)", "リクエスト ID は Smart_Tank-16 です (1 個のファイル)"] {
+        assert_eq!(job_id(out), Some("Smart_Tank-16"), "{out}");
+    }
+    // Windows' own answer
+    assert_eq!(job_id("request id is 12 (HP)"), Some("12"));
+    assert_eq!(job_id("Anfrage-ID ist"), None);
 }
 
 #[test]

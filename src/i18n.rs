@@ -957,7 +957,7 @@ pub const ES: Texts = Texts {
     no_jobs: "No hay trabajos pendientes",
     queue_title: "Cola de impresión (x cancelar trabajo, Esc volver)",
     duplex_title: "Doble cara manual",
-    flip: ["Cara impresa hacia ti,\ntexto derecho", "Dale la vuelta de arriba abajo", "Cara en blanco hacia ti,\nborde verde de arriba abajo", "Ponla en la bandeja trasera,\nel borde de arriba entra primero", "Pulsa Enter"],
+    flip: ["Cara impresa hacia ti,\ntexto derecho", "Dale la vuelta de arriba abajo", "Cara en blanco hacia ti,\nborde verde de arriba abajo", "Ponla en la bandeja trasera,\ncon el borde de arriba primero", "Pulsa Enter"],
     ink: "tinta %",
     k_done: "listo",
     k_add: "añadir",
