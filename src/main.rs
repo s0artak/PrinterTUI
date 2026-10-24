@@ -1918,12 +1918,50 @@ fn draw(f: &mut Frame, app: &App) {
             f.render_stateful_widget(list, area, &mut state);
         }
         Mode::Flip { job, .. } => {
-            let area = popup(f, 100, 18);
-            let block = panel(format!(" {} ", t.duplex_title)).border_style(Style::new().fg(ACCENT));
-            let [text, anim] = Layout::horizontal([Constraint::Min(30), Constraint::Length(31)]).areas(block.inner(area));
-            f.render_widget(block, area);
-            f.render_widget(Paragraph::new(app.status.as_str()).wrap(Wrap { trim: false }), text);
-            if job.is_none() {
+            if job.is_some() {
+                let area = popup(f, 72, 8);
+                let block = panel(format!(" {} ", t.duplex_title)).border_style(Style::new().fg(ACCENT));
+                let [body, divider, footer] =
+                    Layout::vertical([Constraint::Min(2), Constraint::Length(1), Constraint::Length(1)])
+                        .areas(block.inner(area));
+                f.render_widget(block, area);
+
+                // Keep the latest sent-job details and the current state; older file entries
+                // can otherwise make this status-only popup grow with the print batch.
+                let status = app
+                    .status
+                    .lines()
+                    .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with("Esc ="))
+                    .collect::<Vec<_>>();
+                let current = t.printing_front.lines().find(|line| !line.is_empty()).unwrap_or("");
+                let mut lines = Vec::new();
+                for line in status.iter().filter(|line| **line != current) {
+                    lines.push(Line::styled(*line, Style::new().fg(theme().dim)));
+                }
+                if let Some(line) = status.iter().rev().find(|line| **line == current) {
+                    lines.push(Line::from(vec![
+                        Span::styled("▶ ", Style::new().fg(ACCENT).bold()),
+                        Span::styled(*line, Style::new().fg(theme().fg.unwrap_or(WHITE)).bold()),
+                    ]));
+                }
+                f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), body);
+                f.render_widget(
+                    Paragraph::new("─".repeat(divider.width as usize)).style(Style::new().fg(theme().dim)),
+                    divider,
+                );
+                f.render_widget(
+                    Line::from(vec![
+                        Span::styled(format!(" {} ", "Esc"), Style::new().fg(theme().chip.0).bg(theme().chip.1).bold()),
+                        Span::styled(format!(" {} ", t.k_cancel), Style::new().fg(theme().dim)),
+                    ]),
+                    footer,
+                );
+            } else {
+                let area = popup(f, 100, 18);
+                let block = panel(format!(" {} ", t.duplex_title)).border_style(Style::new().fg(ACCENT));
+                let [text, anim] = Layout::horizontal([Constraint::Min(30), Constraint::Length(31)]).areas(block.inner(area));
+                f.render_widget(block, area);
+                f.render_widget(Paragraph::new(app.status.as_str()).wrap(Wrap { trim: false }), text);
                 let (art, caption) = pet::flip(tick / 350);
                 let mut lines: Vec<Line> = art.into_iter().map(|l| l.centered()).collect();
                 lines.push(Line::default());
