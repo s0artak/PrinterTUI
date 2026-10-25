@@ -35,6 +35,7 @@ Development on Arch: `bash test/dev-setup-arch.sh` (`... fake` also adds a test 
 
 ```sh
 printertui [file...]           # open with these files loaded
+printertui --dummy [file...]   # open with an in-memory simulated printer; nothing is sent
 printertui --scan              # open on the Scan tab
 printertui --print [file...]   # print with the saved settings, no interface
 printertui --version

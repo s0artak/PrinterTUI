@@ -7,7 +7,7 @@ edition = "2024"
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 lopdf = { version = "0.45.0", default-features = false }
-minreq = "3.0.0"
+minreq = { version = "3.0.0", features = ["https-rustls-probe"] }
 pdf-writer = "0.15.0"
 ratatui = "0.30.2"
 unicode-width = "0.2.2"

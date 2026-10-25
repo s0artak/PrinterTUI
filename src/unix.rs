@@ -60,17 +60,24 @@ pub fn printer_state(queue: &str) -> PrinterState {
     let uri = lpoption(&opts, "device-uri").unwrap_or_default();
     // a printer macOS added has a Bonjour name: its address, to ask it directly
     let uri = if uri.starts_with("dnssd://") { bonjour_uri(&uri).unwrap_or(uri) } else { uri };
-    if !matches!(uri_host(&uri), Some(("ipp" | "ipps" | "http", _))) {
-        return cups_state(&opts);
+    if !matches!(uri_host(&uri), Some(("ipp" | "ipps" | "http" | "https", _))) {
+        let mut state = cups_state(&opts);
+        state.ink_source = InkSource::CupsCache;
+        return state;
     }
-    ipp_attributes(&uri, None, &STATE_ATTRIBUTES).map_or_else(
-        |_| {
+    match ipp_attributes(&uri, None, &STATE_ATTRIBUTES) {
+        Ok(attrs) => {
+            let mut state = PrinterState::from(&attrs);
+            state.ink_source = InkSource::Ipp;
+            state
+        }
+        Err(_) => {
             let mut state = cups_state(&opts);
+            state.ink_source = InkSource::CupsCache;
             state.problems.push("offline".into());
             state
-        },
-        |attrs| PrinterState::from(&attrs),
-    )
+        }
+    }
 }
 
 /// CUPS keeps the printer's state attributes as queue options: marker-levels=80,100.

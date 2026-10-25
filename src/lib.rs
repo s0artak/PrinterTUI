@@ -429,12 +429,18 @@ pub type IppAttributes = std::collections::HashMap<String, Vec<IppValue>>;
 pub const STATE_ATTRIBUTES: [&str; 5] = ["printer-state", "printer-state-reasons", "marker-colors", "marker-levels", "marker-low-levels"];
 
 /// Asks a printer for attributes over IPP (Get-Printer-Attributes), or about one of its jobs
-/// (Get-Job-Attributes). `url` is its ipp://, ipps:// or http:// address; the request goes over
-/// plain HTTP, port 631 unless one is given.
+/// (Get-Job-Attributes). `url` is its ipp://, ipps://, http:// or https:// address.
 pub fn ipp_attributes(url: &str, job: Option<i32>, names: &[&str]) -> Result<IppAttributes, String> {
-    let (_, rest) = url.split_once("://").ok_or(format!("Bad printer address: {url}"))?;
+    let (scheme, rest) = url.split_once("://").ok_or(format!("Bad printer address: {url}"))?;
+    let (transport, ipp_scheme, default_port) = match scheme {
+        "ipp" => ("http", "ipp", 631),
+        "ipps" => ("https", "ipps", 631),
+        "http" => ("http", "ipp", 80),
+        "https" => ("https", "ipps", 443),
+        _ => return Err(format!("Unsupported printer address scheme: {scheme}")),
+    };
     let (authority, path) = rest.find('/').map_or((rest, "/ipp/print"), |i| (&rest[..i], &rest[i..]));
-    let authority = if authority.contains(':') { authority.to_string() } else { format!("{authority}:631") };
+    let authority = if authority.contains(':') { authority.to_string() } else { format!("{authority}:{default_port}") };
     let mut body = vec![1, 1, 0, if job.is_some() { 0x09 } else { 0x0B }, 0, 0, 0, 1, 0x01];
     let mut attr = |tag: u8, name: &str, value: &[u8]| {
         body.push(tag);
@@ -445,7 +451,7 @@ pub fn ipp_attributes(url: &str, job: Option<i32>, names: &[&str]) -> Result<Ipp
     };
     attr(0x47, "attributes-charset", b"utf-8");
     attr(0x48, "attributes-natural-language", b"en");
-    attr(0x45, "printer-uri", format!("ipp://{authority}{path}").as_bytes());
+    attr(0x45, "printer-uri", format!("{ipp_scheme}://{authority}{path}").as_bytes());
     if let Some(id) = job {
         attr(0x21, "job-id", &id.to_be_bytes());
     }
@@ -454,7 +460,7 @@ pub fn ipp_attributes(url: &str, job: Option<i32>, names: &[&str]) -> Result<Ipp
         attr(0x44, if i == 0 { "requested-attributes" } else { "" }, name.as_bytes());
     }
     body.push(0x03);
-    let res = minreq::post(format!("http://{authority}{path}"))
+    let res = minreq::post(format!("{transport}://{authority}{path}"))
         .with_header("Content-Type", "application/ipp")
         .with_body(body)
         .with_timeout(3)
@@ -500,10 +506,21 @@ fn parse_ipp(data: &[u8]) -> Option<IppAttributes> {
 }
 
 /// What a printer reports about itself.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum InkSource {
+    #[default]
+    Unknown,
+    Ipp,
+    CupsCache,
+    Demo,
+}
+
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct PrinterState {
     /// Each ink or toner as (RGB color, percent or -1 when unknown, running low).
     pub ink: Vec<(u32, i32, bool)>,
+    /// Whether those levels came directly from the device or from a local cache.
+    pub ink_source: InkSource,
     /// What needs a person, as IPP printer-state-reasons without their -error / -warning
     /// ending: "media-empty", "media-jam", "door-open", "offline", "stopped"...
     pub problems: Vec<String>,
@@ -549,7 +566,7 @@ impl PrinterState {
             problems.push("stopped".into());
         }
         problems.dedup();
-        PrinterState { ink, problems }
+        PrinterState { ink, ink_source: InkSource::Unknown, problems }
     }
 }
 

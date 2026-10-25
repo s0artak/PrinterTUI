@@ -8,7 +8,7 @@ use sound::Sound;
 use printertui::*;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
-    layout::{Constraint, Layout},
+    layout::{Alignment, Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap},
@@ -47,6 +47,7 @@ const GRAPHICS: usize = 4;
 const FOLDER: usize = 5;
 /// Image preview choices as the settings file names them.
 const GRAPHICS_PREFS: [&str; 4] = ["auto", "kitty", "sixel", "blocks"];
+const DUMMY_QUEUE: &str = "printertui-demo";
 const FILE: usize = 1;
 const PAGES: usize = 5;
 const SCALE: usize = 9;
@@ -96,6 +97,29 @@ struct PrintView {
     title: String,
 }
 
+/// A print job kept only in memory while `--dummy` is running.
+struct DummyJob {
+    id: String,
+    description: String,
+    sides: u32,
+    started: Instant,
+    cancelled: bool,
+}
+
+impl DummyJob {
+    fn duration(&self) -> Duration {
+        Duration::from_millis((2_000 + u64::from(self.sides) * 500).min(12_000))
+    }
+
+    fn progress(&self) -> u32 {
+        (u128::from(self.sides) * self.started.elapsed().as_millis() / self.duration().as_millis()).min(u128::from(self.sides)) as u32
+    }
+
+    fn active(&self) -> bool {
+        !self.cancelled && self.started.elapsed() < self.duration()
+    }
+}
+
 enum Mode {
     Main,
     /// Editing the selected text field (vim-style, entered with `i`).
@@ -114,6 +138,10 @@ enum Mode {
 }
 
 struct App {
+    /// Uses only the in-memory fake printer and never calls a print or scan backend.
+    dummy: bool,
+    dummy_jobs: Vec<DummyJob>,
+    dummy_next_job: u32,
     printers: Vec<String>,
     labels: Vec<String>,
     /// The last known state of a printer (by queue), the check running, and when it started.
@@ -204,19 +232,28 @@ fn main() -> std::io::Result<()> {
         println!("printertui {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    let dummy = args.iter().any(|a| a == "--dummy");
     if let Some(i) = args.iter().position(|a| a == "--print") {
-        return print_files(&args[i + 1..]);
+        if !dummy {
+            return print_files(&args[i + 1..]);
+        }
     }
     // the files to print, `;`-separated like the File field
     let file = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<_>>().join("; ");
-    let mut app = new_app(args.iter().any(|a| a == "--scan"), file);
+    let mut app = new_app(args.iter().any(|a| a == "--scan"), file, dummy);
     app.save_as = default_scan_name(&app.scan_folder);
+    if dummy {
+        app.status = demo_text(
+            "DEMO MODE · print jobs stay in this session; no device output",
+            "MODO DEMO · los trabajos son simulados; no se envía nada a una impresora",
+        ).into();
+    }
     sound::play(Sound::Boot);
-    if app.printers.is_empty() {
+    if app.printers.is_empty() && !dummy {
         app.status = t().no_printers.into();
     }
     // If launched with --scan, preload the most recent scanned page for preview testing
-    if app.tab == Tab::Scan {
+    if app.tab == Tab::Scan && !dummy {
         let dir = std::env::temp_dir().join("printertui-scan");
         if let Ok(rd) = std::fs::read_dir(&dir) {
             let mut paths: Vec<_> = rd
@@ -239,8 +276,12 @@ fn main() -> std::io::Result<()> {
         }
     }
 
+    run_app(&mut app)
+}
+
+fn run_app(app: &mut App) -> std::io::Result<()> {
     let mut term = init();
-    let res = run(&mut term, &mut app);
+    let res = run(&mut term, app);
     if let (Graphics::Kitty(tmux), Some(_)) = (app.graphics, &app.sent) {
         emit(&kitty(&format!("a=d,d=I,i={},q=2", image_id()), "", tmux));
     }
@@ -250,8 +291,11 @@ fn main() -> std::io::Result<()> {
 }
 
 /// A fresh app with its saved settings read in; no terminal needed yet (the installer sets `lang`).
-fn new_app(scan: bool, file: String) -> App {
+fn new_app(scan: bool, file: String, dummy: bool) -> App {
     let mut app = App {
+        dummy,
+        dummy_jobs: Vec::new(),
+        dummy_next_job: 1,
         printers: Vec::new(),
         labels: Vec::new(),
         state: None,
@@ -309,14 +353,59 @@ fn new_app(scan: bool, file: String) -> App {
         printing: Vec::new(),
         mode: Mode::Main,
     };
-    app.set_printers(printers());
+    if dummy {
+        app.printers = vec![DUMMY_QUEUE.into()];
+        app.labels = vec![dummy_label().into()];
+        app.state = Some((DUMMY_QUEUE.into(), dummy_state()));
+        app.scanners = Some(Vec::new());
+    } else {
+        app.set_printers(printers());
+    }
     if let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         for (k, v) in parse_config(&text) {
             app.apply(k, v);
         }
     }
     app.apply_settings();
+    if dummy {
+        app.labels = vec![dummy_label().into()];
+    }
     app
+}
+
+fn demo_text(en: &'static str, es: &'static str) -> &'static str {
+    if t().code == "es" { es } else { en }
+}
+
+fn dummy_label() -> &'static str {
+    demo_text("PrinterTUI Demo Printer · simulated", "PrinterTUI · impresora de prueba")
+}
+
+fn dummy_state() -> PrinterState {
+    PrinterState {
+        ink: vec![(0x00AEEF, 92, false), (0xE83E8C, 78, false), (0xFFC107, 66, false), (0x222222, 85, false)],
+        ink_source: InkSource::Demo,
+        problems: Vec::new(),
+    }
+}
+
+fn dummy_queue(jobs: &[DummyJob]) -> Vec<(String, String)> {
+    jobs.iter()
+        .filter(|job| job.active())
+        .map(|job| (job.id.clone(), format!("{}  ·  {} {}/{}", job.description, demo_text("simulation", "simulación"), job.progress(), job.sides)))
+        .collect()
+}
+
+fn cancel_dummy_job(jobs: &mut [DummyJob], id: &str) -> Result<(), String> {
+    let Some(job) = jobs.iter_mut().find(|job| job.id == id && job.active()) else {
+        return Err(format!("Unknown demo job {id}"));
+    };
+    job.cancelled = true;
+    Ok(())
+}
+
+fn dummy_job_active(jobs: &[DummyJob], id: &str) -> bool {
+    jobs.iter().find(|job| job.id == id).is_some_and(DummyJob::active)
 }
 
 /// The command line, in English (the app's own texts follow the settings).
@@ -326,6 +415,7 @@ fn print_help() {
 PrinterTUI {}
 
 usage: printertui [file...]          open, with these files loaded
+       printertui --dummy [file...]   open with a simulated printer; no jobs are sent
        printertui --scan             open on the Scan tab
        printertui --print [file...]  print with the saved settings and exit
        printertui --version
@@ -341,7 +431,7 @@ i types, q quits.",
 /// `--print`: prints with the saved settings, no UI; the exit code says how it went.
 fn print_files(args: &[String]) -> std::io::Result<()> {
     let files: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).map(|f| expand_home(f)).collect();
-    let mut app = new_app(false, files.join("; "));
+    let mut app = new_app(false, files.join("; "), false);
     match print_now(&mut app) {
         Ok(out) => {
             println!("{out}");
@@ -414,13 +504,15 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
         if app.last_poll.elapsed() >= Duration::from_secs(1) {
             app.last_poll = Instant::now();
             if let Mode::Flip { job, steps, .. } = &mut app.mode
-                && job.as_deref().is_some_and(|id| !job_active(id))
+                && job.as_deref().is_some_and(|id| {
+                    if app.dummy { !dummy_job_active(&app.dummy_jobs, id) } else { !job_active(id) }
+                })
             {
                 *job = None;
                 app.status = std::mem::take(steps);
             }
             if let Mode::Queue(jobs, _) = &mut app.mode {
-                *jobs = queue();
+                *jobs = if app.dummy { dummy_queue(&app.dummy_jobs) } else { queue() };
             }
             if !app.printing.is_empty() {
                 app.follow_jobs();
@@ -525,6 +617,9 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     KeyCode::Enter if app.tab == Tab::Scan => app.scan_enter(),
                     KeyCode::Enter if app.tab == Tab::Settings && app.sel == FOLDER => app.mode = Mode::Insert,
                     KeyCode::Enter if app.tab == Tab::Settings => app.cycle(true),
+                    KeyCode::Enter if app.sel == ADD && app.dummy => {
+            app.status = demo_text("Adding printers is disabled in demo mode.", "No se pueden añadir impresoras en el modo demo.").into();
+                    }
                     KeyCode::Enter if app.sel == ADD => app.spawn(t().searching_printers, || {
                         let found = discover();
                         Box::new(move |app: &mut App| {
@@ -550,7 +645,8 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     KeyCode::Enter if app.sel == PAGES => app.open_pages(),
                     KeyCode::Enter if app.sel == QUEUE => {
                         app.status = String::new();
-                        app.mode = Mode::Queue(queue(), ListState::default().with_selected(Some(0)));
+                        let jobs = if app.dummy { dummy_queue(&app.dummy_jobs) } else { queue() };
+                        app.mode = Mode::Queue(jobs, ListState::default().with_selected(Some(0)));
                     }
                     KeyCode::Enter => app.try_print(),
                     _ => {}
@@ -634,11 +730,12 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     KeyCode::Char('G') => state.select_last(),
                     KeyCode::Char('x') | KeyCode::Delete => {
                         if let Some((id, desc)) = state.selected().and_then(|i| jobs.get(i)).cloned() {
-                            app.status = match cancel_job(&id) {
+                            let result = if app.dummy { cancel_dummy_job(&mut app.dummy_jobs, &id) } else { cancel_job(&id) };
+                            app.status = match result {
                                 Ok(()) => fill(t().cancelled, &[("desc", &desc)]),
                                 Err(e) => failed(e),
                             };
-                            *jobs = queue();
+                            *jobs = if app.dummy { dummy_queue(&app.dummy_jobs) } else { queue() };
                         }
                     }
                     _ => {}
@@ -745,6 +842,11 @@ impl App {
 
     /// Adds a network printer; the terminal is in normal mode meanwhile, for the password / UAC prompt.
     fn add(&mut self, term: &mut DefaultTerminal, name: &str, uri: &str) {
+        if self.dummy {
+            self.status = demo_text("Adding printers is disabled in demo mode.", "No se pueden añadir impresoras en el modo demo.").into();
+            self.mode = Mode::Main;
+            return;
+        }
         restore();
         println!("{}", fill(t().adding, &[("name", &name), ("uri", &uri), ("note", &t().hints()[2])]));
         let res = add_printer(name, uri);
@@ -759,7 +861,7 @@ impl App {
     }
 
     fn set_printers(&mut self, printers: Vec<String>) {
-        self.labels = printer_labels(&printers);
+        self.labels = if self.dummy { vec![dummy_label().into()] } else { printer_labels(&printers) };
         self.printers = printers;
     }
 
@@ -969,6 +1071,7 @@ impl App {
             sound::play(Sound::Print);
         }
         self.status = match res {
+            Ok(s) if self.dummy => s,
             Ok(s) => match self.save() {
                 Ok(()) => s,
                 Err(e) => format!("{s}\n\n{}", fill(t().settings_not_saved, &[("e", &e)])).trim_start().into(),
@@ -1080,14 +1183,31 @@ impl App {
 
     /// True when the selected printer prints both sides by itself, so Double-sided needs no flipping.
     fn auto_duplex(&self) -> bool {
-        self.duplex && self.printers.get(self.printer).is_some_and(|q| supports_duplex(q))
+        !self.dummy && self.duplex && self.printers.get(self.printer).is_some_and(|q| supports_duplex(q))
     }
 
     /// Sends a job and follows it in the bubble; `pages` is how many it prints, before number-up and copies.
     fn send(&mut self, job: &Job, pages: usize) -> Result<String, String> {
-        let out = submit(job)?;
+        let out = self.submit_job(job, pages)?;
         self.follow(&out, job, pages);
         Ok(out)
+    }
+
+    fn submit_job(&mut self, job: &Job, pages: usize) -> Result<String, String> {
+        if !self.dummy {
+            return submit(job);
+        }
+        let id = format!("{DUMMY_QUEUE}-{}", self.dummy_next_job);
+        self.dummy_next_job += 1;
+        let sides = pages.div_ceil(job.per_sheet as usize).max(1) as u32 * job.copies;
+        self.dummy_jobs.push(DummyJob {
+            id: id.clone(),
+            description: format!("{} · {}", name(&job.file), demo_text("simulated", "simulado")),
+            sides,
+            started: Instant::now(),
+            cancelled: false,
+        });
+        Ok(format!("request id is {id} ({})", job.printer))
     }
 
     fn follow(&mut self, lp_out: &str, job: &Job, pages: usize) {
@@ -1099,14 +1219,37 @@ impl App {
     /// Asks how the jobs being printed are doing. Once all are done, a last page comes out and
     /// the printer says so; not when one was cancelled, or before the flip in a manual duplex.
     fn follow_jobs(&mut self) {
-        let states: Vec<(i32, u32)> = self.printing.iter().map(|(id, ..)| job_progress(id)).collect();
+        let states: Vec<(i32, u32)> = self.printing.iter().map(|(id, ..)| {
+            if self.dummy {
+                match self.dummy_jobs.iter().find(|job| job.id == *id) {
+                    Some(job) if job.cancelled => (7, job.sides),
+                    Some(job) if job.active() => (5, job.progress()),
+                    Some(job) => (9, job.sides),
+                    None => (7, 0),
+                }
+            } else {
+                job_progress(id)
+            }
+        }).collect();
         // 7 canceled, 8 aborted, 9 completed
         if states.iter().all(|(state, _)| *state >= 7) {
             let ok = states.iter().all(|(state, _)| *state == 9);
+            if self.dummy {
+                let done: Vec<String> = self.printing.iter().map(|(id, ..)| id.clone()).collect();
+                self.dummy_jobs.retain(|job| !done.contains(&job.id));
+            }
             self.printing.clear();
             self.act = if ok { Act::Print(Instant::now(), 1) } else { Act::Idle };
-            if ok && !matches!(self.mode, Mode::Flip { .. }) && !self.status.starts_with(t().error) {
-                self.status = t().printed.into();
+            if ok {
+                // Ink levels may have changed; don't leave the pre-print values cached for 20s.
+                self.checked = Instant::now() - Duration::from_secs(20);
+                if !matches!(self.mode, Mode::Flip { .. }) && !self.status.starts_with(t().error) {
+                    self.status = if self.dummy {
+                        demo_text("Demo print finished; nothing was sent to a device.", "Impresión simulada terminada; no se envió nada a una impresora.").into()
+                    } else {
+                        t().printed.into()
+                    };
+                }
             }
             return;
         }
@@ -1122,8 +1265,9 @@ impl App {
         let bar = (10 * done / total) as usize;
         let page = fill(t().printing_page, &[("i", &(done + 1).min(total)), ("n", &total)]);
         let mut text = format!("{page}\n{}{}", "█".repeat(bar), "░".repeat(10 - bar));
-        // in a manual duplex the status is the popup's text
-        let news = Some(self.status.clone()).filter(|s| !s.is_empty() && !matches!(self.mode, Mode::Flip { .. }));
+        // While the front side prints, keep progress and status in the printer bubble.
+        // The flip popup is reserved for the moment when the user must turn the stack.
+        let news = Some(self.status.clone()).filter(|s| !s.is_empty() && !matches!(self.mode, Mode::Flip { job: None, .. }));
         for s in [news, self.complaint()].into_iter().flatten() {
             text += &format!("\n\n{s}");
         }
@@ -1204,8 +1348,12 @@ impl App {
         match self.graphics {
             Graphics::Kitty(tmux) => {
                 let area = self.preview_area.get();
-                let want = self.preview_png().map(|p| (p, area.width, area.height));
-                if want.is_some() && want != self.sent && area.width > 0 {
+                let want = if self.popup_open() { None } else { self.preview_png().map(|p| (p, area.width, area.height)) };
+                if want.is_none() {
+                    if self.sent.take().is_some() {
+                        emit(&kitty(&format!("a=d,d=I,i={},q=2", image_id()), "", tmux));
+                    }
+                } else if want != self.sent && area.width > 0 {
                     let (png, c, r) = want.clone().unwrap_or_default();
                     emit(&kitty(&format!("a=T,U=1,f=100,t=f,i={},q=2,c={c},r={r}", image_id()), &base64(png.as_bytes()), tmux));
                     self.sent = want;
@@ -1218,7 +1366,8 @@ impl App {
                         buf.push_str(&format!("\x1b[{};{}H{:w$}", area.y + 1 + r, area.x + 1, " ", w = area.width as usize));
                     }
                 };
-                let Some((png, (w, h, px))) = self.shown() else {
+                let shown = if self.popup_open() { None } else { self.shown() };
+                let Some((png, (w, h, px))) = shown else {
                     // wipe the last image, ratatui does not know it is there
                     if self.sent.take().is_some() {
                         let mut buf = String::new();
@@ -1331,8 +1480,16 @@ impl App {
         self.shown().map(|(png, _)| png)
     }
 
+    /// Popups cover terminal image cells, so temporarily hide the full-size preview.
+    fn popup_open(&self) -> bool {
+        !matches!(self.mode, Mode::Main | Mode::Insert | Mode::Flip { job: Some(_), .. })
+    }
+
     /// Asks the selected printer how it is doing: when it changes, and every 20 seconds.
     fn check_printer(&mut self) {
+        if self.dummy {
+            return;
+        }
         let Some(queue) = self.printers.get(self.printer).cloned() else { return };
         let known = self.state.as_ref().is_some_and(|(q, _)| *q == queue);
         if self.checking.is_some() || (known && self.checked.elapsed() < Duration::from_secs(20)) {
@@ -1414,6 +1571,9 @@ impl App {
 
     /// Saves the settings right away, as the Settings tab changes them.
     fn save_settings(&mut self) {
+        if self.dummy {
+            return;
+        }
         if let Err(e) = self.save() {
             self.status = fill(t().settings_not_saved, &[("e", &e)]);
         }
@@ -1509,6 +1669,11 @@ impl App {
     }
 
     fn find_scanners(&mut self, full: bool) {
+        if self.dummy {
+            self.scanners = Some(Vec::new());
+            self.status = demo_text("Scanner actions are disabled in demo mode.", "El escáner está desactivado en el modo demo.").into();
+            return;
+        }
         self.spawn(t().searching_scanners, move || {
             let list = scanners(full);
             Box::new(move |app: &mut App| {
@@ -1543,6 +1708,10 @@ impl App {
     /// `retake` replaces the page scanned from that original instead of adding one. With the
     /// document feeder, scanning goes to the end of the stack, one page after another.
     fn scan_page(&mut self, then_copy: bool, retake: Option<String>) {
+        if self.dummy {
+            self.status = demo_text("Scanning is disabled in demo mode; print jobs are simulated.", "El escaneo está desactivado; los trabajos de impresión son simulados.").into();
+            return;
+        }
         let Some((device, _)) = self.scanners.as_ref().and_then(|l| l.get(self.scanner)).cloned() else {
             return self.status = failed(t().no_scanner_selected);
         };
@@ -1622,6 +1791,10 @@ impl App {
     /// Photocopy: prints the kept pages at their real size with the Print tab's printer, color,
     /// paper, copies and scale; with nothing scanned yet it scans a page first.
     fn copy(&mut self) {
+        if self.dummy {
+            self.status = demo_text("Copying is disabled in demo mode; print jobs are simulated.", "La copia está desactivada; los trabajos de impresión son simulados.").into();
+            return;
+        }
         if self.printers.is_empty() {
             return self.status = failed(t().no_printer_for_copy);
         }
@@ -1849,8 +2022,13 @@ fn draw(f: &mut Frame, app: &App) {
     let tab = |name: &'static str, on: bool| {
         Span::styled(format!(" {name} "), if on { Style::new().fg(WHITE).bg(ACCENT).bold() } else { Style::new().fg(theme().dim) })
     };
+    let demo = if app.dummy {
+        Span::styled(format!("  DEMO · {}", demo_text("no device output", "sin salida a impresoras")), Style::new().fg(YELLOW).bold())
+    } else {
+        Span::raw("")
+    };
     // same widths as the mouse expects: " PrinterTUI  " then " Print " and " Scan "
-    let title = Line::from(vec![Span::styled(" PrinterTUI  ", Style::new().bold()), tab(t().tab_print, app.tab == Tab::Print), tab(t().tab_scan, app.tab == Tab::Scan), tab(t().tab_settings, app.tab == Tab::Settings), Span::raw(" ")]);
+    let title = Line::from(vec![Span::styled(" PrinterTUI  ", Style::new().bold()), tab(t().tab_print, app.tab == Tab::Print), tab(t().tab_scan, app.tab == Tab::Scan), tab(t().tab_settings, app.tab == Tab::Settings), demo, Span::raw(" ")]);
     f.render_widget(Paragraph::new(lines).block(panel(title)), form);
     app.form_area.set(form);
     draw_preview(f, app, preview);
@@ -1872,7 +2050,18 @@ fn draw(f: &mut Frame, app: &App) {
         .iter()
         .flat_map(|(k, what)| [Span::styled(format!(" {k} "), Style::new().fg(theme().chip.0).bg(theme().chip.1)), Span::styled(format!(" {what}  "), Style::new().fg(theme().dim))])
         .collect();
-    f.render_widget(Line::from(chips), help);
+    let build_number = env!("PRINTERTUI_BUILD_NUMBER");
+    let build_date = env!("PRINTERTUI_BUILD_DATE");
+    let build_label = format!("Build #{build_number} · {build_date}");
+    let build_width = width(&build_label).min(help.width as usize) as u16;
+    let [keys_area, build_area] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(build_width)]).areas(help);
+    f.render_widget(Line::from(chips), keys_area);
+    let build_info = Line::from(vec![
+        Span::styled(format!("Build #{build_number}"), Style::new().fg(ACCENT).bold()),
+        Span::styled(format!(" · {build_date}"), Style::new().fg(theme().dim)),
+    ]);
+    f.render_widget(Paragraph::new(build_info).alignment(Alignment::Right), build_area);
     let tick = app.started.elapsed().as_millis() as usize;
 
     match &app.mode {
@@ -1918,45 +2107,7 @@ fn draw(f: &mut Frame, app: &App) {
             f.render_stateful_widget(list, area, &mut state);
         }
         Mode::Flip { job, .. } => {
-            if job.is_some() {
-                let area = popup(f, 72, 8);
-                let block = panel(format!(" {} ", t.duplex_title)).border_style(Style::new().fg(ACCENT));
-                let [body, divider, footer] =
-                    Layout::vertical([Constraint::Min(2), Constraint::Length(1), Constraint::Length(1)])
-                        .areas(block.inner(area));
-                f.render_widget(block, area);
-
-                // Keep the latest sent-job details and the current state; older file entries
-                // can otherwise make this status-only popup grow with the print batch.
-                let status = app
-                    .status
-                    .lines()
-                    .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with("Esc ="))
-                    .collect::<Vec<_>>();
-                let current = t.printing_front.lines().find(|line| !line.is_empty()).unwrap_or("");
-                let mut lines = Vec::new();
-                for line in status.iter().filter(|line| **line != current) {
-                    lines.push(Line::styled(*line, Style::new().fg(theme().dim)));
-                }
-                if let Some(line) = status.iter().rev().find(|line| **line == current) {
-                    lines.push(Line::from(vec![
-                        Span::styled("▶ ", Style::new().fg(ACCENT).bold()),
-                        Span::styled(*line, Style::new().fg(theme().fg.unwrap_or(WHITE)).bold()),
-                    ]));
-                }
-                f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), body);
-                f.render_widget(
-                    Paragraph::new("─".repeat(divider.width as usize)).style(Style::new().fg(theme().dim)),
-                    divider,
-                );
-                f.render_widget(
-                    Line::from(vec![
-                        Span::styled(format!(" {} ", "Esc"), Style::new().fg(theme().chip.0).bg(theme().chip.1).bold()),
-                        Span::styled(format!(" {} ", t.k_cancel), Style::new().fg(theme().dim)),
-                    ]),
-                    footer,
-                );
-            } else {
+            if job.is_none() {
                 let area = popup(f, 100, 18);
                 let block = panel(format!(" {} ", t.duplex_title)).border_style(Style::new().fg(ACCENT));
                 let [text, anim] = Layout::horizontal([Constraint::Min(30), Constraint::Length(31)]).areas(block.inner(area));
@@ -2103,7 +2254,8 @@ fn form_row<'a>(app: &App, label: &'a str, i: usize) -> Line<'a> {
 
 /// The printer and what it says (the status, or a word about the selected row), and the ink tanks.
 fn draw_stage(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let inks = if app.tab != Tab::Print { &[][..] } else { app.printer_state().map_or(&[][..], |s| s.ink.as_slice()) };
+    let printer_state = if app.tab == Tab::Print { app.printer_state() } else { None };
+    let inks = printer_state.map_or(&[][..], |s| s.ink.as_slice());
     // the printer needs 22 columns and goes last on a narrow screen, after the ink tanks
     let pet_w = if app.mascot && area.width >= 22 + 24 { 22 } else { 0 };
     let tanks_w = if inks.is_empty() || area.width < pet_w + 24 + inks.len() as u16 * 4 + 1 { 0 } else { inks.len() as u16 * 4 + 1 };
@@ -2115,7 +2267,8 @@ fn draw_stage(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         None if app.editing.is_some() => (format!("{}...", t().editing_page), Work::Busy),
         None if app.viewing.is_some() && app.tab == Tab::Print && app.status.is_empty() => (format!("{}...", t().drawing_preview), Work::Busy),
         None if !app.printing.is_empty() && !matches!(app.mode, Mode::Flip { job: None, .. }) => (app.progress(), Work::None),
-        None if matches!(app.mode, Mode::Flip { .. }) => (t().flip_time.into(), Work::None),
+        None if matches!(app.mode, Mode::Flip { job: Some(_), .. }) => (app.status.clone(), Work::None),
+        None if matches!(app.mode, Mode::Flip { job: None, .. }) => (t().flip_time.into(), Work::None),
         None if app.status.is_empty() => (app.complaint().unwrap_or_else(|| app.chat()), Work::None),
         None => (app.status.clone(), Work::None),
     };
@@ -2139,7 +2292,13 @@ fn draw_stage(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         f.buffer_mut()[(bubble.x, bubble.y + 2)].set_symbol("◀").set_fg(edge);
     }
     if tanks_w > 0 {
-        let mut lines = vec![Line::styled(format!(" {}", t().ink), Style::new().fg(theme().dim))];
+        let source = match printer_state.map_or(InkSource::Unknown, |s| s.ink_source) {
+            InkSource::Ipp => "IPP",
+            InkSource::CupsCache => "CUPS",
+            InkSource::Demo => "DEMO",
+            InkSource::Unknown => "?",
+        };
+        let mut lines = vec![Line::styled(format!(" {} · {source}", t().ink), Style::new().fg(theme().dim))];
         lines.extend(pet::tanks(inks).into_iter().map(|l| {
             let mut l = l;
             l.spans.insert(0, Span::raw(" "));
@@ -2179,6 +2338,7 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         return;
     }
     match app.graphics {
+        Graphics::Kitty(_) if app.popup_open() => {}
         Graphics::Kitty(_) => {
             // placeholder cells: U+10EEEE, the row as a diacritic on the first cell (the terminal infers
             // the columns), and the image id as the foreground color

@@ -339,7 +339,11 @@ pub fn printer_state(queue: &str) -> PrinterState {
     };
     let mut state = port_host(&port)
         .and_then(|host| ipp_attributes(&format!("ipp://{host}/ipp/print"), None, &STATE_ATTRIBUTES).ok())
-        .map_or_else(PrinterState::default, |attrs| PrinterState::from(&attrs));
+        .map_or_else(PrinterState::default, |attrs| {
+            let mut state = PrinterState::from(&attrs);
+            state.ink_source = InkSource::Ipp;
+            state
+        });
     for (bit, problem) in PROBLEMS {
         if status & bit != 0 && !state.problems.iter().any(|p| p == problem) {
             state.problems.push(problem.into());
