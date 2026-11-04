@@ -142,6 +142,81 @@ pub fn scale_pdf(file: &str, percent: u32) -> Result<String, String> {
     Ok(out.to_string_lossy().into_owned())
 }
 
+/// Appends a blank page at the end of a PDF (with the same dimensions as the last page),
+/// saving it to a temporary file in `work_dir`. Returns the path to the padded PDF.
+pub fn append_blank_page(file: &str) -> Result<String, String> {
+    use lopdf::{Dictionary, Object, Stream};
+    let err = |e: lopdf::Error| format!("{file}: {e}");
+    let mut doc = lopdf::Document::load(file).map_err(err)?;
+    let pages = doc.get_pages();
+    let (&_last_num, &last_page_id) = pages.iter().last().ok_or_else(|| format!("{file}: no pages found"))?;
+
+    let last_dict = doc.get_dictionary(last_page_id).map_err(err)?;
+    let parent_id = last_dict
+        .get(b"Parent")
+        .and_then(Object::as_reference)
+        .map_err(|e| format!("{file}: invalid page parent: {e}"))?;
+
+    let media_box = page_box(&doc, last_page_id).unwrap_or([0.0, 0.0, 595.0, 842.0]);
+    let media_box_obj = Object::Array(vec![
+        Object::Real(media_box[0] as f32),
+        Object::Real(media_box[1] as f32),
+        Object::Real(media_box[2] as f32),
+        Object::Real(media_box[3] as f32),
+    ]);
+
+    let contents_id = doc.add_object(Stream::new(Dictionary::new(), Vec::new()));
+    let mut page_dict = Dictionary::new();
+    page_dict.set("Type", "Page");
+    page_dict.set("Parent", parent_id);
+    page_dict.set("MediaBox", media_box_obj);
+    page_dict.set("Contents", contents_id);
+    page_dict.set("Resources", Dictionary::new());
+    let new_page_id = doc.add_object(page_dict);
+
+    let parent_dict = doc.get_dictionary_mut(parent_id).map_err(err)?;
+    let kids = parent_dict
+        .get_mut(b"Kids")
+        .and_then(Object::as_array_mut)
+        .map_err(|e| format!("{file}: invalid Kids: {e}"))?;
+    kids.push(new_page_id.into());
+
+    let mut cur = parent_id;
+    loop {
+        let cur_dict = doc.get_dictionary_mut(cur).map_err(err)?;
+        if let Ok(Object::Integer(n)) = cur_dict.get_mut(b"Count") {
+            *n += 1;
+        }
+        match cur_dict.get(b"Parent").and_then(Object::as_reference) {
+            Ok(p) => cur = p,
+            Err(_) => break,
+        }
+    }
+
+    let out = work_dir(file)?.join("padded-duplex.pdf");
+    let mut data = Vec::new();
+    doc.save_to(&mut data).map_err(|e| format!("{file}: {e}"))?;
+    write_atomic(&out, &data)?;
+    Ok(out.to_string_lossy().into_owned())
+}
+
+/// Prepares sides for manual duplex: detects the total sides, and if odd (> 1),
+/// appends a blank page to the PDF so that all sheets of the first run can be
+/// reinserted together into the tray without leaving an odd pending page hanging.
+/// Returns `(pdf_path, front_pages, back_pages)`.
+pub fn prepare_duplex(pdf: &str, total: u32, pages: &[u32], per_sheet: usize) -> Result<(String, Vec<u32>, Vec<u32>), String> {
+    let per_sheet = per_sheet.max(1);
+    let mut sides: Vec<Vec<u32>> = pages.chunks(per_sheet).map(|c| c.to_vec()).collect();
+    let mut out_pdf = pdf.to_string();
+    if sides.len() > 1 && sides.len() % 2 != 0 {
+        out_pdf = append_blank_page(pdf)?;
+        let blank_page = total + 1;
+        sides.push(vec![blank_page]);
+    }
+    let (front, back) = split_duplex(&sides);
+    Ok((out_pdf, front.concat(), back.concat()))
+}
+
 /// The visible area of a page (CropBox, else MediaBox), which pages may inherit from their parents.
 fn page_box(doc: &lopdf::Document, page: lopdf::ObjectId) -> Option<[f64; 4]> {
     for key in [&b"CropBox"[..], b"MediaBox"] {
@@ -1197,4 +1272,58 @@ fn test_sixel_encode() {
     assert!(six.starts_with("\x1bPq\"1;1;12;12"));
     assert!(six.ends_with("\x1b\\"));
     assert!(six.contains("#0"));
+}
+
+#[test]
+fn pad_pdf_appends_blank_page() {
+    assert_eq!(page_count("test/one-page.pdf"), Some(1));
+    let padded = append_blank_page("test/one-page.pdf").unwrap();
+    assert_eq!(page_count(&padded), Some(2));
+    let doc = lopdf::Document::load(&padded).unwrap();
+    assert_eq!(doc.get_pages().len(), 2);
+
+    let count = page_count("test/Examen_practic.pdf").unwrap();
+    let padded2 = append_blank_page("test/Examen_practic.pdf").unwrap();
+    assert_eq!(page_count(&padded2), Some(count + 1));
+}
+
+#[test]
+fn prepare_duplex_manages_odd_batches() {
+    let dir = std::env::temp_dir().join(format!("printertui-duplex-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("p.png").to_string_lossy().into_owned();
+    DynamicImage::ImageLuma8(GrayImage::from_pixel(100, 100, Luma([255]))).save_with_format(&img, ImageFormat::Png).unwrap();
+    let pdf7 = dir.join("doc7.pdf");
+    std::fs::write(&pdf7, images_to_pdf(&vec![img.clone(); 7], 100, &[]).unwrap()).unwrap();
+    let pdf7_str = pdf7.to_string_lossy().into_owned();
+
+    // 7 pages: odd, should pad with 8th blank page so front and back both have 4 sheets
+    let (padded, front, back) = prepare_duplex(&pdf7_str, 7, &[1, 2, 3, 4, 5, 6, 7], 1).unwrap();
+    assert_eq!(front, vec![1, 3, 5, 7]);
+    assert_eq!(back, vec![2, 4, 6, 8]);
+    assert_eq!(page_count(&padded), Some(8));
+
+    // 6 pages: even, should NOT pad
+    let pdf6 = dir.join("doc6.pdf");
+    std::fs::write(&pdf6, images_to_pdf(&vec![img.clone(); 6], 100, &[]).unwrap()).unwrap();
+    let (same, front6, back6) = prepare_duplex(&pdf6.to_string_lossy(), 6, &[1, 2, 3, 4, 5, 6], 1).unwrap();
+    assert_eq!(front6, vec![1, 3, 5]);
+    assert_eq!(back6, vec![2, 4, 6]);
+    assert_eq!(same, pdf6.to_string_lossy());
+
+    // 1 page: should not pad or create back side
+    let (one, front1, back1) = prepare_duplex("test/one-page.pdf", 1, &[1], 1).unwrap();
+    assert_eq!(front1, vec![1]);
+    assert!(back1.is_empty());
+    assert_eq!(one, "test/one-page.pdf");
+
+    // 5 pages, 2 per sheet: 3 sides, odd -> should pad to 4 sides
+    let pdf5 = dir.join("doc5.pdf");
+    std::fs::write(&pdf5, images_to_pdf(&vec![img; 5], 100, &[]).unwrap()).unwrap();
+    let (padded5, front5, back5) = prepare_duplex(&pdf5.to_string_lossy(), 5, &[1, 2, 3, 4, 5], 2).unwrap();
+    assert_eq!(front5, vec![1, 2, 5]);
+    assert_eq!(back5, vec![3, 4, 6]);
+    assert_eq!(page_count(&padded5), Some(6));
+
+    std::fs::remove_dir_all(&dir).unwrap();
 }

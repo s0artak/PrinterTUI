@@ -1306,11 +1306,9 @@ impl App {
             let total = page_count(&pdf).ok_or(t().unreadable_pdf)?;
             // page-ranges picks pages before number-up groups them, so split whole sheet sides
             let pages = parse_ranges(&self.pages, total)?;
-            let sides: Vec<&[u32]> = pages.chunks(PER_SHEET[self.per_sheet] as usize).collect();
-            let (front, back) = split_duplex(&sides);
-            // Collated copies would leave a sheet without back side inside every copy when odd.
-            let odd = front.len() > back.len();
-            let (front, back) = (front.concat(), back.concat());
+            let per_sheet = PER_SHEET[self.per_sheet] as usize;
+            let (pdf, front, back) = prepare_duplex(&pdf, total, &pages, per_sheet)?;
+            let odd = front.len().div_ceil(per_sheet) > back.len().div_ceil(per_sheet);
             let id = self.send(&self.job(&pdf, Some(join(&front)), false, !odd), front.len())?;
             if back.is_empty() {
                 done += &format!("{head}{}\n\n", fill(t().one_page, &[("id", &job_no(&id))]));
@@ -2173,6 +2171,79 @@ fn paper_follows_the_locale() {
     assert_eq!(region("C"), "");
     assert_eq!(PAPERS[paper_for("US")], "Letter");
     assert_eq!(PAPERS[paper_for("ES")], "A4");
+}
+
+#[test]
+fn duplex_pads_odd_pages_so_all_sheets_reinsert() {
+    let dir = std::env::temp_dir().join(format!("printertui-main-duplex-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("p.png").to_string_lossy().into_owned();
+    image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(100, 100, image::Luma([255]))).save_with_format(&img, image::ImageFormat::Png).unwrap();
+    let pdf7 = dir.join("doc7.pdf");
+    std::fs::write(&pdf7, images_to_pdf(&vec![img; 7], 100, &[]).unwrap()).unwrap();
+    let pdf7_str = pdf7.to_string_lossy().into_owned();
+
+    let mut app = new_app(false, pdf7_str.clone(), true);
+    app.printers = vec!["dummy-printer".into()];
+    app.duplex = true;
+    let res = app.duplex(vec![pdf7_str], 0, String::new());
+    assert!(res.is_ok());
+
+    // Front job sent 4 sides
+    assert_eq!(app.dummy_jobs.len(), 1);
+    assert_eq!(app.dummy_jobs[0].sides, 4);
+
+    let (back_job, back_pages, steps) = match &app.mode {
+        Mode::Flip { back, steps, .. } => (back.0.clone(), back.1, steps.clone()),
+        _ => panic!("Expected Mode::Flip"),
+    };
+
+    // Back job has 4 pages: [2, 4, 6, 8] (including blank page 8)
+    assert_eq!(back_pages, 4);
+    assert_eq!(back_job.pages.as_deref(), Some("2,4,6,8"));
+    assert!(back_job.collate, "Copies should remain collated since sheet count is balanced");
+    assert!(!steps.contains("aside"), "Flip steps should not ask to put sheets aside: {steps}");
+    assert!(!steps.contains("Aparta"), "Flip steps should not ask to put sheets aside: {steps}");
+
+    // Completing the back side sends the back job
+    let res_back = app.back_side();
+    assert!(res_back.is_ok());
+    assert_eq!(app.dummy_jobs.len(), 2);
+    assert_eq!(app.dummy_jobs[1].sides, 4);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn duplex_physics_3_pages() {
+    let pdf = "test/fisica_3paginas.pdf";
+    let mut app = new_app(false, pdf.into(), true);
+    app.printers = vec!["dummy-printer".into()];
+    app.duplex = true;
+    let res = app.duplex(vec![pdf.into()], 0, String::new());
+    assert!(res.is_ok());
+
+    // Front job sent 2 sides (pages 1 and 3 on 2 sheets)
+    assert_eq!(app.dummy_jobs.len(), 1);
+    assert_eq!(app.dummy_jobs[0].sides, 2);
+
+    let (back_job, back_pages, steps) = match &app.mode {
+        Mode::Flip { back, steps, .. } => (back.0.clone(), back.1, steps.clone()),
+        _ => panic!("Expected Mode::Flip"),
+    };
+
+    // Back job has 2 pages: [2, 4] (page 4 is the generated blank page on sheet 2)
+    assert_eq!(back_pages, 2);
+    assert_eq!(back_job.pages.as_deref(), Some("2,4"));
+    assert!(back_job.collate);
+    assert!(!steps.contains("aside"));
+    assert!(!steps.contains("Aparta"));
+
+    // Completing the back side sends the back job (page 2 on sheet 1, blank on sheet 2)
+    let res_back = app.back_side();
+    assert!(res_back.is_ok());
+    assert_eq!(app.dummy_jobs.len(), 2);
+    assert_eq!(app.dummy_jobs[1].sides, 2);
 }
 
 /// The character at a screen column of `s`, for mouse clicks.
