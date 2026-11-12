@@ -732,9 +732,15 @@ function Uninstall-PrinterTUI {
         [Environment]::SetEnvironmentVariable('Path', ($path -join ';'), 'User')
     }
     Say $T.rm_cfg
-    # settings, and the copy of pdfium the app unpacks
+    # settings, temp caches, and the copy of pdfium the app unpacks
     $roaming = if ($env:APPDATA) { $env:APPDATA } else { $base }
-    $data = @((Join-Path $roaming 'printertui'), (Join-Path $base 'printertui'))
+    $temp = [IO.Path]::GetTempPath()
+    $data = @(
+        (Join-Path $roaming 'printertui'),
+        (Join-Path $base 'printertui'),
+        (Join-Path $temp 'printertui'),
+        (Join-Path $temp 'printertui-scan')
+    )
     Step "remove $($data -join ', ')" { Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue }
     W "`n"
     Animate 'unprint'

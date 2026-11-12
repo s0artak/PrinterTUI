@@ -5,7 +5,7 @@ license = "MIT"
 edition = "2024"
 
 [dependencies]
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif", "tiff"] }
 lopdf = { version = "0.45.0", default-features = false }
 minreq = { version = "3.0.0", features = ["https-rustls-probe"] }
 pdf-writer = "0.15.0"

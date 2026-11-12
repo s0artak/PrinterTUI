@@ -1,5 +1,5 @@
 #!/bin/sh
-# PrinterTUI installer for Arch Linux and macOS.
+# PrinterTUI installer for Linux and macOS.
 #   curl -fsSL https://raw.githubusercontent.com/s0artak/PrinterTUI/main/install.sh | sh
 # Asks for a language, then opens a menu: Install the first time, Update or Uninstall when
 # PrinterTUI is already there, then a checklist of optional extras.
@@ -206,7 +206,7 @@ lang_en() {
     T_bye="Paper's back in the tray. Bye for now!"
     T_left="CUPS and your printers were left as they are."
     T_quit="No worries, nothing was touched."
-    T_e_os="only Arch Linux and macOS are supported"
+    T_e_os="only Linux and macOS are supported"
     T_e_brew="Homebrew is needed first: https://brew.sh"
     T_e_net="check your internet connection and run the installer again"
     T_extras="Want some extras? All optional."
@@ -238,7 +238,7 @@ lang_zh() {
     T_bye="纸已放回纸盒。再见！"
     T_left="CUPS 和你的打印机都保持原样。"
     T_quit="没关系，什么都没改动。"
-    T_e_os="只支持 Arch Linux 和 macOS"
+    T_e_os="只支持 Linux 和 macOS"
     T_e_brew="需要先安装 Homebrew：https://brew.sh"
     T_e_net="请检查网络连接后重新运行安装程序"
     T_extras="要来点附加组件吗？全部可选。"
@@ -270,7 +270,7 @@ lang_hi() {
     T_bye="कागज़ वापस ट्रे में। फिर मिलेंगे!"
     T_left="CUPS और आपके प्रिंटर जैसे थे वैसे ही हैं।"
     T_quit="कोई बात नहीं, कुछ भी नहीं बदला।"
-    T_e_os="केवल Arch Linux और macOS समर्थित हैं"
+    T_e_os="केवल Linux और macOS समर्थित हैं"
     T_e_brew="पहले Homebrew चाहिए: https://brew.sh"
     T_e_net="इंटरनेट कनेक्शन जाँचें और इंस्टॉलर फिर से चलाएँ"
     T_extras="कुछ अतिरिक्त चाहिए? सब वैकल्पिक हैं।"
@@ -302,7 +302,7 @@ lang_es() {
     T_bye="El papel ha vuelto a la bandeja. ¡Hasta pronto!"
     T_left="CUPS y tus impresoras se quedan como estaban."
     T_quit="Tranquilo, no he tocado nada."
-    T_e_os="solo funciona en Arch Linux y macOS"
+    T_e_os="solo funciona en Linux y macOS"
     T_e_brew="primero hace falta Homebrew: https://brew.sh"
     T_e_net="revisa tu conexión a internet y vuelve a ejecutar el instalador"
     T_extras="¿Unos extras? Todos son opcionales."
@@ -334,7 +334,7 @@ lang_ar() {
     T_bye="عاد الورق إلى الدرج. إلى اللقاء!"
     T_left="بقيت CUPS وطابعاتك كما هي."
     T_quit="لا بأس، لم يتغير شيء."
-    T_e_os="يدعم فقط Arch Linux و macOS"
+    T_e_os="يدعم فقط Linux و macOS"
     T_e_brew="يلزم Homebrew أولاً: https://brew.sh"
     T_e_net="تحقّق من اتصالك بالإنترنت ثم أعد تشغيل المثبّت"
     T_extras="هل تريد بعض الإضافات؟ كلها اختيارية."
@@ -366,7 +366,7 @@ lang_fr() {
     T_bye="Le papier est retourné dans le bac. À bientôt !"
     T_left="CUPS et vos imprimantes restent tels quels."
     T_quit="Pas de souci, rien n'a été modifié."
-    T_e_os="seuls Arch Linux et macOS sont pris en charge"
+    T_e_os="seuls Linux et macOS sont pris en charge"
     T_e_brew="Homebrew est nécessaire d'abord : https://brew.sh"
     T_e_net="vérifiez votre connexion internet puis relancez l'installateur"
     T_extras="Quelques extras ? Tous optionnels."
@@ -398,7 +398,7 @@ lang_bn() {
     T_bye="কাগজ আবার ট্রেতে। আবার দেখা হবে!"
     T_left="CUPS আর আপনার প্রিন্টার যেমন ছিল তেমনই আছে।"
     T_quit="চিন্তা নেই, কিছুই বদলানো হয়নি।"
-    T_e_os="শুধু Arch Linux আর macOS সমর্থিত"
+    T_e_os="শুধু Linux আর macOS সমর্থিত"
     T_e_brew="আগে Homebrew লাগবে: https://brew.sh"
     T_e_net="ইন্টারনেট সংযোগ দেখে নিন, তারপর ইনস্টলার আবার চালান"
     T_extras="কিছু বাড়তি জিনিস চান? সবই ঐচ্ছিক।"
@@ -430,7 +430,7 @@ lang_pt() {
     T_bye="O papel voltou para a bandeja. Até mais!"
     T_left="CUPS e suas impressoras ficaram como estavam."
     T_quit="Tudo bem, nada foi alterado."
-    T_e_os="só Arch Linux e macOS são suportados"
+    T_e_os="só Linux e macOS são suportados"
     T_e_brew="primeiro é preciso o Homebrew: https://brew.sh"
     T_e_net="verifique sua conexão com a internet e rode o instalador de novo"
     T_extras="Quer uns extras? Todos opcionais."
@@ -462,7 +462,7 @@ lang_ru() {
     T_bye="Бумага вернулась в лоток. Пока!"
     T_left="CUPS и ваши принтеры остались как были."
     T_quit="Ничего страшного, ничего не изменено."
-    T_e_os="поддерживаются только Arch Linux и macOS"
+    T_e_os="поддерживаются только Linux и macOS"
     T_e_brew="сначала нужен Homebrew: https://brew.sh"
     T_e_net="проверьте подключение к интернету и запустите установщик снова"
     T_extras="Немного дополнений? Всё по желанию."
@@ -494,7 +494,7 @@ lang_id() {
     T_bye="Kertas sudah kembali ke baki. Sampai jumpa!"
     T_left="CUPS dan printermu tetap seperti semula."
     T_quit="Tenang, tidak ada yang diubah."
-    T_e_os="hanya Arch Linux dan macOS yang didukung"
+    T_e_os="hanya Linux dan macOS yang didukung"
     T_e_brew="perlu Homebrew dulu: https://brew.sh"
     T_e_net="periksa koneksi internet lalu jalankan installer lagi"
     T_extras="Mau tambahan? Semuanya opsional."
@@ -725,7 +725,7 @@ fetch() {
 do_uninstall() {
     say "$T_rm_cmd"
     for bin in $(bins); do
-        run rm -f "$bin" 2>/dev/null || run sudo rm -f "$bin"
+        run rm -f "$bin" 2>/dev/null || as_root rm -f "$bin"
     done
     say "$T_rm_cfg"
     run rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/printertui" "${TMPDIR:-/tmp}/printertui" "${TMPDIR:-/tmp}/printertui-scan" "${TMPDIR:-/tmp}/printertui-sounds"
@@ -735,30 +735,112 @@ do_uninstall() {
     fi
 }
 
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then run "$@"; else run sudo "$@"; fi
+}
+
+enable_cups() {
+    say "$T_cups"
+    if command -v systemctl >/dev/null; then
+        as_root systemctl enable --now cups.socket 2>/dev/null || as_root systemctl enable --now cups
+    elif command -v rc-service >/dev/null; then
+        as_root rc-update add cupsd default 2>/dev/null || true
+        as_root rc-service cupsd start 2>/dev/null || true
+    fi
+}
+
 do_install() {
     case "$(uname -s)" in
         Linux)
-            command -v pacman >/dev/null || die "$T_e_os"
-            say "$T_deps_linux"
-            run sudo pacman -S --needed --noconfirm cups cups-filters
-            say "$T_cups"
-            run sudo systemctl enable --now cups.socket
-            if [ "$extras" != 000 ]; then
-                # Tesseract reads English plus the language picked here
-                case $lang in
-                    zh) ocr=chi_sim ;; hi) ocr=hin ;; es) ocr=spa ;; ar) ocr=ara ;; fr) ocr=fra ;;
-                    bn) ocr=ben ;; pt) ocr=por ;; ru) ocr=rus ;; id) ocr=ind ;; *) ocr=eng ;;
-                esac
-                pkgs=
-                checked=$extras
-                if marked 1; then pkgs="$pkgs libreoffice-fresh"; fi
-                if marked 2; then pkgs="$pkgs sane sane-airscan"; fi
-                if marked 3; then pkgs="$pkgs tesseract tesseract-data-eng"; fi
-                if marked 3 && [ $ocr != eng ]; then pkgs="$pkgs tesseract-data-$ocr"; fi
-                checked=
-                say "$T_extras_inst"
-                # shellcheck disable=SC2086
-                run sudo pacman -S --needed --noconfirm $pkgs
+            # Tesseract reads English plus the language picked here
+            case $lang in
+                zh) ocr=chi_sim ocr_apt=chi-sim ;; hi) ocr=hin ocr_apt=hin ;; es) ocr=spa ocr_apt=spa ;;
+                ar) ocr=ara ocr_apt=ara ;; fr) ocr=fra ocr_apt=fra ;; bn) ocr=ben ocr_apt=ben ;;
+                pt) ocr=por ocr_apt=por ;; ru) ocr=rus ocr_apt=rus ;; id) ocr=ind ocr_apt=ind ;;
+                *) ocr=eng ocr_apt=eng ;;
+            esac
+            if command -v pacman >/dev/null; then
+                say "$T_deps_linux"
+                as_root pacman -S --needed --noconfirm cups cups-filters poppler
+                enable_cups
+                if [ "$extras" != 000 ]; then
+                    pkgs=
+                    checked=$extras
+                    if marked 1; then pkgs="$pkgs libreoffice-fresh"; fi
+                    if marked 2; then pkgs="$pkgs sane sane-airscan"; fi
+                    if marked 3; then pkgs="$pkgs tesseract tesseract-data-eng"; fi
+                    if marked 3 && [ "$ocr" != eng ]; then pkgs="$pkgs tesseract-data-$ocr"; fi
+                    checked=
+                    say "$T_extras_inst"
+                    # shellcheck disable=SC2086
+                    as_root pacman -S --needed --noconfirm $pkgs
+                fi
+            elif command -v apt-get >/dev/null; then
+                say "$T_deps_linux"
+                as_root apt-get update
+                as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y cups cups-bsd cups-client poppler-utils
+                enable_cups
+                if [ "$extras" != 000 ]; then
+                    pkgs=
+                    checked=$extras
+                    if marked 1; then pkgs="$pkgs libreoffice"; fi
+                    if marked 2; then pkgs="$pkgs sane-utils sane-airscan"; fi
+                    if marked 3; then pkgs="$pkgs tesseract-ocr tesseract-ocr-eng"; fi
+                    if marked 3 && [ "$ocr_apt" != eng ]; then pkgs="$pkgs tesseract-ocr-$ocr_apt"; fi
+                    checked=
+                    say "$T_extras_inst"
+                    # shellcheck disable=SC2086
+                    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs
+                fi
+            elif command -v dnf >/dev/null; then
+                say "$T_deps_linux"
+                as_root dnf install -y cups poppler-utils
+                enable_cups
+                if [ "$extras" != 000 ]; then
+                    pkgs=
+                    checked=$extras
+                    if marked 1; then pkgs="$pkgs libreoffice"; fi
+                    if marked 2; then pkgs="$pkgs sane-backends sane-airscan"; fi
+                    if marked 3; then pkgs="$pkgs tesseract tesseract-langpack-eng"; fi
+                    if marked 3 && [ "$ocr" != eng ]; then pkgs="$pkgs tesseract-langpack-$ocr"; fi
+                    checked=
+                    say "$T_extras_inst"
+                    # shellcheck disable=SC2086
+                    as_root dnf install -y $pkgs
+                fi
+            elif command -v zypper >/dev/null; then
+                say "$T_deps_linux"
+                as_root zypper --non-interactive install cups poppler-tools
+                enable_cups
+                if [ "$extras" != 000 ]; then
+                    pkgs=
+                    checked=$extras
+                    if marked 1; then pkgs="$pkgs libreoffice"; fi
+                    if marked 2; then pkgs="$pkgs sane-backends sane-airscan"; fi
+                    if marked 3; then pkgs="$pkgs tesseract-ocr tesseract-ocr-traineddata-english"; fi
+                    checked=
+                    say "$T_extras_inst"
+                    # shellcheck disable=SC2086
+                    as_root zypper --non-interactive install $pkgs
+                fi
+            elif command -v apk >/dev/null; then
+                say "$T_deps_linux"
+                as_root apk add cups cups-client poppler-utils
+                enable_cups
+                if [ "$extras" != 000 ]; then
+                    pkgs=
+                    checked=$extras
+                    if marked 1; then pkgs="$pkgs libreoffice"; fi
+                    if marked 2; then pkgs="$pkgs sane-utils"; fi
+                    if marked 3; then pkgs="$pkgs tesseract-ocr tesseract-ocr-data-eng"; fi
+                    if marked 3 && [ "$ocr" != eng ]; then pkgs="$pkgs tesseract-ocr-data-$ocr"; fi
+                    checked=
+                    say "$T_extras_inst"
+                    # shellcheck disable=SC2086
+                    as_root apk add $pkgs
+                fi
+            elif ! command -v lp >/dev/null; then
+                die "$T_e_os"
             fi
             # already on every PATH, so printertui runs right away in this terminal
             bin_dir=/usr/local/bin
@@ -810,11 +892,11 @@ do_install() {
 
     say "$T_put $bin_dir"
     # Apple silicon Macs may not have /usr/local/bin yet
-    [ -d "$bin_dir" ] || run sudo mkdir -p "$bin_dir"
+    [ -d "$bin_dir" ] || as_root mkdir -p "$bin_dir"
     if [ -w "$bin_dir" ]; then
         run install -m 755 "$tmp" "$bin_dir/printertui"
     else
-        run sudo install -m 755 "$tmp" "$bin_dir/printertui"
+        as_root install -m 755 "$tmp" "$bin_dir/printertui"
     fi
     run rm -f "$HOME/.local/bin/printertui" # older installs, would shadow the new one
 }

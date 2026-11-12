@@ -16,7 +16,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, name: printertui-linux-x86_64, test: true }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: printertui-linux-aarch64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: printertui-linux-aarch64, test: true }
           - { os: macos-latest, target: aarch64-apple-darwin, name: printertui-macos-aarch64, test: true }
           - { os: macos-latest, target: x86_64-apple-darwin, name: printertui-macos-x86_64, test: true }
           # the tests print for real to "Microsoft Print to PDF"
@@ -29,6 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup target add ${{ matrix.target }}
+      - run: rustup component add clippy
+      - run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
       - run: cargo build --release --target ${{ matrix.target }}
       # the installers: syntax, and the speech bubble's text measuring with this system's awk / PowerShell
       - if: runner.os != 'Windows'
@@ -43,8 +45,8 @@ jobs:
           sed -n '/^synth() {/,/^}/p' install.sh > synth.sh
           . ./synth.sh
           for n in boot blip print done jam bye; do printf "$(synth $n 50)" > $n.wav; test "$(head -c 4 $n.wav)" = RIFF; test $(wc -c < $n.wav) -gt 500; done
-      # the macOS install as it runs from curl | sh, without changing anything
-      - if: runner.os == 'macOS'
+      # the Linux / macOS install as it runs from curl | sh, without changing anything
+      - if: runner.os != 'Windows'
         run: PRINTERTUI_PREVIEW=fresh sh install.sh install
       - if: runner.os == 'Windows'
         shell: powershell

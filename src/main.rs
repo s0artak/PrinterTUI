@@ -2,16 +2,16 @@ mod i18n;
 mod pet;
 mod sound;
 
-use i18n::{fill, t};
+use i18n::{extra, fill, t};
 use pet::{theme, Act, Mood, Work, ACCENT, RED, WHITE, YELLOW};
 use sound::Sound;
 use printertui::*;
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
+    crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
     layout::{Alignment, Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
     DefaultTerminal, Frame,
 };
 use std::cell::Cell;
@@ -48,6 +48,7 @@ const FOLDER: usize = 5;
 /// Image preview choices as the settings file names them.
 const GRAPHICS_PREFS: [&str; 4] = ["auto", "kitty", "sixel", "blocks"];
 const DUMMY_QUEUE: &str = "printertui-demo";
+const DUMMY_SCANNER: &str = "dummy";
 const FILE: usize = 1;
 const PAGES: usize = 5;
 const SCALE: usize = 9;
@@ -73,8 +74,6 @@ struct ScannedPage {
     keep: bool,
     thumb: Thumb,
 }
-
-type Thumb = (usize, usize, Vec<u8>);
 
 /// What the Print tab preview shows: the n-th sheet side of one of the files as it will print.
 #[derive(Clone, PartialEq)]
@@ -131,10 +130,12 @@ enum Mode {
     Pages(Vec<bool>, ListState),
     /// Manual duplex: `job` is the front job while it is still printing, `steps` the flip
     /// instructions shown after it, `back` the back-side job and its page count, `files[next..]`
-    /// the files still to print.
-    Flip { job: Option<String>, steps: String, back: (Job, usize), files: Vec<String>, next: usize },
+    /// the files still to print, `use_range` whether `app.pages` applies.
+    Flip { job: Option<String>, steps: String, back: (Job, usize), files: Vec<String>, next: usize, use_range: bool },
     /// Print queue popup: (job number, description), refreshed every second.
     Queue(Vec<(String, String)>, ListState),
+    /// Printer Doctor diagnostic popup (`?`).
+    Doctor(String),
 }
 
 struct App {
@@ -142,11 +143,13 @@ struct App {
     dummy: bool,
     dummy_jobs: Vec<DummyJob>,
     dummy_next_job: u32,
+    backend: Option<&'static str>,
     printers: Vec<String>,
     labels: Vec<String>,
     /// The last known state of a printer (by queue), the check running, and when it started.
     state: Option<(String, PrinterState)>,
     checking: Option<mpsc::Receiver<Done>>,
+    polling: Option<mpsc::Receiver<Done>>,
     checked: Instant,
     printer: usize,
     file: String,
@@ -212,6 +215,7 @@ struct App {
     started: Instant,
     last_poll: Instant,
     sel: usize,
+    cursor: usize,
     status: String,
     /// The status the printer last reacted to (an error jams it).
     heard: String,
@@ -233,27 +237,22 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
     let dummy = args.iter().any(|a| a == "--dummy");
-    if let Some(i) = args.iter().position(|a| a == "--print") {
-        if !dummy {
-            return print_files(&args[i + 1..]);
-        }
+    if args.iter().any(|a| a == "--print") && !dummy {
+        return print_files(&args);
     }
     // the files to print, `;`-separated like the File field
     let file = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<_>>().join("; ");
     let mut app = new_app(args.iter().any(|a| a == "--scan"), file, dummy);
     app.save_as = default_scan_name(&app.scan_folder);
     if dummy {
-        app.status = demo_text(
-            "DEMO MODE · print jobs stay in this session; no device output",
-            "MODO DEMO · los trabajos son simulados; no se envía nada a una impresora",
-        ).into();
+        app.status = extra().demo_status.into();
     }
     sound::play(Sound::Boot);
     if app.printers.is_empty() && !dummy {
-        app.status = t().no_printers.into();
+        app.status = backend_text(app.backend).unwrap_or_else(|| t().no_printers.into());
     }
-    // If launched with --scan, preload the most recent scanned page for preview testing
-    if app.tab == Tab::Scan && !dummy {
+    // Optional preview testing hook when PRINTERTUI_PRELOAD_SCAN is set
+    if app.tab == Tab::Scan && !dummy && std::env::var_os("PRINTERTUI_PRELOAD_SCAN").is_some() {
         let dir = std::env::temp_dir().join("printertui-scan");
         if let Ok(rd) = std::fs::read_dir(&dir) {
             let mut paths: Vec<_> = rd
@@ -265,7 +264,7 @@ fn main() -> std::io::Result<()> {
                     s.starts_with("page-") && !s.contains('.')
                 })
                 .collect();
-            paths.sort_by_key(|e| e.file_name());
+            paths.sort_by_key(|e| (e.metadata().and_then(|m| m.modified()).ok(), e.file_name()));
             if let Some(entry) = paths.last() {
                 let path = entry.path().to_string_lossy().into_owned();
                 if let Ok(thumb) = thumbnail(&path) {
@@ -296,10 +295,12 @@ fn new_app(scan: bool, file: String, dummy: bool) -> App {
         dummy,
         dummy_jobs: Vec::new(),
         dummy_next_job: 1,
+        backend: if dummy { None } else { backend_problem() },
         printers: Vec::new(),
         labels: Vec::new(),
         state: None,
         checking: None,
+        polling: None,
         checked: Instant::now(),
         printer: 0,
         file,
@@ -347,6 +348,7 @@ fn new_app(scan: bool, file: String, dummy: bool) -> App {
         started: Instant::now(),
         last_poll: Instant::now(),
         sel: 0,
+        cursor: 0,
         status: String::new(),
         heard: String::new(),
         act: Act::Idle,
@@ -355,30 +357,29 @@ fn new_app(scan: bool, file: String, dummy: bool) -> App {
     };
     if dummy {
         app.printers = vec![DUMMY_QUEUE.into()];
-        app.labels = vec![dummy_label().into()];
         app.state = Some((DUMMY_QUEUE.into(), dummy_state()));
-        app.scanners = Some(Vec::new());
     } else {
         app.set_printers(printers());
     }
-    if let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+    if !cfg!(test)
+        && let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok())
+    {
         for (k, v) in parse_config(&text) {
             app.apply(k, v);
         }
     }
     app.apply_settings();
-    if dummy {
-        app.labels = vec![dummy_label().into()];
-    }
     app
 }
 
-fn demo_text(en: &'static str, es: &'static str) -> &'static str {
-    if t().code == "es" { es } else { en }
-}
-
-fn dummy_label() -> &'static str {
-    demo_text("PrinterTUI Demo Printer · simulated", "PrinterTUI · impresora de prueba")
+fn backend_text(problem: Option<&str>) -> Option<String> {
+    let cmd = if cfg!(target_os = "macos") { "sudo launchctl start org.cups.cupsd" } else { "sudo systemctl enable --now cups" };
+    match problem? {
+        "cups-missing" => Some(extra().cups_missing.into()),
+        "cups-stopped" => Some(fill(extra().cups_stopped, &[("cmd", &cmd)])),
+        "spooler-stopped" => Some(extra().spooler_stopped.into()),
+        _ => None,
+    }
 }
 
 fn dummy_state() -> PrinterState {
@@ -392,7 +393,7 @@ fn dummy_state() -> PrinterState {
 fn dummy_queue(jobs: &[DummyJob]) -> Vec<(String, String)> {
     jobs.iter()
         .filter(|job| job.active())
-        .map(|job| (job.id.clone(), format!("{}  ·  {} {}/{}", job.description, demo_text("simulation", "simulación"), job.progress(), job.sides)))
+        .map(|job| (job.id.clone(), format!("{}  ·  {} {}/{}", job.description, extra().simulated, job.progress(), job.sides)))
         .collect()
 }
 
@@ -415,7 +416,7 @@ fn print_help() {
 PrinterTUI {}
 
 usage: printertui [file...]          open, with these files loaded
-       printertui --dummy [file...]   open with a simulated printer; no jobs are sent
+       printertui --dummy [file...]   open with a simulated printer & scanner
        printertui --scan             open on the Scan tab
        printertui --print [file...]  print with the saved settings and exit
        printertui --version
@@ -423,7 +424,7 @@ usage: printertui [file...]          open, with these files loaded
 
 Files are PDFs, photos, text or documents (LibreOffice); several are printed in
 order. In the app, Tab changes tab, j/k move, h/l change, Enter picks or prints,
-i types, q quits.",
+i types, ? opens Printer Doctor, q quits.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -445,18 +446,22 @@ fn print_files(args: &[String]) -> std::io::Result<()> {
 }
 
 fn print_now(app: &mut App) -> Result<String, String> {
+    if app.printers.is_empty()
+        && let Some(msg) = backend_text(app.backend)
+    {
+        return Err(msg);
+    }
     let files = app.files()?;
     let (scale, paper) = (SCALES[app.scale], PAPERS[app.paper]);
     let auto = app.auto_duplex();
     if app.duplex && !auto {
         return Err("Manual double-sided needs the app: run printertui and print there.".into());
     }
+    let pdfs: Vec<String> = files.iter().map(|f| printable(f, scale, paper)).collect::<Result<_, _>>()?;
+    let jobs = app.prepare_batch(pdfs, auto, true)?;
     let mut out = Vec::new();
-    for f in &files {
-        let pdf = printable(f, scale, paper)?;
-        let mut job = app.job(&pdf, None, app.reverse && !auto, true);
-        job.sides = auto;
-        out.push(submit(&job)?);
+    for (job, _) in &jobs {
+        out.push(submit(job)?);
     }
     Ok(out.join("\n"))
 }
@@ -466,6 +471,7 @@ const MOUSE: bool = cfg!(windows);
 
 fn init() -> DefaultTerminal {
     let term = ratatui::init();
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
     if MOUSE {
         let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::EnableMouseCapture);
     }
@@ -473,6 +479,7 @@ fn init() -> DefaultTerminal {
 }
 
 fn restore() {
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     if MOUSE {
         let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::DisableMouseCapture);
     }
@@ -499,23 +506,67 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
             app.checking = None;
             done(app);
         }
+        if let Some(done) = app.polling.as_ref().and_then(finished) {
+            app.polling = None;
+            done(app);
+        }
         app.check_printer();
         app.sync_view();
         if app.last_poll.elapsed() >= Duration::from_secs(1) {
             app.last_poll = Instant::now();
-            if let Mode::Flip { job, steps, .. } = &mut app.mode
-                && job.as_deref().is_some_and(|id| {
-                    if app.dummy { !dummy_job_active(&app.dummy_jobs, id) } else { !job_active(id) }
-                })
-            {
-                *job = None;
-                app.status = std::mem::take(steps);
-            }
-            if let Mode::Queue(jobs, _) = &mut app.mode {
-                *jobs = if app.dummy { dummy_queue(&app.dummy_jobs) } else { queue() };
-            }
-            if !app.printing.is_empty() {
-                app.follow_jobs();
+            if app.dummy {
+                if let Mode::Flip { job, steps, .. } = &mut app.mode
+                    && job.as_deref().is_some_and(|id| !dummy_job_active(&app.dummy_jobs, id))
+                {
+                    *job = None;
+                    app.status = std::mem::take(steps);
+                }
+                if let Mode::Queue(jobs, _) = &mut app.mode {
+                    *jobs = dummy_queue(&app.dummy_jobs);
+                }
+                if !app.printing.is_empty() {
+                    let states: Vec<(i32, u32)> = app.printing.iter().map(|(id, ..)| {
+                        match app.dummy_jobs.iter().find(|job| job.id == *id) {
+                            Some(job) if job.cancelled => (7, job.sides),
+                            Some(job) if job.active() => (5, job.progress()),
+                            Some(job) => (9, job.sides),
+                            None => (7, 0),
+                        }
+                    }).collect();
+                    app.apply_job_states(states);
+                }
+            } else if app.polling.is_none() {
+                let flip_id = match &app.mode {
+                    Mode::Flip { job: Some(id), .. } => Some(id.clone()),
+                    _ => None,
+                };
+                let want_queue = matches!(app.mode, Mode::Queue(..));
+                let ids: Vec<String> = app.printing.iter().map(|(id, ..)| id.clone()).collect();
+                if flip_id.is_some() || want_queue || !ids.is_empty() {
+                    app.polling = Some(task(move || {
+                        let flip_done = flip_id.as_deref().is_some_and(|id| !job_active(id));
+                        let q = want_queue.then(queue);
+                        let states: Vec<(String, (i32, u32))> = ids.into_iter().map(|id| {
+                            let p = job_progress(&id);
+                            (id, p)
+                        }).collect();
+                        Box::new(move |app: &mut App| {
+                            if flip_done && let Mode::Flip { job, steps, .. } = &mut app.mode {
+                                *job = None;
+                                app.status = std::mem::take(steps);
+                            }
+                            if let (Some(q), Mode::Queue(jobs, _)) = (q, &mut app.mode) {
+                                *jobs = q;
+                            }
+                            if !app.printing.is_empty() && !states.is_empty() {
+                                let mapped: Vec<(i32, u32)> = app.printing.iter().map(|(id, _, done)| {
+                                    states.iter().find(|(sid, _)| sid == id).map_or((5, *done), |(_, s)| *s)
+                                }).collect();
+                                app.apply_job_states(mapped);
+                            }
+                        })
+                    }));
+                }
             }
         }
         // pages keep coming out while the jobs print, also after a hop or a jam
@@ -545,6 +596,10 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
         let keys = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => vec![k],
             Event::Mouse(m) => app.mouse(m),
+            Event::Paste(pasted) => {
+                app.paste(&pasted);
+                continue;
+            }
             _ => continue,
         };
         if app.act.done() {
@@ -562,12 +617,13 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
             let (gg, dd) = (prev == Some('g') && k.code == KeyCode::Char('g'), prev == Some('d') && k.code == KeyCode::Char('d'));
             if let KeyCode::Char(c @ ('g' | 'd')) = k.code
                 && prev != Some(c)
-                && !matches!(app.mode, Mode::Insert)
+                && !matches!(app.mode, Mode::Insert | Mode::Address(_))
             {
                 pending = Some(c);
             }
             match &mut app.mode {
                 Mode::Main => match k.code {
+                    KeyCode::Char('?') => app.open_doctor(),
                     // H/L browse the scanned pages from any row
                     KeyCode::Char(c @ ('H' | 'L')) if app.tab == Tab::Scan && !app.scans.is_empty() => {
                         let n = app.scans.len();
@@ -613,18 +669,19 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     }
                     KeyCode::Left | KeyCode::Char('h') => app.cycle(false),
                     KeyCode::Right | KeyCode::Char('l') => app.cycle(true),
-                    KeyCode::Char('i') | KeyCode::Char('a') if app.text().is_some() => app.mode = Mode::Insert,
+                    KeyCode::Char('i') | KeyCode::Char('a') if app.text().is_some() => app.enter_insert(),
                     KeyCode::Enter if app.tab == Tab::Scan => app.scan_enter(),
-                    KeyCode::Enter if app.tab == Tab::Settings && app.sel == FOLDER => app.mode = Mode::Insert,
+                    KeyCode::Enter if app.tab == Tab::Settings && app.sel == FOLDER => app.enter_insert(),
                     KeyCode::Enter if app.tab == Tab::Settings => app.cycle(true),
                     KeyCode::Enter if app.sel == ADD && app.dummy => {
-            app.status = demo_text("Adding printers is disabled in demo mode.", "No se pueden añadir impresoras en el modo demo.").into();
+                        app.status = extra().demo_no_add.into();
                     }
                     KeyCode::Enter if app.sel == ADD => app.spawn(t().searching_printers, || {
                         let found = discover();
                         Box::new(move |app: &mut App| {
                             if found.is_empty() {
                                 app.status = t().no_net_printers.into();
+                                app.cursor = 0;
                                 app.mode = Mode::Address(String::new());
                             } else {
                                 app.status = String::new();
@@ -659,15 +716,13 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                             app.save_settings();
                         }
                     }
-                    KeyCode::Backspace => {
-                        app.text().map(String::pop);
-                    }
-                    KeyCode::Char(c) => {
-                        if let Some(t) = app.text() {
-                            t.push(c)
+                    _ => {
+                        let mut cur = app.cursor;
+                        if let Some(s) = app.text() {
+                            edit_text(s, &mut cur, k);
                         }
+                        app.cursor = cur;
                     }
-                    _ => {}
                 },
                 Mode::Pick(found, state) => match k.code {
                     KeyCode::Esc => app.mode = Mode::Main,
@@ -675,7 +730,10 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     KeyCode::Down | KeyCode::Char('j') => state.select_next(),
                     KeyCode::Char('g') if gg => state.select_first(),
                     KeyCode::Char('G') => state.select_last(),
-                    KeyCode::Char('a') => app.mode = Mode::Address(String::new()),
+                    KeyCode::Char('a') => {
+                        app.cursor = 0;
+                        app.mode = Mode::Address(String::new());
+                    }
                     KeyCode::Enter => {
                         let (name, uri) = found[state.selected().unwrap_or(0)].clone();
                         app.add(term, &name, &uri);
@@ -684,10 +742,6 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                 },
                 Mode::Address(addr) => match k.code {
                     KeyCode::Esc => app.mode = Mode::Main,
-                    KeyCode::Backspace => {
-                        addr.pop();
-                    }
-                    KeyCode::Char(c) => addr.push(c),
                     KeyCode::Enter if !addr.trim().is_empty() => {
                         let addr = addr.trim().to_string();
                         // a bare IP or name gets the standard IPP Everywhere path; a full uri is used as is
@@ -695,7 +749,7 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                         let host = uri_host(&uri).map_or(addr.clone(), |(_, h)| h.to_string());
                         app.add(term, &queue_name(&host), &uri);
                     }
-                    _ => {}
+                    _ => edit_text(addr, &mut app.cursor, k),
                 },
                 Mode::Pages(on, state) => {
                     let i = state.selected().unwrap_or(0);
@@ -751,9 +805,64 @@ fn run(term: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                     }
                     _ => {}
                 },
+                Mode::Doctor(_) => match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => app.mode = Mode::Main,
+                    _ => {}
+                },
             }
         }
     }
+}
+
+/// Edits a single-line text field with cursor movement and readline-style shortcuts.
+fn edit_text(s: &mut String, cursor: &mut usize, k: KeyEvent) {
+    *cursor = (*cursor).min(s.len());
+    while *cursor > 0 && !s.is_char_boundary(*cursor) {
+        *cursor -= 1;
+    }
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+    match k.code {
+        KeyCode::Left => *cursor = s[..*cursor].char_indices().next_back().map_or(0, |(i, _)| i),
+        KeyCode::Right => *cursor = s[*cursor..].chars().next().map_or(s.len(), |c| *cursor + c.len_utf8()),
+        KeyCode::Home => *cursor = 0,
+        KeyCode::End => *cursor = s.len(),
+        KeyCode::Char('b') if ctrl => *cursor = s[..*cursor].char_indices().next_back().map_or(0, |(i, _)| i),
+        KeyCode::Char('f') if ctrl => *cursor = s[*cursor..].chars().next().map_or(s.len(), |c| *cursor + c.len_utf8()),
+        KeyCode::Char('a') if ctrl => *cursor = 0,
+        KeyCode::Char('e') if ctrl => *cursor = s.len(),
+        KeyCode::Char('u') if ctrl => {
+            s.drain(..*cursor);
+            *cursor = 0;
+        }
+        KeyCode::Char('k') if ctrl => s.truncate(*cursor),
+        KeyCode::Char('w') if ctrl => delete_word_back(s, cursor),
+        KeyCode::Backspace if alt => delete_word_back(s, cursor),
+        KeyCode::Backspace | KeyCode::Char('h') if k.code == KeyCode::Backspace || ctrl => {
+            if let Some((i, _)) = s[..*cursor].char_indices().next_back() {
+                s.remove(i);
+                *cursor = i;
+            }
+        }
+        KeyCode::Delete | KeyCode::Char('d') if k.code == KeyCode::Delete || ctrl => {
+            if *cursor < s.len() {
+                s.remove(*cursor);
+            }
+        }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            s.insert(*cursor, c);
+            *cursor += c.len_utf8();
+        }
+        _ => {}
+    }
+}
+
+fn delete_word_back(s: &mut String, cursor: &mut usize) {
+    let is_sep = |c: char| c.is_whitespace() || matches!(c, '/' | '\\' | ';');
+    let trimmed = s[..*cursor].trim_end_matches(is_sep);
+    let start = trimmed.rfind(is_sep).map_or(0, |i| i + trimmed[i..].chars().next().map_or(1, char::len_utf8));
+    s.drain(start..*cursor);
+    *cursor = start;
 }
 
 /// Runs `work` in a thread; its returned closure updates the app when it finishes.
@@ -777,6 +886,91 @@ impl App {
         self.busy = Some((msg.into(), task(work)));
     }
 
+    fn enter_insert(&mut self) {
+        self.cursor = self.text().map_or(0, |s| s.len());
+        self.mode = Mode::Insert;
+    }
+
+    fn paste(&mut self, raw: &str) {
+        let clean: String = raw.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+        if clean.is_empty() {
+            return;
+        }
+        let mut cur = self.cursor;
+        match &mut self.mode {
+            Mode::Address(addr) => {
+                cur = cur.min(addr.len());
+                while cur > 0 && !addr.is_char_boundary(cur) {
+                    cur -= 1;
+                }
+                addr.insert_str(cur, &clean);
+                self.cursor = cur + clean.len();
+            }
+            Mode::Insert => {
+                if let Some(s) = self.text() {
+                    cur = cur.min(s.len());
+                    while cur > 0 && !s.is_char_boundary(cur) {
+                        cur -= 1;
+                    }
+                    s.insert_str(cur, &clean);
+                    cur += clean.len();
+                }
+                self.cursor = cur;
+            }
+            _ => {}
+        }
+    }
+
+    fn open_doctor(&mut self) {
+        if self.dummy {
+            self.mode = Mode::Doctor(format!("{}\n\n{}", extra().demo_status, extra().doc_ok));
+            return;
+        }
+        let current = self.printers.get(self.printer).cloned();
+        let current_label = self.labels.get(self.printer).cloned();
+        self.spawn(extra().checking_doctor, move || {
+            let (backend, usb, net, legacy) = doctor_scan();
+            let state = current.as_deref().map(printer_state);
+            Box::new(move |app: &mut App| {
+                app.backend = backend;
+                let mut lines = Vec::new();
+                if let Some(msg) = backend_text(backend) {
+                    lines.push(format!("✗ {msg}"));
+                } else {
+                    lines.push(extra().doc_ok.to_string());
+                }
+                if let (Some(label), Some(st)) = (&current_label, &state) {
+                    let src = match st.ink_source {
+                        InkSource::Ipp => "IPP",
+                        InkSource::CupsCache => "CUPS",
+                        InkSource::Demo => "DEMO",
+                        InkSource::Unknown => "?",
+                    };
+                    lines.push(format!("• {label} ({}: {src})", t().ink));
+                    app.state = current.map(|q| (q, st.clone()));
+                    if let Some(problem) = app.complaint() {
+                        lines.push(format!("  ⚠ {problem}"));
+                    }
+                }
+                if !usb.is_empty() {
+                    lines.push(fill(extra().doc_usb, &[("list", &usb.join(", "))]));
+                }
+                if !net.is_empty() {
+                    lines.push(fill(extra().doc_net, &[("n", &net.len())]));
+                    for (n, u) in net.iter().take(4) {
+                        lines.push(format!("  {n}  ({u})"));
+                    }
+                } else if app.printers.is_empty() && usb.is_empty() && backend.is_none() {
+                    lines.push(extra().doc_no_net.to_string());
+                }
+                if !legacy.is_empty() {
+                    lines.push(fill(extra().doc_legacy, &[("list", &legacy.join(", "))]));
+                }
+                app.mode = Mode::Doctor(lines.join("\n\n"));
+            })
+        });
+    }
+
     /// The keys a mouse event stands for: a click selects a row (or popup item), a click on `<` / `>`
     /// changes the value, a click on a button, File or Pages (or on the selected popup item) opens it,
     /// and the wheel moves up and down.
@@ -790,21 +984,22 @@ impl App {
         }
         let (x, y) = (m.column, m.row);
         let popup = self.popup_area.get();
-        let item = (popup.contains((x, y).into()) && y > popup.y).then(|| (y - popup.y - 1) as usize);
+        let inner_row = (popup.contains((x, y).into()) && y > popup.y && y + 1 < popup.y + popup.height).then(|| (y - popup.y - 1) as usize);
         match &mut self.mode {
             Mode::Pick(list, state) | Mode::Queue(list, state) => {
-                let Some(i) = item.filter(|i| *i < list.len()) else { return Vec::new() };
+                let Some(i) = inner_row.map(|r| state.offset() + r).filter(|i| *i < list.len()) else { return Vec::new() };
                 let again = state.selected() == Some(i);
                 state.select(Some(i));
                 // a second click adds the printer; jobs are only cancelled with x
                 return if again && matches!(self.mode, Mode::Pick(..)) { key(KeyCode::Enter) } else { Vec::new() };
             }
             Mode::Pages(on, state) => {
-                let Some(i) = item.filter(|i| *i < on.len()) else { return Vec::new() };
+                let Some(i) = inner_row.map(|r| state.offset() + r).filter(|i| *i < on.len()) else { return Vec::new() };
                 state.select(Some(i));
                 return key(KeyCode::Char(' '));
             }
             Mode::Flip { .. } => return key(KeyCode::Enter),
+            Mode::Doctor(_) => return key(KeyCode::Esc),
             Mode::Insert | Mode::Address(_) => return Vec::new(),
             Mode::Main => {}
         }
@@ -843,7 +1038,7 @@ impl App {
     /// Adds a network printer; the terminal is in normal mode meanwhile, for the password / UAC prompt.
     fn add(&mut self, term: &mut DefaultTerminal, name: &str, uri: &str) {
         if self.dummy {
-            self.status = demo_text("Adding printers is disabled in demo mode.", "No se pueden añadir impresoras en el modo demo.").into();
+            self.status = extra().demo_no_add.into();
             self.mode = Mode::Main;
             return;
         }
@@ -851,6 +1046,7 @@ impl App {
         println!("{}", fill(t().adding, &[("name", &name), ("uri", &uri), ("note", &t().hints()[2])]));
         let res = add_printer(name, uri);
         *term = init();
+        self.backend = backend_problem();
         self.status = match res {
             Ok(()) => fill(t().added, &[("name", &name)]),
             Err(e) => e,
@@ -861,7 +1057,7 @@ impl App {
     }
 
     fn set_printers(&mut self, printers: Vec<String>) {
-        self.labels = if self.dummy { vec![dummy_label().into()] } else { printer_labels(&printers) };
+        self.labels = if self.dummy { vec![extra().demo_printer.into()] } else { printer_labels(&printers) };
         self.printers = printers;
     }
 
@@ -1043,14 +1239,19 @@ impl App {
         }
     }
 
-    /// Opens the page selector for the first file, pre-checking the current range.
+    /// Opens the page selector across the selected files, pre-checking the current range.
     fn open_pages(&mut self) {
-        let Some(file) = split_files(&self.file).first().map(|f| expand_home(f)) else {
+        let files: Vec<String> = split_files(&self.file).iter().map(|f| expand_home(f)).collect();
+        if files.is_empty() {
             return self.status = failed(t().pick_file_first);
-        };
+        }
         let paper = PAPERS[self.paper];
         self.spawn(t().reading_pages, move || {
-            let total = printable(&file, 100, paper).and_then(|p| page_count(&p).ok_or(t().unreadable_pdf.into()));
+            let total = files
+                .iter()
+                .map(|f| printable(f, 100, paper).and_then(|p| page_count(&p).ok_or_else(|| t().unreadable_pdf.into())))
+                .collect::<Result<Vec<_>, String>>()
+                .map(|counts| counts.into_iter().min().unwrap_or(1));
             Box::new(move |app: &mut App| match total {
                 Ok(total) => {
                     let current = parse_ranges(&app.pages, total).unwrap_or_default();
@@ -1202,7 +1403,7 @@ impl App {
         let sides = pages.div_ceil(job.per_sheet as usize).max(1) as u32 * job.copies;
         self.dummy_jobs.push(DummyJob {
             id: id.clone(),
-            description: format!("{} · {}", name(&job.file), demo_text("simulated", "simulado")),
+            description: format!("{} · {}", name(&job.file), extra().simulated),
             sides,
             started: Instant::now(),
             cancelled: false,
@@ -1216,21 +1417,8 @@ impl App {
         }
     }
 
-    /// Asks how the jobs being printed are doing. Once all are done, a last page comes out and
-    /// the printer says so; not when one was cancelled, or before the flip in a manual duplex.
-    fn follow_jobs(&mut self) {
-        let states: Vec<(i32, u32)> = self.printing.iter().map(|(id, ..)| {
-            if self.dummy {
-                match self.dummy_jobs.iter().find(|job| job.id == *id) {
-                    Some(job) if job.cancelled => (7, job.sides),
-                    Some(job) if job.active() => (5, job.progress()),
-                    Some(job) => (9, job.sides),
-                    None => (7, 0),
-                }
-            } else {
-                job_progress(id)
-            }
-        }).collect();
+    /// Updates active print progress from polled `(state, printed_sides)` pairs.
+    fn apply_job_states(&mut self, states: Vec<(i32, u32)>) {
         // 7 canceled, 8 aborted, 9 completed
         if states.iter().all(|(state, _)| *state >= 7) {
             let ok = states.iter().all(|(state, _)| *state == 9);
@@ -1244,11 +1432,7 @@ impl App {
                 // Ink levels may have changed; don't leave the pre-print values cached for 20s.
                 self.checked = Instant::now() - Duration::from_secs(20);
                 if !matches!(self.mode, Mode::Flip { .. }) && !self.status.starts_with(t().error) {
-                    self.status = if self.dummy {
-                        demo_text("Demo print finished; nothing was sent to a device.", "Impresión simulada terminada; no se envió nada a una impresora.").into()
-                    } else {
-                        t().printed.into()
-                    };
+                    self.status = if self.dummy { extra().demo_done.into() } else { t().printed.into() };
                 }
             }
             return;
@@ -1274,30 +1458,49 @@ impl App {
         text
     }
 
-    fn print_pdfs(&mut self, pdfs: Vec<String>) -> Result<String, String> {
-        // a printer with its own duplexer gets one job printing both sides; the rest flip by hand
-        let auto = self.auto_duplex();
-        if self.duplex && !auto {
-            return self.duplex(pdfs, 0, String::new());
-        }
-        let pages = self.pages.trim().to_string();
+    /// Validates page counts and ranges for every PDF in the batch before any job is submitted.
+    fn prepare_batch(&self, pdfs: Vec<String>, auto: bool, use_range: bool) -> Result<Vec<(Job, usize)>, String> {
+        let pages = if use_range { self.pages.trim() } else { "" };
         let all = pages.is_empty() || pages == "all";
         // the last file first too, so the whole stack comes out in order
         let pdfs: Vec<String> = if self.reverse && !auto { pdfs.into_iter().rev().collect() } else { pdfs };
+        let mut jobs = Vec::with_capacity(pdfs.len());
         for p in &pdfs {
             let total = page_count(p);
-            // checked against each PDF: CUPS takes page-ranges beyond the last page without a word
-            let range = if all { None } else { Some(parse_ranges(&pages, total.ok_or(t().unreadable_pdf)?)?) };
+            // checked against each PDF before sending any job
+            let range = if all { None } else { Some(parse_ranges(pages, total.ok_or(t().unreadable_pdf)?)?) };
             let n = range.as_ref().map_or(total.unwrap_or(1) as usize, Vec::len);
             let mut job = self.job(p, range.map(|r| join(&r)), self.reverse && !auto, true);
             job.sides = auto;
+            jobs.push((job, n));
+        }
+        Ok(jobs)
+    }
+
+    fn print_pdfs(&mut self, pdfs: Vec<String>) -> Result<String, String> {
+        self.send_pdfs(pdfs, true)
+    }
+
+    fn send_pdfs(&mut self, pdfs: Vec<String>, use_range: bool) -> Result<String, String> {
+        // a printer with its own duplexer gets one job printing both sides; the rest flip by hand
+        let auto = self.auto_duplex();
+        if self.duplex && !auto {
+            // validate every PDF in the batch upfront before printing file 1's front side
+            let range_str = if use_range { self.pages.as_str() } else { "" };
+            for f in &pdfs {
+                let total = page_count(f).ok_or(t().unreadable_pdf)?;
+                parse_ranges(range_str, total)?;
+            }
+            return self.duplex(pdfs, 0, String::new(), use_range);
+        }
+        for (job, n) in self.prepare_batch(pdfs, auto, use_range)? {
             self.send(&job, n)?;
         }
         Ok(String::new())
     }
 
     /// Prints the front of files[i..] until one needs flipping, then waits in Mode::Flip.
-    fn duplex(&mut self, files: Vec<String>, mut i: usize, mut done: String) -> Result<String, String> {
+    fn duplex(&mut self, files: Vec<String>, mut i: usize, mut done: String, use_range: bool) -> Result<String, String> {
         self.mode = Mode::Main;
         while let Some(file) = files.get(i) {
             i += 1;
@@ -1305,38 +1508,32 @@ impl App {
             let pdf = file.clone();
             let total = page_count(&pdf).ok_or(t().unreadable_pdf)?;
             // page-ranges picks pages before number-up groups them, so split whole sheet sides
-            let pages = parse_ranges(&self.pages, total)?;
+            let pages = parse_ranges(if use_range { &self.pages } else { "" }, total)?;
             let per_sheet = PER_SHEET[self.per_sheet] as usize;
             let (pdf, front, back) = prepare_duplex(&pdf, total, &pages, per_sheet)?;
-            let odd = front.len().div_ceil(per_sheet) > back.len().div_ceil(per_sheet);
-            let id = self.send(&self.job(&pdf, Some(join(&front)), false, !odd), front.len())?;
+            let id = self.send(&self.job(&pdf, Some(join(&front)), false, true), front.len())?;
             if back.is_empty() {
                 done += &format!("{head}{}\n\n", fill(t().one_page, &[("id", &job_no(&id))]));
                 continue;
             }
-            let aside = match (odd, self.copies) {
-                (false, _) => String::new(),
-                (true, 1) => t().aside_one.into(),
-                (true, n) => fill(t().aside_many, &[("n", &n)]),
-            };
             let sent = fill(t().front_sent, &[("id", &job_no(&id))]);
-            let steps = format!("{done}{head}{sent}\n\n{}", fill(t().flip_steps, &[("aside", &aside)]));
+            let steps = format!("{done}{head}{sent}\n\n{}", t().flip_steps);
             let wait = format!("{done}{head}{sent}\n\n{}", t().printing_front);
             // unparsable lp output: "" is never listed as active, so the steps show right away
             let job = Some(job_id(&id).unwrap_or_default().to_string());
-            let back = (self.job(&pdf, Some(join(&back)), self.reverse_back, !odd), back.len());
-            self.mode = Mode::Flip { job, steps, back, files, next: i };
+            let back = (self.job(&pdf, Some(join(&back)), self.reverse_back, true), back.len());
+            self.mode = Mode::Flip { job, steps, back, files, next: i, use_range };
             return Ok(wait);
         }
         Ok(done.trim_end().to_string())
     }
 
     fn back_side(&mut self) -> Result<String, String> {
-        let Mode::Flip { back, files, next, .. } = std::mem::replace(&mut self.mode, Mode::Main) else {
+        let Mode::Flip { back, files, next, use_range, .. } = std::mem::replace(&mut self.mode, Mode::Main) else {
             return Ok(String::new());
         };
         let id = self.send(&back.0, back.1)?;
-        self.duplex(files, next, fill(t().back_sent, &[("id", &job_no(&id))]) + "\n\n")
+        self.duplex(files, next, fill(t().back_sent, &[("id", &job_no(&id))]) + "\n\n", use_range)
     }
 }
 
@@ -1346,14 +1543,14 @@ impl App {
         match self.graphics {
             Graphics::Kitty(tmux) => {
                 let area = self.preview_area.get();
-                let want = if self.popup_open() { None } else { self.preview_png().map(|p| (p, area.width, area.height)) };
+                let want = self.preview_png().map(|p| (p, area.width, area.height));
                 if want.is_none() {
                     if self.sent.take().is_some() {
                         emit(&kitty(&format!("a=d,d=I,i={},q=2", image_id()), "", tmux));
                     }
                 } else if want != self.sent && area.width > 0 {
                     let (png, c, r) = want.clone().unwrap_or_default();
-                    emit(&kitty(&format!("a=T,U=1,f=100,t=f,i={},q=2,c={c},r={r}", image_id()), &base64(png.as_bytes()), tmux));
+                    kitty_send(&png, c, r, tmux);
                     self.sent = want;
                 }
             }
@@ -1381,7 +1578,7 @@ impl App {
                     if max_w > 0 && max_h > 0 && *w > 0 && *h > 0 {
                         let scale = (max_w as f32 / *w as f32).min(max_h as f32 / *h as f32);
                         let ow = ((*w as f32 * scale) as usize).clamp(10, max_w);
-                        let oh = (((((*h as f32 * scale) as usize) + 5) / 6 * 6).max(6)).min(max_h / 6 * 6);
+                        let oh = (((*h as f32 * scale) as usize).div_ceil(6).max(1) * 6).min(max_h / 6 * 6);
                         if ow > 0 && oh > 0 {
                             let small = downscale(*w, *h, px, ow, oh);
                             let sixel = sixel_encode(ow, oh, &small);
@@ -1478,7 +1675,7 @@ impl App {
         self.shown().map(|(png, _)| png)
     }
 
-    /// Popups cover terminal image cells, so temporarily hide the full-size preview.
+    /// Popups cover Sixel image cells, so temporarily hide the full-size preview.
     fn popup_open(&self) -> bool {
         !matches!(self.mode, Mode::Main | Mode::Insert | Mode::Flip { job: Some(_), .. })
     }
@@ -1507,6 +1704,9 @@ impl App {
 
     /// How the printer looks while nothing else happens, from its worst problem.
     fn mood(&self) -> Mood {
+        if self.printers.is_empty() && self.backend.is_some() {
+            return Mood::Off;
+        }
         let problems = self.printer_state().map_or(&[][..], |s| s.problems.as_slice());
         let has = |names: &[&str]| problems.iter().any(|p| names.contains(&p.as_str()));
         if has(&["offline", "shutdown", "connecting-to-device", "timed-out", "stopped", "paused"]) {
@@ -1522,6 +1722,9 @@ impl App {
 
     /// What the printer says about its worst problem, if it has one.
     fn complaint(&self) -> Option<String> {
+        if self.printers.is_empty() {
+            return backend_text(self.backend);
+        }
         let problem = self.printer_state()?.problems.first()?;
         Some(match problem.as_str() {
             "media-empty" | "media-needed" => t().no_paper.into(),
@@ -1550,6 +1753,10 @@ impl App {
         let before = t().code;
         i18n::set(if self.lang.is_empty() { system_language() } else { self.lang.clone() }.as_str());
         self.clear |= t().code != before;
+        if self.dummy {
+            self.labels = vec![extra().demo_printer.into()];
+            self.scanners = Some(vec![(DUMMY_SCANNER.into(), extra().demo_scanner.into())]);
+        }
         pet::set_theme(self.theme);
         let graphics = match GRAPHICS_PREFS[self.graphics_pref] {
             "kitty" => Graphics::Kitty(std::env::var_os("TMUX").is_some()),
@@ -1628,7 +1835,10 @@ impl App {
                 return true;
             }
             'd' if dd => {
-                self.scans.remove(i);
+                let removed = self.scans.remove(i);
+                if !self.discarded.iter().any(|p| p.orig == removed.orig) {
+                    clean_scan_files(&[removed.orig]);
+                }
                 self.cur = i.min(self.scans.len().saturating_sub(1));
                 self.status = fill(t().page_deleted, &[("n", &(i + 1))]);
                 return true;
@@ -1668,8 +1878,9 @@ impl App {
 
     fn find_scanners(&mut self, full: bool) {
         if self.dummy {
-            self.scanners = Some(Vec::new());
-            self.status = demo_text("Scanner actions are disabled in demo mode.", "El escáner está desactivado en el modo demo.").into();
+            self.scanners = Some(vec![(DUMMY_SCANNER.into(), extra().demo_scanner.into())]);
+            self.scanner = 0;
+            self.status = String::new();
             return;
         }
         self.spawn(t().searching_scanners, move || {
@@ -1693,7 +1904,14 @@ impl App {
             SAVE => self.save_scans(),
             COPY => self.copy(),
             DISCARD => {
-                // kept, not dropped: `u` brings them back while none are left
+                // kept, not dropped: `u` brings them back while none are left; any older discarded batch is cleaned
+                let old: Vec<String> = self
+                    .discarded
+                    .drain(..)
+                    .map(|p| p.orig)
+                    .filter(|o| !self.scans.iter().any(|p| p.orig == *o))
+                    .collect();
+                clean_scan_files(&old);
                 self.discarded = std::mem::take(&mut self.scans);
                 self.cur = 0;
                 self.status = t().discarded.into();
@@ -1706,10 +1924,6 @@ impl App {
     /// `retake` replaces the page scanned from that original instead of adding one. With the
     /// document feeder, scanning goes to the end of the stack, one page after another.
     fn scan_page(&mut self, then_copy: bool, retake: Option<String>) {
-        if self.dummy {
-            self.status = demo_text("Scanning is disabled in demo mode; print jobs are simulated.", "El escaneo está desactivado; los trabajos de impresión son simulados.").into();
-            return;
-        }
         let Some((device, _)) = self.scanners.as_ref().and_then(|l| l.get(self.scanner)).cloned() else {
             return self.status = failed(t().no_scanner_selected);
         };
@@ -1717,7 +1931,7 @@ impl App {
         let n = retake.as_ref().and_then(|o| self.scans.iter().position(|p| p.orig == *o)).unwrap_or(self.scans.len()) + 1;
         // unique name: pages can be deleted and reordered, and old edits must not be reused
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
-        let (mode, dpi) = (SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi]);
+        let (mode, dpi, paper) = (SCAN_MODES[self.scan_mode], SCAN_DPI[self.scan_dpi], PAPERS[self.paper]);
         let source = SCAN_SOURCES[self.scan_source];
         // the feeder is read to the end of the stack; a retake is one page
         let stack = source == "Feeder" && retake.is_none();
@@ -1725,29 +1939,20 @@ impl App {
         sound::play(Sound::Scan);
         self.spawn(fill(t().scanning, &[("n", &n)]), move || {
             // the pages of one feeder run share the stamp: page-<stamp>, page-<stamp>-1, ...
-            let res = std::fs::create_dir_all(&dir).map_err(|e| e.to_string()).and_then(|_| {
-                let mut pages = Vec::new();
-                loop {
-                    let path = match pages.len() {
-                        0 => dir.join(format!("page-{stamp}")),
-                        i => dir.join(format!("page-{stamp}-{i}")),
-                    }
-                    .to_string_lossy()
-                    .into_owned();
-                    match scan(&device, mode, dpi, &path, source).and_then(|_| thumbnail(&path)) {
-                        Ok(thumb) => pages.push((path, thumb)),
-                        // a scan that fails with nothing scanned yet is the real error; after a
-                        // page it means the feeder ran out, and the stack ended (on eSCL an empty
-                        // feeder can take a minute: 503 until retry_busy gives up)
-                        Err(e) if pages.is_empty() => return Err(e),
-                        Err(_) => break,
-                    }
-                    if !stack {
-                        break;
-                    }
-                }
-                Ok(pages)
-            });
+            let res = std::fs::create_dir_all(&dir)
+                .map_err(|e| e.to_string())
+                .and_then(|_| {
+                    scan_pages(&device, mode, dpi, paper, source, stack, |i| {
+                        let name = if i == 0 { format!("page-{stamp}") } else { format!("page-{stamp}-{i}") };
+                        dir.join(name).to_string_lossy().into_owned()
+                    })
+                })
+                .and_then(|paths| {
+                    paths
+                        .into_iter()
+                        .map(|path| thumbnail(&path).map(|thumb| (path, thumb)))
+                        .collect::<Result<Vec<_>, _>>()
+                });
             Box::new(move |app: &mut App| {
                 app.scanning = false;
                 app.status = match res {
@@ -1760,7 +1965,10 @@ impl App {
                         // the page to retake may have been moved or deleted meanwhile
                         if let Some(i) = retake.and_then(|o| app.scans.iter().position(|p| p.orig == o)) {
                             if let Some(page) = pages.next() {
-                                app.scans[i] = page;
+                                let old_orig = std::mem::replace(&mut app.scans[i], page).orig;
+                                if !app.discarded.iter().any(|p| p.orig == old_orig) {
+                                    clean_scan_files(&[old_orig]);
+                                }
                                 app.cur = i;
                             }
                             return app.status = fill(t().page_rescanned, &[("n", &(i + 1))]);
@@ -1787,12 +1995,8 @@ impl App {
     }
 
     /// Photocopy: prints the kept pages at their real size with the Print tab's printer, color,
-    /// paper, copies and scale; with nothing scanned yet it scans a page first.
+    /// sides, order, paper, copies and scale; with nothing scanned yet it scans a page first.
     fn copy(&mut self) {
-        if self.dummy {
-            self.status = demo_text("Copying is disabled in demo mode; print jobs are simulated.", "La copia está desactivada; los trabajos de impresión son simulados.").into();
-            return;
-        }
         if self.printers.is_empty() {
             return self.status = failed(t().no_printer_for_copy);
         }
@@ -1808,17 +2012,18 @@ impl App {
         }
         let pdf = std::env::temp_dir().join("printertui-scan").join("copy.pdf");
         let (dpi, scale, paper) = (SCAN_DPI[self.scan_dpi], SCALES[self.scale], PAPERS[self.paper]);
-        let job = self.job("", None, false, true);
         self.spawn(t().printing_copy, move || {
             let res = images_to_pdf(&files, dpi, &[])
-                .and_then(|data| std::fs::write(&pdf, data).map_err(|e| format!("{}: {e}", pdf.display())))
-                .and_then(|_| printable(&pdf.to_string_lossy(), scale, paper))
-                .and_then(|file| submit(&Job { file, ..job.clone() }));
+                .and_then(|data| {
+                    if let Some(parent) = pdf.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    std::fs::write(&pdf, data).map_err(|e| format!("{}: {e}", pdf.display()))
+                })
+                .and_then(|_| printable(&pdf.to_string_lossy(), scale, paper));
             Box::new(move |app: &mut App| {
-                if let Ok(out) = &res {
-                    app.follow(out, &job, files.len());
-                }
-                app.show(res.map(|_| String::new()))
+                let res = res.and_then(|file| app.send_pdfs(vec![file], false));
+                app.show(res)
             })
         });
     }
@@ -1831,6 +2036,7 @@ impl App {
         if self.editing.is_some() {
             return self.status = t().edit_running.into();
         }
+        let origs: Vec<String> = self.scans.iter().map(|p| p.orig.clone()).collect();
         let out = expand_home(self.save_as.trim());
         let out = out.trim_end_matches(".pdf").trim_end_matches(".png").to_string();
         let (format, dpi) = (SCAN_FORMATS[self.scan_format], SCAN_DPI[self.scan_dpi]);
@@ -1841,10 +2047,14 @@ impl App {
             Box::new(move |app: &mut App| {
                 app.status = match res {
                     Ok(written) => {
+                        let clean: Vec<String> = origs.into_iter().filter(|o| !app.discarded.iter().any(|p| p.orig == *o)).collect();
+                        clean_scan_files(&clean);
                         app.scans.clear();
                         app.cur = 0;
                         app.save_as = default_scan_name(&app.scan_folder);
-                        let _ = app.save();
+                        if !app.dummy {
+                            let _ = app.save();
+                        }
                         sound::play(Sound::Done);
                         let written: Vec<String> = written.iter().map(|p| tilde(p)).collect();
                         fill(t().saved, &[("files", &written.join(", "))])
@@ -1861,13 +2071,36 @@ fn emit(s: &str) {
     let _ = stdout.write_all(s.as_bytes()).and_then(|_| stdout.flush());
 }
 
+/// Sends a PNG to a Kitty/Ghostty terminal: by file path locally, or chunked inline over SSH.
+fn kitty_send(png: &str, c: u16, r: u16, tmux: bool) {
+    let id = image_id();
+    if std::env::var_os("SSH_CONNECTION").is_none() && std::env::var_os("SSH_TTY").is_none() {
+        emit(&kitty(&format!("a=T,U=1,f=100,t=f,i={id},q=2,c={c},r={r}"), &base64(png.as_bytes()), tmux));
+        return;
+    }
+    let Ok(bytes) = std::fs::read(png) else { return };
+    let b64 = base64(&bytes);
+    let chunks: Vec<&[u8]> = b64.as_bytes().chunks(4096).collect();
+    let mut out = String::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let more = usize::from(i + 1 < chunks.len());
+        let ctrl = if i == 0 {
+            format!("a=T,U=1,f=100,t=d,i={id},q=2,c={c},r={r},m={more}")
+        } else {
+            format!("m={more}")
+        };
+        out.push_str(&kitty(&ctrl, &String::from_utf8_lossy(chunk), tmux));
+    }
+    emit(&out);
+}
+
 /// Image ids are global to the terminal, so derive ours from the pid (24 bits, sent as the placeholder's RGB color).
 fn image_id() -> u32 {
     std::process::id() & 0xFF_FFFF | 1
 }
 
-/// Row numbers for kitty Unicode placeholders (the first 100 of kitty's rowcolumn-diacritics.txt).
-const ROW_DIACRITICS: &str = "\u{0305}\u{030D}\u{030E}\u{0310}\u{0312}\u{033D}\u{033E}\u{033F}\u{0346}\u{034A}\u{034B}\u{034C}\u{0350}\u{0351}\u{0352}\u{0357}\u{035B}\u{0363}\u{0364}\u{0365}\u{0366}\u{0367}\u{0368}\u{0369}\u{036A}\u{036B}\u{036C}\u{036D}\u{036E}\u{036F}\u{0483}\u{0484}\u{0485}\u{0486}\u{0487}\u{0592}\u{0593}\u{0594}\u{0595}\u{0597}\u{0598}\u{0599}\u{059C}\u{059D}\u{059E}\u{059F}\u{05A0}\u{05A1}\u{05A8}\u{05A9}\u{05AB}\u{05AC}\u{05AF}\u{05C4}\u{0610}\u{0611}\u{0612}\u{0613}\u{0614}\u{0615}\u{0616}\u{0617}\u{0657}\u{0658}\u{0659}\u{065A}\u{065B}\u{065D}\u{065E}\u{06D6}\u{06D7}\u{06D8}\u{06D9}\u{06DA}\u{06DB}\u{06DC}\u{06DF}\u{06E0}\u{06E1}\u{06E2}\u{06E4}\u{06E7}\u{06E8}\u{06EB}\u{06EC}\u{0730}\u{0732}\u{0733}\u{0735}\u{0736}\u{073A}\u{073D}\u{073F}\u{0740}\u{0741}\u{0743}\u{0745}\u{0747}\u{0749}\u{074A}";
+/// Row/column numbers for kitty Unicode placeholders (kitty's rowcolumn-diacritics.txt).
+const DIACRITICS: &str = "\u{0305}\u{030D}\u{030E}\u{0310}\u{0312}\u{033D}\u{033E}\u{033F}\u{0346}\u{034A}\u{034B}\u{034C}\u{0350}\u{0351}\u{0352}\u{0357}\u{035B}\u{0363}\u{0364}\u{0365}\u{0366}\u{0367}\u{0368}\u{0369}\u{036A}\u{036B}\u{036C}\u{036D}\u{036E}\u{036F}\u{0483}\u{0484}\u{0485}\u{0486}\u{0487}\u{0592}\u{0593}\u{0594}\u{0595}\u{0597}\u{0598}\u{0599}\u{059C}\u{059D}\u{059E}\u{059F}\u{05A0}\u{05A1}\u{05A8}\u{05A9}\u{05AB}\u{05AC}\u{05AF}\u{05C4}\u{0610}\u{0611}\u{0612}\u{0613}\u{0614}\u{0615}\u{0616}\u{0617}\u{0657}\u{0658}\u{0659}\u{065A}\u{065B}\u{065D}\u{065E}\u{06D6}\u{06D7}\u{06D8}\u{06D9}\u{06DA}\u{06DB}\u{06DC}\u{06DF}\u{06E0}\u{06E1}\u{06E2}\u{06E4}\u{06E7}\u{06E8}\u{06EB}\u{06EC}\u{0730}\u{0732}\u{0733}\u{0735}\u{0736}\u{073A}\u{073D}\u{073F}\u{0740}\u{0741}\u{0743}\u{0745}\u{0747}\u{0749}\u{074A}\u{07EB}\u{07EC}\u{07ED}\u{07EE}\u{07EF}\u{07F0}\u{07F1}\u{07F3}\u{0816}\u{0817}\u{0818}\u{0819}\u{081B}\u{081C}\u{081D}\u{081E}\u{081F}\u{0820}\u{0821}\u{0822}\u{0823}\u{0825}\u{0826}\u{0827}\u{0829}\u{082A}\u{082B}\u{082C}\u{082D}\u{0951}\u{0953}\u{0954}\u{0F82}\u{0F83}\u{0F86}\u{0F87}\u{135D}\u{135E}\u{135F}\u{17DD}\u{193A}\u{1A17}\u{1A75}\u{1A76}\u{1A77}\u{1A78}\u{1A79}\u{1A7A}\u{1A7B}\u{1A7C}\u{1B6B}\u{1B6D}\u{1B6E}\u{1B6F}\u{1B70}\u{1B71}\u{1B72}\u{1B73}\u{1CD0}\u{1CD1}\u{1CD2}\u{1CDA}\u{1CDB}\u{1CE0}\u{1DC0}\u{1DC1}\u{1DC3}\u{1DC4}\u{1DC5}\u{1DC6}\u{1DC7}\u{1DC8}\u{1DC9}\u{1DCB}\u{1DCC}\u{1DD1}\u{1DD2}\u{1DD3}\u{1DD4}\u{1DD5}\u{1DD6}\u{1DD7}\u{1DD8}\u{1DD9}\u{1DDA}\u{1DDB}\u{1DDC}\u{1DDD}\u{1DDE}\u{1DDF}\u{1DE0}\u{1DE1}\u{1DE2}\u{1DE3}\u{1DE4}\u{1DE5}\u{1DE6}\u{1DFE}\u{20D0}\u{20D1}\u{20D4}\u{20D5}\u{20D6}\u{20D7}\u{20DB}\u{20DC}\u{20E1}\u{20E7}\u{20E9}\u{20F0}\u{2CEF}\u{2CF0}\u{2CF1}\u{2DE0}\u{2DE1}\u{2DE2}\u{2DE3}\u{2DE4}\u{2DE5}\u{2DE6}\u{2DE7}\u{2DE8}\u{2DE9}\u{2DEA}\u{2DEB}\u{2DEC}\u{2DED}\u{2DEE}\u{2DEF}\u{2DF0}\u{2DF1}\u{2DF2}\u{2DF3}\u{2DF4}\u{2DF5}\u{2DF6}\u{2DF7}\u{2DF8}\u{2DF9}\u{2DFA}\u{2DFB}\u{2DFC}\u{2DFD}\u{2DFE}\u{2DFF}\u{A66F}\u{A67C}\u{A67D}\u{A6F0}\u{A6F1}\u{A8E0}\u{A8E1}\u{A8E2}\u{A8E3}\u{A8E4}\u{A8E5}\u{A8E6}\u{A8E7}\u{A8E8}\u{A8E9}\u{A8EA}\u{A8EB}\u{A8EC}\u{A8ED}\u{A8EE}\u{A8EF}\u{A8F0}\u{A8F1}\u{AAB0}\u{AAB2}\u{AAB3}\u{AAB7}\u{AAB8}\u{AABE}\u{AABF}\u{AAC1}\u{FE20}\u{FE21}\u{FE22}\u{FE23}\u{FE24}\u{FE25}\u{FE26}\u{10A0F}\u{10A38}\u{1D185}\u{1D186}\u{1D187}\u{1D188}\u{1D189}\u{1D1AA}\u{1D1AB}\u{1D1AC}\u{1D1AD}\u{1D242}\u{1D243}\u{1D244}";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Graphics {
@@ -1923,10 +2156,42 @@ fn detect_graphics() -> Graphics {
     Graphics::None
 }
 
-/// Where scans go unless the settings say otherwise: ~/Documents, or ~ without one.
+/// Where scans go unless the settings say otherwise: XDG Documents, ~/Documents, or ~ without one.
 fn default_scan_folder() -> String {
-    let docs = std::env::home_dir().is_some_and(|h| h.join("Documents").is_dir());
-    if docs { "~/Documents".into() } else { "~".into() }
+    if let Some(dir) = std::env::var_os("XDG_DOCUMENTS_DIR").map(std::path::PathBuf::from).filter(|p| p.is_dir()) {
+        return tilde(&dir.to_string_lossy());
+    }
+    if let Some(home) = std::env::home_dir() {
+        let cfg = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"))
+            .join("user-dirs.dirs");
+        if let Ok(text) = std::fs::read_to_string(cfg)
+            && let Some(dir) = parse_xdg_documents(&text, &home).filter(|p| p.is_dir())
+        {
+            return tilde(&dir.to_string_lossy());
+        }
+        if home.join("Documents").is_dir() {
+            return "~/Documents".into();
+        }
+    }
+    "~".into()
+}
+
+fn parse_xdg_documents(text: &str, home: &std::path::Path) -> Option<std::path::PathBuf> {
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("XDG_DOCUMENTS_DIR=") {
+            let val = val.trim().trim_matches('"');
+            if let Some(rest) = val.strip_prefix("$HOME/").or_else(|| val.strip_prefix("${HOME}/")) {
+                return Some(home.join(rest));
+            }
+            if !val.is_empty() && !val.starts_with('$') {
+                return Some(val.into());
+            }
+        }
+    }
+    None
 }
 
 /// `~/Documents/scan-2026-09-26_154200`, in the folder from the settings when there is one.
@@ -1968,16 +2233,21 @@ fn render_view(k: &ViewKey) -> Result<PrintView, String> {
         .iter()
         .map(|n| {
             let png = dir.join(format!("page-{n}.png")).to_string_lossy().into_owned();
-            render_page(&pdf, *n, &png).map(|_| png)
+            if !fresh(&pdf, std::path::Path::new(&png)) {
+                render_page(&pdf, *n, &png)?;
+            }
+            Ok(png)
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<String>, String>>()?;
     let (png, title) = if k.per_sheet == 1 {
         let title = fill(t().preview_page, &[("n", &sheets[idx][0]), ("i", &(idx + 1)), ("count", &sheets.len()), ("scale", &k.scale)]);
         (pngs[0].clone(), title)
     } else {
         // named by its pages, so the terminal is sent the new image when they change
         let png = dir.join(format!("sheet-{}-{}-{}.png", k.paper, k.per_sheet, join(sheets[idx]))).to_string_lossy().into_owned();
-        sheet_png(&pngs, k.paper, k.per_sheet, &png)?;
+        if !fresh(&pdf, std::path::Path::new(&png)) {
+            sheet_png(&pngs, k.paper, k.per_sheet, &png)?;
+        }
         let title = fill(t().preview_sheet, &[("i", &(idx + 1)), ("count", &sheets.len()), ("pages", &join(sheets[idx])), ("scale", &k.scale)]);
         (png, title)
     };
@@ -2006,7 +2276,7 @@ fn expand_home(p: &str) -> String {
     }
 }
 
-fn draw(f: &mut Frame, app: &App) {
+fn draw(f: &mut Frame, app: &mut App) {
     if let (Some(bg), Some(fg)) = (theme().bg, theme().fg) {
         f.render_widget(Block::default().style(Style::new().bg(bg).fg(fg)), f.area());
     }
@@ -2021,7 +2291,7 @@ fn draw(f: &mut Frame, app: &App) {
         Span::styled(format!(" {name} "), if on { Style::new().fg(WHITE).bg(ACCENT).bold() } else { Style::new().fg(theme().dim) })
     };
     let demo = if app.dummy {
-        Span::styled(format!("  DEMO · {}", demo_text("no device output", "sin salida a impresoras")), Style::new().fg(YELLOW).bold())
+        Span::styled(format!("  {}", extra().demo_banner), Style::new().fg(YELLOW).bold())
     } else {
         Span::raw("")
     };
@@ -2033,15 +2303,17 @@ fn draw(f: &mut Frame, app: &App) {
     draw_stage(f, app, status);
 
     let t = t();
+    let ex = extra();
     let keys: &[(&str, &str)] = match app.mode {
         Mode::Insert => &[("Esc", t.k_done), ("Enter", t.k_done)],
         Mode::Address(_) => &[("Enter", t.k_add), ("Esc", t.k_cancel)],
+        Mode::Doctor(_) => &[("Esc", t.k_done)],
         _ if app.tab == Tab::Settings && app.sel == FOLDER => &[("j/k", t.k_move), ("i", t.k_edit_text), ("Tab", t.k_print_scan), ("q", t.k_quit)],
         _ if app.tab == Tab::Settings => &[("j/k", t.k_move), ("h/l", t.k_change), ("Tab", t.k_print_scan), ("q", t.k_quit)],
         _ if app.sel == PAGE && app.tab == Tab::Scan => &[("H/L", t.k_page), ("</>", t.k_move), ("r/R", t.k_rotate), ("f", t.k_filter), ("x", t.k_keep), ("s", t.k_retake), ("dd", t.k_delete)],
         _ if app.tab == Tab::Scan && !app.scans.is_empty() => &[("j/k", t.k_move), ("h/l", t.k_change), ("H/L", t.k_page), ("Enter", t.k_select), ("Tab", t.k_print_scan), ("q", t.k_quit)],
-        _ if app.sel == PAGES && app.tab == Tab::Print => &[("j/k", t.k_move), ("Enter", t.k_pick_pages), ("i", t.k_type_range), ("q", t.k_quit)],
-        _ if app.tab == Tab::Print => &[("j/k", t.k_move), ("h/l", t.k_change), ("H/L", t.k_preview_page), ("i", t.k_edit_text), ("Enter", t.k_select), ("Tab", t.k_print_scan), ("q", t.k_quit)],
+        _ if app.sel == PAGES && app.tab == Tab::Print => &[("j/k", t.k_move), ("Enter", t.k_pick_pages), ("i", t.k_type_range), ("?", ex.k_doctor), ("q", t.k_quit)],
+        _ if app.tab == Tab::Print => &[("j/k", t.k_move), ("h/l", t.k_change), ("H/L", t.k_preview_page), ("i", t.k_edit_text), ("Enter", t.k_select), ("?", ex.k_doctor), ("Tab", t.k_print_scan), ("q", t.k_quit)],
         _ => &[("j/k", t.k_move), ("h/l", t.k_change), ("i", t.k_edit_text), ("Enter", t.k_select), ("Tab", t.k_print_scan), ("q", t.k_quit)],
     };
     let chips: Vec<Span> = keys
@@ -2061,12 +2333,16 @@ fn draw(f: &mut Frame, app: &App) {
     ]);
     f.render_widget(Paragraph::new(build_info).alignment(Alignment::Right), build_area);
     let tick = app.started.elapsed().as_millis() as usize;
+    let status_text = app.status.clone();
+    let cursor = app.cursor;
 
-    match &app.mode {
+    match &mut app.mode {
         Mode::Main | Mode::Insert => {}
         Mode::Address(addr) => {
             let area = popup(f, 76, 4);
-            let text = vec![Line::from(format!(" {}: {addr}_", t.address)), Line::from(format!(" {}", t.address_eg)).style(Style::new().add_modifier(Modifier::DIM))];
+            let mut line = vec![Span::raw(format!(" {}: ", t.address))];
+            line.extend(cursor_spans(addr, cursor, Style::new()));
+            let text = vec![Line::from(line), Line::from(format!(" {}", t.address_eg)).style(Style::new().add_modifier(Modifier::DIM))];
             f.render_widget(Paragraph::new(text).block(panel(format!(" {} ", t.add_by_address)).border_style(Style::new().fg(ACCENT))), area);
         }
         Mode::Pick(found, state) => {
@@ -2075,7 +2351,7 @@ fn draw(f: &mut Frame, app: &App) {
             let list = List::new(items)
                 .block(panel(format!(" {} ", t.add_title)).border_style(Style::new().fg(ACCENT)))
                 .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-            f.render_stateful_widget(list, area, &mut state.clone());
+            f.render_stateful_widget(list, area, state);
         }
         Mode::Pages(on, state) => {
             let area = popup(f, 76, on.len() as u16 + 2);
@@ -2085,7 +2361,7 @@ fn draw(f: &mut Frame, app: &App) {
             let list = List::new(items)
                 .block(panel(format!(" {} ", fill(t.pages_title, &[("n", &n), ("all", &on.len())]))).border_style(Style::new().fg(ACCENT)))
                 .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-            f.render_stateful_widget(list, area, &mut state.clone());
+            f.render_stateful_widget(list, area, state);
         }
         Mode::Queue(jobs, state) => {
             let area = popup(f, 90, jobs.len().max(1) as u16 + 2);
@@ -2095,14 +2371,13 @@ fn draw(f: &mut Frame, app: &App) {
                 jobs.iter().map(|(id, desc)| ListItem::new(format!(" #{id}  {desc}"))).collect()
             };
             let list = List::new(items)
-                .block(panel(format!(" {} ", t.queue_title)).border_style(Style::new().fg(ACCENT)).title_bottom(format!(" {} ", app.status)))
+                .block(panel(format!(" {} ", t.queue_title)).border_style(Style::new().fg(ACCENT)).title_bottom(format!(" {status_text} ")))
                 .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
             // the list shrinks as jobs finish, keep the cursor on a row
-            let mut state = *state;
             if state.selected().is_some_and(|i| i >= jobs.len()) {
                 state.select(jobs.len().checked_sub(1));
             }
-            f.render_stateful_widget(list, area, &mut state);
+            f.render_stateful_widget(list, area, state);
         }
         Mode::Flip { job, .. } => {
             if job.is_none() {
@@ -2110,13 +2385,20 @@ fn draw(f: &mut Frame, app: &App) {
                 let block = panel(format!(" {} ", t.duplex_title)).border_style(Style::new().fg(ACCENT));
                 let [text, anim] = Layout::horizontal([Constraint::Min(30), Constraint::Length(31)]).areas(block.inner(area));
                 f.render_widget(block, area);
-                f.render_widget(Paragraph::new(app.status.as_str()).wrap(Wrap { trim: false }), text);
+                f.render_widget(Paragraph::new(status_text.as_str()).wrap(Wrap { trim: false }), text);
                 let (art, caption) = pet::flip(tick / 350);
                 let mut lines: Vec<Line> = art.into_iter().map(|l| l.centered()).collect();
                 lines.push(Line::default());
                 lines.extend(t.flip[caption].lines().map(|c| Line::from(c).centered()));
                 f.render_widget(Paragraph::new(lines), anim);
             }
+        }
+        Mode::Doctor(report) => {
+            let cols = f.area().width.saturating_sub(4).min(80).saturating_sub(4).max(1) as usize;
+            let rows = wrapped_rows(report, cols).max(3) as u16 + 2;
+            let area = popup(f, 80, rows);
+            let block = panel(format!(" {} ", ex.doctor_title)).border_style(Style::new().fg(ACCENT)).padding(Padding::horizontal(1));
+            f.render_widget(Paragraph::new(report.as_str()).wrap(Wrap { trim: false }).block(block), area);
         }
     }
 }
@@ -2186,7 +2468,7 @@ fn duplex_pads_odd_pages_so_all_sheets_reinsert() {
     let mut app = new_app(false, pdf7_str.clone(), true);
     app.printers = vec!["dummy-printer".into()];
     app.duplex = true;
-    let res = app.duplex(vec![pdf7_str], 0, String::new());
+    let res = app.duplex(vec![pdf7_str], 0, String::new(), true);
     assert!(res.is_ok());
 
     // Front job sent 4 sides
@@ -2220,7 +2502,7 @@ fn duplex_physics_3_pages() {
     let mut app = new_app(false, pdf.into(), true);
     app.printers = vec!["dummy-printer".into()];
     app.duplex = true;
-    let res = app.duplex(vec![pdf.into()], 0, String::new());
+    let res = app.duplex(vec![pdf.into()], 0, String::new(), true);
     assert!(res.is_ok());
 
     // Front job sent 2 sides (pages 1 and 3 on 2 sheets)
@@ -2244,6 +2526,116 @@ fn duplex_physics_3_pages() {
     assert!(res_back.is_ok());
     assert_eq!(app.dummy_jobs.len(), 2);
     assert_eq!(app.dummy_jobs[1].sides, 2);
+}
+
+#[test]
+fn multi_file_range_validated_before_any_job_sends() {
+    let dir = std::env::temp_dir().join(format!("printertui-batch-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("p.png").to_string_lossy().into_owned();
+    image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(50, 50, image::Luma([255])))
+        .save_with_format(&img, image::ImageFormat::Png)
+        .unwrap();
+    let pdf5 = dir.join("five.pdf");
+    let pdf2 = dir.join("two.pdf");
+    std::fs::write(&pdf5, images_to_pdf(&vec![img.clone(); 5], 100, &[]).unwrap()).unwrap();
+    std::fs::write(&pdf2, images_to_pdf(&vec![img; 2], 100, &[]).unwrap()).unwrap();
+
+    let mut app = new_app(false, String::new(), true);
+    app.pages = "1-4".into();
+    let res = app.print_pdfs(vec![pdf5.to_string_lossy().into_owned(), pdf2.to_string_lossy().into_owned()]);
+    assert!(res.is_err(), "Range 1-4 must fail because second PDF has only 2 pages");
+    assert!(app.dummy_jobs.is_empty(), "No job should be sent when a later file in the batch fails validation");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn cursor_editing_and_xdg_documents() {
+    let mut s = "hola/mundo.pdf".to_string();
+    let mut cur = s.len();
+    edit_text(&mut s, &mut cur, KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    assert_eq!(s, "hola/");
+    assert_eq!(cur, 5);
+    edit_text(&mut s, &mut cur, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    edit_text(&mut s, &mut cur, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+    assert_eq!(s, "holas/");
+    // Ctrl+C or Alt+X must not insert characters
+    edit_text(&mut s, &mut cur, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    edit_text(&mut s, &mut cur, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+    assert_eq!(s, "holas/");
+
+    let home = std::path::Path::new("/home/ana");
+    let cfg = "# user-dirs\nXDG_DOCUMENTS_DIR=\"$HOME/Documentos\"\n";
+    assert_eq!(parse_xdg_documents(cfg, home).unwrap(), home.join("Documentos"));
+}
+
+#[test]
+fn dummy_scan_and_copy_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("printertui-dummy-scan-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let flat = scan_pages("dummy", "Color", 150, "A4", "Flatbed", false, |i| dir.join(format!("flat-{i}")).to_string_lossy().into_owned()).unwrap();
+    assert_eq!(flat.len(), 1);
+    let adf = scan_pages("dummy", "Gray", 150, "Letter", "Feeder", true, |i| dir.join(format!("adf-{i}")).to_string_lossy().into_owned()).unwrap();
+    assert_eq!(adf.len(), 3);
+
+    let mut app = new_app(true, String::new(), true);
+    assert_eq!(app.scanners.as_ref().map(Vec::len), Some(1));
+    for p in &adf {
+        let thumb = thumbnail(p).unwrap();
+        app.scans.push(ScannedPage { orig: p.clone(), file: p.clone(), rot: 0, filter: 0, keep: true, thumb });
+    }
+    app.pages = "1".into(); // Print tab range must not truncate Scan tab photocopy
+    let copy_pdf = dir.join("copy.pdf");
+    std::fs::write(&copy_pdf, images_to_pdf(&adf, 150, &[]).unwrap()).unwrap();
+    app.send_pdfs(vec![copy_pdf.to_string_lossy().into_owned()], false).unwrap();
+    assert_eq!(app.dummy_jobs.len(), 1);
+    assert_eq!(app.dummy_jobs[0].sides, 3);
+
+    clean_scan_files(&flat);
+    clean_scan_files(&adf);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kitty_placeholders_stay_intact_around_flip_popup() {
+    let mut app = new_app(false, "doc.pdf".into(), true);
+    app.graphics = Graphics::Kitty(false);
+    app.view = Some((
+        ViewKey { file: "doc.pdf".into(), pages: String::new(), scale: 100, paper: "A4", per_sheet: 1, idx: 0 },
+        Ok(PrintView { png: "page-1.png".into(), thumb: (2, 2, vec![255; 4]), idx: 0, count: 2, title: "p1".into() }),
+    ));
+    app.mode = Mode::Flip {
+        job: None,
+        steps: "flip".into(),
+        back: (app.job("doc.pdf", Some("2".into()), false, true), 1),
+        files: vec![],
+        next: 0,
+        use_range: false,
+    };
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+    term.draw(|f| draw(f, &mut app)).unwrap();
+    app.popup_area.set(POPUP.get());
+    let buf = term.backend().buffer();
+    let preview = app.preview_area.get();
+    let popup = app.popup_area.get();
+    let dias: Vec<char> = DIACRITICS.chars().collect();
+    assert_eq!(dias.len(), 297);
+    assert!(popup.width > 0 && popup.height > 0);
+
+    // Every preview cell outside the centered popup must keep U+10EEEE with explicit row + col
+    // diacritics, while cells inside the popup are cleared/covered by it.
+    for row in 0..preview.height {
+        for col in 0..preview.width {
+            let (x, y) = (preview.x + col, preview.y + row);
+            if popup.contains((x, y).into()) {
+                assert!(!buf[(x, y)].symbol().contains('\u{10EEEE}'));
+            } else {
+                assert_eq!(buf[(x, y)].symbol(), format!("\u{10EEEE}{}{}", dias[row as usize], dias[col as usize]));
+            }
+        }
+    }
 }
 
 /// The character at a screen column of `s`, for mouse clicks.
@@ -2316,11 +2708,35 @@ fn form_row<'a>(app: &App, label: &'a str, i: usize) -> Line<'a> {
         let hop = on && matches!(app.act, Act::Hop(_)) && !app.act.done();
         let v = if hop { Style::new().fg(theme().hop).bold() } else if on { Style::new().bold() } else { Style::new() };
         spans.extend([Span::styled("‹ ", arrows), Span::styled(inner.to_string(), v), Span::styled(" ›", arrows)]);
+    } else if on && matches!(app.mode, Mode::Insert) {
+        spans.extend(cursor_spans(&value, app.cursor, Style::new().bold()));
     } else {
-        let cursor = if on && matches!(app.mode, Mode::Insert) { "_" } else { "" };
-        spans.push(Span::styled(format!("{value}{cursor}"), if on { Style::new().bold() } else { Style::new() }));
+        spans.push(Span::styled(value, if on { Style::new().bold() } else { Style::new() }));
     }
     Line::from(spans)
+}
+
+fn cursor_spans(s: &str, cursor: usize, base: Style) -> Vec<Span<'static>> {
+    let mut idx = cursor.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    let (before, rest) = s.split_at(idx);
+    let mut spans = Vec::new();
+    if !before.is_empty() {
+        spans.push(Span::styled(before.to_string(), base));
+    }
+    let mut chars = rest.chars();
+    if let Some(c) = chars.next() {
+        spans.push(Span::styled(c.to_string(), base.add_modifier(Modifier::REVERSED)));
+        let after = chars.as_str();
+        if !after.is_empty() {
+            spans.push(Span::styled(after.to_string(), base));
+        }
+    } else {
+        spans.push(Span::styled("_", base));
+    }
+    spans
 }
 
 /// The printer and what it says (the status, or a word about the selected row), and the ink tanks.
@@ -2409,17 +2825,17 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         return;
     }
     match app.graphics {
-        Graphics::Kitty(_) if app.popup_open() => {}
         Graphics::Kitty(_) => {
-            // placeholder cells: U+10EEEE, the row as a diacritic on the first cell (the terminal infers
-            // the columns), and the image id as the foreground color
-            let want = app.preview_png().map(|p| (p, inner.width, inner.height));
-            if want.is_some() && want == app.sent {
+            // Placeholder cells: U+10EEEE with explicit row + column diacritics on every cell
+            // so a centered popup covering the left side leaves exposed cells intact. Drawn
+            // before sync_image() flushes the transfer so there is no blank flicker frame.
+            if app.preview_png().is_some() && inner.width > 0 && inner.height > 0 {
                 let id = image_id();
                 let color = Color::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8);
-                for (row, diacritic) in (0..inner.height).zip(ROW_DIACRITICS.chars()) {
-                    for col in 0..inner.width {
-                        let symbol = if col == 0 { format!("\u{10EEEE}{diacritic}") } else { "\u{10EEEE}".into() };
+                let dias: Vec<char> = DIACRITICS.chars().collect();
+                for (row, &r_dia) in (0..inner.height).zip(&dias) {
+                    for (col, &c_dia) in (0..inner.width).zip(&dias) {
+                        let symbol = format!("\u{10EEEE}{r_dia}{c_dia}");
                         f.buffer_mut()[(inner.x + col, inner.y + row)].set_symbol(&symbol).set_fg(color);
                     }
                 }

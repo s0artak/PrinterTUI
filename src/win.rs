@@ -107,6 +107,43 @@ pub fn printers() -> Vec<String> {
     list
 }
 
+/// Checks whether the Windows Print Spooler service is stopped ("spooler-stopped").
+pub fn backend_problem() -> Option<&'static str> {
+    let (mut needed, mut count) = (0, 0);
+    let res = unsafe { EnumPrintersW(PRINTER_ENUM_LOCAL, PCWSTR::null(), 2, None, &mut needed, &mut count) };
+    if res.is_err() && needed == 0 { Some("spooler-stopped") } else { None }
+}
+
+/// Inspects USB PnP printers and mDNS IPP printers for the Printer Doctor popup.
+pub fn doctor_scan() -> crate::DoctorScan {
+    let prob = backend_problem();
+    if prob.is_some() {
+        return (prob, Vec::new(), Vec::new(), Vec::new());
+    }
+    let known = printers();
+    let mut usb = Vec::new();
+    let filter = wide("USBPRINT");
+    let flags = CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT;
+    let mut len = 0;
+    if unsafe { CM_Get_Device_ID_List_SizeW(&mut len, PCWSTR(filter.as_ptr()), flags) } == CR_SUCCESS && len > 0 {
+        let mut ids = vec![0u16; len as usize];
+        if unsafe { CM_Get_Device_ID_ListW(PCWSTR(filter.as_ptr()), &mut ids, flags) } == CR_SUCCESS {
+            for id in ids.split(|&c| c == 0).filter(|s| !s.is_empty()) {
+                let s = String::from_utf16_lossy(id);
+                // USBPRINT\<Model>\<Instance>
+                if let Some(model) = s.split('\\').nth(1)
+                    && !known.iter().any(|p| p.to_ascii_lowercase().contains(&model.to_ascii_lowercase()))
+                {
+                    usb.push(model.replace('_', " "));
+                }
+            }
+        }
+    }
+    usb.sort();
+    usb.dedup();
+    (None, usb, discover(), Vec::new())
+}
+
 /// The printer name, plus the network address for network printers.
 pub fn printer_labels(queues: &[String]) -> Vec<String> {
     let all = installed();
@@ -130,17 +167,17 @@ pub fn supports_duplex(printer: &str) -> bool {
 /// Hosts of the installed network printers, to try as eSCL scanners.
 pub fn printer_hosts() -> Vec<String> {
     let mut hosts: Vec<String> = installed().iter().filter_map(|(_, port, ..)| port_host(port)).collect();
-    hosts.extend(ipp_urls().iter().filter_map(|u| uri_host(u)).map(|(_, host)| host.to_string()));
+    hosts.extend(ipp_devices().iter().filter_map(|(_, _, u)| uri_host(u)).map(|(_, host)| host.to_string()));
     hosts.sort();
     hosts.dedup();
     hosts
 }
 
-/// URLs of the printers Windows added over IPP (Add-Printer -IppURL, or found on the network):
-/// their port is just "WSD-<id>", the URL is a property of their SWD\IPP\... device.
-fn ipp_urls() -> Vec<String> {
-    // the printer URI property, {A35996AB-11CF-4935-8B61-A6761081ECDF} 12 in Get-PnpDeviceProperty
+/// Printers Windows added over IPP (`Add-Printer -IppURL`, or found on the network) as
+/// `(device_id, friendly_name, ipp_url)`: their port is "WSD-<id>", the URL lives on their `SWD\IPP\...` node.
+fn ipp_devices() -> Vec<(String, String, String)> {
     const URI: DEVPROPKEY = DEVPROPKEY { fmtid: windows::core::GUID::from_u128(0xa35996ab_11cf_4935_8b61_a6761081ecdf), pid: 12 };
+    const NAME: DEVPROPKEY = DEVPROPKEY { fmtid: windows::core::GUID::from_u128(0xb725f130_47ef_101a_a5f1_02608c9eebac), pid: 10 };
     let filter = wide("SWD");
     let flags = CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT;
     let mut len = 0;
@@ -151,24 +188,45 @@ fn ipp_urls() -> Vec<String> {
     if unsafe { CM_Get_Device_ID_ListW(PCWSTR(filter.as_ptr()), &mut ids, flags) } != CR_SUCCESS {
         return Vec::new();
     }
+    let prop = |node: u32, key: &DEVPROPKEY| -> Option<String> {
+        let mut buf = [0u16; 512];
+        let mut size = (buf.len() * 2) as u32;
+        let mut kind = DEVPROPTYPE::default();
+        if unsafe { CM_Get_DevNode_PropertyW(node, key, &mut kind, Some(buf.as_mut_ptr().cast()), &mut size, 0) } != CR_SUCCESS {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..size as usize / 2]).trim_end_matches('\0').to_string())
+    };
     ids.split(|&c| c == 0)
         .filter(|id| String::from_utf16_lossy(id).to_ascii_uppercase().starts_with("SWD\\IPP\\"))
-        .filter_map(|id| {
-            let id: Vec<u16> = id.iter().copied().chain([0]).collect();
+        .filter_map(|raw| {
+            let dev_id = String::from_utf16_lossy(raw);
+            let id: Vec<u16> = raw.iter().copied().chain([0]).collect();
             let mut node = 0;
-            let mut buf = [0u16; 512];
-            let mut size = (buf.len() * 2) as u32;
-            let mut kind = DEVPROPTYPE::default();
-            unsafe {
-                if CM_Locate_DevNodeW(&mut node, PCWSTR(id.as_ptr()), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS
-                    || CM_Get_DevNode_PropertyW(node, &URI, &mut kind, Some(buf.as_mut_ptr().cast()), &mut size, 0) != CR_SUCCESS
-                {
-                    return None;
-                }
+            if unsafe { CM_Locate_DevNodeW(&mut node, PCWSTR(id.as_ptr()), CM_LOCATE_DEVNODE_NORMAL) } != CR_SUCCESS {
+                return None;
             }
-            Some(String::from_utf16_lossy(&buf[..size as usize / 2]).trim_end_matches('\0').to_string())
+            let url = prop(node, &URI)?;
+            let name = prop(node, &NAME).unwrap_or_default();
+            Some((dev_id, name, url))
         })
         .collect()
+}
+
+/// Finds the IPP URL for an installed Windows queue (either from its port or its `SWD\IPP` device).
+fn ipp_url_for(queue: &str, port: &str) -> Option<String> {
+    if let Some(host) = port_host(port) {
+        return Some(format!("ipp://{host}/ipp/print"));
+    }
+    let devs = ipp_devices();
+    let wsd_id = port.strip_prefix("WSD-").and_then(|s| s.split('.').next()).unwrap_or_default().to_ascii_lowercase();
+    devs.iter()
+        .find(|(dev_id, name, _)| {
+            (!name.is_empty() && name.eq_ignore_ascii_case(queue))
+                || (!wsd_id.is_empty() && dev_id.to_ascii_lowercase().contains(&wsd_id))
+        })
+        .or_else(|| (devs.len() == 1 && port.starts_with("WSD-")).then(|| &devs[0]))
+        .map(|(_, _, url)| url.clone())
 }
 
 /// pdfium.dll, embedded at build time (see build.rs) and unpacked next to the settings on first use.
@@ -188,9 +246,9 @@ fn pdfium() -> Result<&'static Pdfium, String> {
     Ok(PDFIUM.get_or_init(|| Pdfium::new(bindings)))
 }
 
-/// Printer settings for the job: paper, color, and the sides (the printer's own duplexer, or
+/// Printer settings for the job: paper, orientation, color, and the sides (the printer's own duplexer, or
 /// one side at a time).
-fn devmode(printer: &str, job: &Job) -> Result<Vec<u64>, String> {
+fn devmode(printer: &str, job: &Job, landscape: bool) -> Result<Vec<u64>, String> {
     let name = wide(printer);
     with_printer(printer, |h| unsafe {
         let size = DocumentPropertiesW(None, h, PCWSTR(name.as_ptr()), None, None, 0);
@@ -208,8 +266,12 @@ fn devmode(printer: &str, job: &Job) -> Result<Vec<u64>, String> {
             _ => DMPAPER_A4,
         };
         (*dm).Anonymous1.Anonymous1.dmPaperSize = paper as i16;
-        (*dm).dmDuplex = if job.sides { DMDUP_VERTICAL } else { DMDUP_SIMPLEX };
+        (*dm).dmDuplex = if !job.sides { DMDUP_SIMPLEX } else if landscape { DMDUP_HORIZONTAL } else { DMDUP_VERTICAL };
         (*dm).dmFields |= DM_PAPERSIZE | DM_DUPLEX;
+        if landscape {
+            (*dm).Anonymous1.Anonymous1.dmOrientation = DMORIENT_LANDSCAPE as i16;
+            (*dm).dmFields |= DM_ORIENTATION;
+        }
         if !job.color {
             (*dm).dmColor = DMCOLOR_MONOCHROME;
             (*dm).dmFields |= DM_COLOR;
@@ -243,7 +305,9 @@ fn print_pdf(job: &Job, output: Option<&str>) -> Result<u32, String> {
         sheets.iter().flat_map(|s| std::iter::repeat_n(*s, copies)).collect()
     };
 
-    let dm = devmode(&job.printer, job)?;
+    let landscape = job.per_sheet == 1
+        && pages.first().and_then(|&n| doc.pages().get((n - 1) as PdfPageIndex).ok()).is_some_and(|p| p.is_landscape());
+    let dm = devmode(&job.printer, job, landscape)?;
     let name = wide(&job.printer);
     let hdc = unsafe { CreateDCW(windows::core::w!("WINSPOOL"), PCWSTR(name.as_ptr()), PCWSTR::null(), Some(dm.as_ptr() as *const DEVMODEW)) };
     if hdc.is_invalid() {
@@ -272,7 +336,7 @@ fn print_pdf(job: &Job, output: Option<&str>) -> Result<u32, String> {
     res
 }
 
-/// One sheet side: its pages in a grid, each rendered at up to 300 dpi and scaled to its cell.
+/// One sheet side: its pages in a grid, each rendered at up to 300 dpi and scaled proportionally to its cell.
 fn draw_sheet(hdc: HDC, doc: &PdfDocument, sheet: &[u32], job: &Job) -> Result<(), String> {
     let cap = |i| unsafe { GetDeviceCaps(Some(hdc), i) };
     let (width, height, dpi) = (cap(HORZRES), cap(VERTRES), cap(LOGPIXELSX).max(72));
@@ -287,9 +351,11 @@ fn draw_sheet(hdc: HDC, doc: &PdfDocument, sheet: &[u32], job: &Job) -> Result<(
     unsafe { SetStretchBltMode(hdc, HALFTONE) };
     for (k, &n) in sheet.iter().enumerate() {
         let page = doc.pages().get((n - 1) as PdfPageIndex).map_err(|e| format!("page {n}: {e}"))?;
+        let (pw, ph) = (page.width().value, page.height().value);
+        let fit = ((cell_w as f32 * scale) / pw.max(1.0)).min((cell_h as f32 * scale) / ph.max(1.0));
+        let (tw, th) = ((pw * fit).round().max(1.0) as Pixels, (ph * fit).round().max(1.0) as Pixels);
         let config = PdfRenderConfig::new()
-            .set_maximum_width((cell_w as f32 * scale) as Pixels)
-            .set_maximum_height((cell_h as f32 * scale) as Pixels)
+            .set_fixed_size(tw, th)
             .set_format(PdfBitmapFormat::BGRA)
             .use_grayscale_rendering(!job.color)
             .render_form_data(true);
@@ -331,14 +397,14 @@ const PROBLEMS: [(u32, &str); 8] = [
     (PRINTER_STATUS_OUTPUT_BIN_FULL, "output-area-full"),
 ];
 
-/// The printer's problems from the spooler, and its ink asked over IPP when it is on the network.
-// ponytail: printers added by URL only (a "WSD-..." port) have no address here, so no ink
+/// The printer's problems from the spooler, and its ink asked over IPP when it is on the network
+/// (including IPP printers added via Windows' `WSD-...` port).
 pub fn printer_state(queue: &str) -> PrinterState {
     let Some((_, port, _, status)) = installed().into_iter().find(|(name, ..)| name == queue) else {
         return PrinterState::default();
     };
-    let mut state = port_host(&port)
-        .and_then(|host| ipp_attributes(&format!("ipp://{host}/ipp/print"), None, &STATE_ATTRIBUTES).ok())
+    let mut state = ipp_url_for(queue, &port)
+        .and_then(|url| ipp_attributes(&url, None, &STATE_ATTRIBUTES).ok())
         .map_or_else(PrinterState::default, |attrs| {
             let mut state = PrinterState::from(&attrs);
             state.ink_source = InkSource::Ipp;
@@ -387,10 +453,27 @@ pub fn job_active(id: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// A job's state as IPP numbers it (5 printing, 9 done) and the sheet sides printed so far.
-// ponytail: no page count yet, JOB_INFO_1.PagesPrinted has it; a cancelled job counts as done
+/// A job's state as IPP numbers it (5 printing, 7 cancelled, 8 error, 9 done) and pages printed so far.
 pub fn job_progress(id: &str) -> (i32, u32) {
-    (if job_active(id) { 5 } else { 9 }, 0)
+    let Some((id, printer)) = printer_of(id) else { return (9, 0) };
+    with_printer(&printer, |h| {
+        let (buf, _) = enum_buffer(|b, need, _| unsafe { GetJobW(h, id, 1, b, need).as_bool() });
+        if buf.is_empty() {
+            return (9, 0);
+        }
+        let j = unsafe { &*(buf.as_ptr() as *const JOB_INFO_1W) };
+        let state = if j.Status & (JOB_STATUS_DELETING | JOB_STATUS_DELETED) != 0 {
+            7
+        } else if j.Status & JOB_STATUS_ERROR != 0 {
+            8
+        } else if j.Status & (JOB_STATUS_PRINTED | JOB_STATUS_COMPLETE) != 0 {
+            9
+        } else {
+            5
+        };
+        (state, j.PagesPrinted)
+    })
+    .unwrap_or((9, 0))
 }
 
 /// Unfinished jobs on all printers as (job id, "file  (owner, printer, pages)") for the queue popup.
@@ -486,6 +569,7 @@ pub fn scan_local(device: &str, mode: &str, dpi: u32, out: &str, source: &str) -
             let feeder = scanner.FeederConfiguration()?;
             feeder.SetColorMode(if mode == "Gray" { ImageScannerColorMode::Grayscale } else { ImageScannerColorMode::Color })?;
             feeder.SetDesiredResolution(ImageScannerResolution { DpiX: dpi as f32, DpiY: dpi as f32 })?;
+            feeder.SetMaxNumberOfPages(1)?;
             let format = if feeder.IsFormatSupported(ImageScannerFormat::Png)? { ImageScannerFormat::Png } else { ImageScannerFormat::Jpeg };
             feeder.SetFormat(format)?;
             scanner.ScanFilesToFolderAsync(ImageScannerScanSource::Feeder, &folder)?.join()?
@@ -541,12 +625,7 @@ pub fn ocr_pdf(pages: &[String], out: &str, dpi: u32, _lang: &str) -> Result<Vec
 }
 
 fn ocr_page(engine: &OcrEngine, page: &str) -> Result<Vec<Word>, String> {
-    let img = image::ImageReader::open(page)
-        .and_then(|r| r.with_guessed_format())
-        .map_err(|e| e.to_string())?
-        .decode()
-        .map_err(|e| e.to_string())?
-        .to_luma8();
+    let img = open(page)?.to_luma8();
     // the engine has a size limit; shrink big scans and scale the boxes back
     let max = OcrEngine::MaxImageDimension().unwrap_or(10000).max(1);
     let scale = (max as f32 / img.width().max(img.height()) as f32).min(1.0);

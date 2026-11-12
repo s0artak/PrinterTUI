@@ -13,10 +13,13 @@ pub use win::*;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{ColorType, DynamicImage, GrayImage, ImageFormat, Luma};
-use pdf_writer::types::TextRenderingMode;
+use pdf_writer::types::{CidFontType, FontFlags, SystemInfo, TextRenderingMode, UnicodeCmap};
 use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref, Str};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+
+pub type Thumb = (usize, usize, Vec<u8>);
+pub type DoctorScan = (Option<&'static str>, Vec<String>, Vec<(String, String)>, Vec<String>);
 
 /// Running child pids, and CUPS job ids / eSCL job urls this process started; `stop_all` ends them.
 static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
@@ -33,13 +36,13 @@ pub const SCALES: [u32; 9] = [25, 50, 75, 90, 100, 110, 125, 150, 200];
 pub const QUALITIES: [&str; 3] = ["draft", "normal", "high"];
 
 fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
-    let child = Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{cmd}: {e}"))?;
+    let ctype = std::env::var_os("LC_ALL").or_else(|| std::env::var_os("LC_CTYPE")).or_else(|| std::env::var_os("LANG"));
+    let mut command = Command::new(cmd);
+    command.args(args).env_remove("LC_ALL").env("LC_MESSAGES", "C").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(ct) = ctype {
+        command.env("LC_CTYPE", ct);
+    }
+    let child = command.spawn().map_err(|e| format!("{cmd}: {e}"))?;
     let pid = child.id();
     CHILDREN.lock().unwrap().push(pid);
     let out = child.wait_with_output();
@@ -48,7 +51,8 @@ fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if err.is_empty() { String::from_utf8_lossy(&out.stdout).trim().to_string() } else { err })
     }
 }
 
@@ -69,7 +73,7 @@ pub fn work_dir(file: &str) -> Result<std::path::PathBuf, String> {
 }
 
 /// True when `out` was written after `src` last changed, so it can be reused.
-fn fresh(src: &str, out: &std::path::Path) -> bool {
+pub fn fresh(src: &str, out: &std::path::Path) -> bool {
     let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified());
     matches!((modified(src.as_ref()), modified(out)), (Ok(s), Ok(o)) if o >= s)
 }
@@ -121,6 +125,11 @@ pub fn to_pdf(file: &str) -> Result<String, String> {
 // ponytail: links and form fields (annotations) keep their size and place; scale them too if a form ever prints wrong
 pub fn scale_pdf(file: &str, percent: u32) -> Result<String, String> {
     use lopdf::{Dictionary, Object, Stream};
+    let out = work_dir(file)?.join(format!("scaled-{percent}.pdf"));
+    let out_str = out.to_string_lossy().into_owned();
+    if fresh(file, &out) && page_count(&out_str).is_some() {
+        return Ok(out_str);
+    }
     let err = |e: lopdf::Error| format!("{file}: {e}");
     let mut doc = lopdf::Document::load(file).map_err(err)?;
     let s = percent as f64 / 100.0;
@@ -135,11 +144,10 @@ pub fn scale_pdf(file: &str, percent: u32) -> Result<String, String> {
         contents.push(post.into());
         doc.get_dictionary_mut(id).map_err(err)?.set("Contents", contents);
     }
-    let out = work_dir(file)?.join(format!("scaled-{percent}.pdf"));
     let mut data = Vec::new();
     doc.save_to(&mut data).map_err(|e| format!("{file}: {e}"))?;
     write_atomic(&out, &data)?;
-    Ok(out.to_string_lossy().into_owned())
+    Ok(out_str)
 }
 
 /// Appends a blank page at the end of a PDF (with the same dimensions as the last page),
@@ -208,7 +216,7 @@ pub fn prepare_duplex(pdf: &str, total: u32, pages: &[u32], per_sheet: usize) ->
     let per_sheet = per_sheet.max(1);
     let mut sides: Vec<Vec<u32>> = pages.chunks(per_sheet).map(|c| c.to_vec()).collect();
     let mut out_pdf = pdf.to_string();
-    if sides.len() > 1 && sides.len() % 2 != 0 {
+    if sides.len() > 1 && !sides.len().is_multiple_of(2) {
         out_pdf = append_blank_page(pdf)?;
         let blank_page = total + 1;
         sides.push(vec![blank_page]);
@@ -263,7 +271,11 @@ pub fn printable(file: &str, percent: u32, paper: &str) -> Result<String, String
         photo_pdf(&jpeg?, paper)?
     } else if let Some(text) = plain_text(file) {
         // letters the built-in font has not got print through LibreOffice when it is there
-        if text.chars().all(|c| (c as u32) < 256 || c == '\n') { text_pdf(file, &text, paper)? } else { to_pdf(file).or_else(|_| text_pdf(file, &text, paper))? }
+        if text.chars().all(|c| win_ansi_byte(c).is_some() || matches!(c, '\n' | '\r' | '\t')) {
+            text_pdf(file, &text, paper)?
+        } else {
+            to_pdf(file).or_else(|_| text_pdf(file, &text, paper))?
+        }
     } else {
         to_pdf(file)?
     };
@@ -281,6 +293,11 @@ fn plain_text(file: &str) -> Option<String> {
 
 /// Plain text on pages of the paper in Courier 10 pt, long lines wrapped.
 fn text_pdf(file: &str, text: &str, paper: &str) -> Result<String, String> {
+    let out = work_dir(file)?.join(format!("text-{paper}.pdf"));
+    let out_str = out.to_string_lossy().into_owned();
+    if fresh(file, &out) && page_count(&out_str).is_some() {
+        return Ok(out_str);
+    }
     const MARGIN: f32 = 56.0;
     const SIZE: f32 = 10.0;
     const LEADING: f32 = 12.0;
@@ -319,9 +336,8 @@ fn text_pdf(file: &str, text: &str, paper: &str) -> Result<String, String> {
     pdf.type1_font(font).base_font(Name(b"Courier")).encoding_predefined(Name(b"WinAnsiEncoding"));
     pdf.catalog(catalog).pages(tree);
     pdf.pages(tree).count(kids.len() as i32).kids(kids);
-    let out = work_dir(file)?.join(format!("text-{paper}.pdf"));
     write_atomic(&out, &pdf.finish())?;
-    Ok(out.to_string_lossy().into_owned())
+    Ok(out_str)
 }
 
 /// Width and height of an image, whatever its file name.
@@ -456,8 +472,9 @@ pub fn parse_config(text: &str) -> Vec<(&str, &str)> {
     text.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect()
 }
 
-/// On quit: cancels this session's unfinished print and scan jobs and kills running tools
-/// (their children first, e.g. LibreOffice's soffice.bin, so none are left orphaned).
+/// On quit: cancels this session's unfinished print and scan jobs, kills running tools
+/// (their children first, e.g. LibreOffice's soffice.bin, so none are left orphaned),
+/// and prunes old temporary files.
 pub fn stop_all() {
     let pids = CHILDREN.lock().unwrap().clone();
     if !pids.is_empty() {
@@ -471,6 +488,41 @@ pub fn stop_all() {
     for job in scans {
         let _ = minreq::delete(job).with_timeout(2).send();
     }
+    prune_temp(std::time::Duration::from_secs(6 * 3600));
+}
+
+/// Removes temporary preview/conversion folders and raw scans older than `max_age`.
+pub fn prune_temp(max_age: std::time::Duration) {
+    let cutoff = std::time::SystemTime::now().checked_sub(max_age);
+    let stale = |p: &std::path::Path| cutoff.is_some_and(|c| std::fs::metadata(p).and_then(|m| m.modified()).is_ok_and(|t| t < c));
+    let base = std::env::temp_dir();
+    if let Ok(entries) = std::fs::read_dir(base.join("printertui")) {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            if name != "sounds" && name != "profile" && stale(&e.path()) {
+                let _ = if e.path().is_dir() { std::fs::remove_dir_all(e.path()) } else { std::fs::remove_file(e.path()) };
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(base.join("printertui-scan")) {
+        for e in entries.flatten() {
+            if stale(&e.path()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
+/// Deletes temporary files belonging to saved scans (`orig`, `.preview.png`, and rotated/filtered copies).
+pub fn clean_scan_files(origs: &[String]) {
+    let Some(dir) = origs.first().and_then(|p| std::path::Path::new(p).parent()).map(std::path::Path::to_path_buf) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path().to_string_lossy().into_owned();
+        if origs.iter().any(|o| path == *o || path.starts_with(&format!("{o}.")) || path.starts_with(&format!("{o}-r"))) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// "request id is P-12 (1 file(s))" -> "P-12". lp answers in the user's language
@@ -482,13 +534,18 @@ pub fn job_id(lp_out: &str) -> Option<&str> {
 
 /// Printer name for a network printer at `host`: printer_192_168_1_46.
 pub fn queue_name(host: &str) -> String {
-    format!("printer_{}", host.replace(|c: char| !c.is_ascii_alphanumeric(), "_"))
+    format!("printer_{}", host.trim_matches(['[', ']']).replace(|c: char| !c.is_ascii_alphanumeric(), "_"))
 }
 
-/// ("ipp", "192.168.1.46") from "ipp://192.168.1.46/ipp/print".
+/// ("ipp", "192.168.1.46") from "ipp://192.168.1.46/ipp/print", or ("ipp", "[fe80::1]") for IPv6.
 pub fn uri_host(uri: &str) -> Option<(&str, &str)> {
     let (scheme, rest) = uri.split_once("://")?;
-    Some((scheme, rest.split(['/', ':', '?']).next().filter(|h| !h.is_empty())?))
+    let host = if rest.starts_with('[') {
+        &rest[..=rest.find(']')?]
+    } else {
+        rest.split(['/', ':', '?']).next()?
+    };
+    (!host.is_empty()).then_some((scheme, host))
 }
 
 /// A value of an IPP attribute: integers and enums, or text (keywords, names, uris).
@@ -515,7 +572,8 @@ pub fn ipp_attributes(url: &str, job: Option<i32>, names: &[&str]) -> Result<Ipp
         _ => return Err(format!("Unsupported printer address scheme: {scheme}")),
     };
     let (authority, path) = rest.find('/').map_or((rest, "/ipp/print"), |i| (&rest[..i], &rest[i..]));
-    let authority = if authority.contains(':') { authority.to_string() } else { format!("{authority}:{default_port}") };
+    let has_port = authority.rsplit_once(':').is_some_and(|(_, p)| !p.contains(']') && !p.is_empty());
+    let authority = if has_port { authority.to_string() } else { format!("{authority}:{default_port}") };
     let mut body = vec![1, 1, 0, if job.is_some() { 0x09 } else { 0x0B }, 0, 0, 0, 1, 0x01];
     let mut attr = |tag: u8, name: &str, value: &[u8]| {
         body.push(tag);
@@ -659,10 +717,14 @@ pub fn scanners(full: bool) -> Vec<(String, String)> {
     let mut found: Vec<(String, String)> = printer_hosts()
         .iter()
         .filter_map(|host| {
-            let caps = minreq::get(format!("http://{host}/eSCL/ScannerCapabilities")).with_timeout(2).send().ok()?;
-            let caps = caps.as_str().ok().filter(|_| caps.status_code == 200)?;
-            let model = caps.split("<pwg:MakeAndModel>").nth(1)?.split('<').next()?.to_string();
-            Some((format!("escl:http://{host}/eSCL"), model))
+            for base in [format!("http://{host}/eSCL"), format!("http://{host}:631/eSCL")] {
+                let Ok(caps) = minreq::get(format!("{base}/ScannerCapabilities")).with_timeout(2).send() else { continue };
+                let Some(caps) = caps.as_str().ok().filter(|_| caps.status_code == 200) else { continue };
+                if let Some(model) = caps.split("<pwg:MakeAndModel>").nth(1).and_then(|s| s.split('<').next()) {
+                    return Some((format!("escl:{base}"), model.to_string()));
+                }
+            }
+            None
         })
         .collect();
     if full || found.is_empty() {
@@ -685,6 +747,9 @@ pub fn scanners(full: bool) -> Vec<(String, String)> {
 /// no SANE AirScan backend; any other device goes through the system (SANE's `scanimage`, or
 /// Windows' scanner API).
 pub fn scan(device: &str, mode: &str, dpi: u32, out: &str, source: &str) -> Result<(), String> {
+    if device == "dummy" {
+        return dummy_scan(1, mode, dpi, out);
+    }
     if let Some(page) = device.strip_prefix("file:") {
         // the fake scanner has no feeder; refusing beats looping on it forever
         if source == "Feeder" {
@@ -693,9 +758,39 @@ pub fn scan(device: &str, mode: &str, dpi: u32, out: &str, source: &str) -> Resu
         return fake_scan(page, mode, dpi, out);
     }
     match device.strip_prefix("escl:") {
-        Some(url) => escl_scan(url, mode, dpi, out, source),
+        Some(url) => escl_scan(url, mode, dpi, "A4", out, source),
         None => scan_local(device, mode, dpi, out, source),
     }
+}
+
+/// Scans one page or a full feeder stack (`stack = true`), calling `out_for(i)` for each page's path.
+/// On eSCL, a single `ScanJob` reads the entire feeder stack until `NextDocument` returns 404.
+pub fn scan_pages(device: &str, mode: &str, dpi: u32, paper: &str, source: &str, stack: bool, mut out_for: impl FnMut(usize) -> String) -> Result<Vec<String>, String> {
+    if device == "dummy" {
+        let count = if stack { 3 } else { 1 };
+        return (0..count)
+            .map(|i| {
+                let path = out_for(i);
+                dummy_scan(i + 1, mode, dpi, &path).map(|_| path)
+            })
+            .collect();
+    }
+    if let Some(url) = device.strip_prefix("escl:") {
+        return escl_scan_pages(url, mode, dpi, paper, source, stack, out_for);
+    }
+    let mut pages = Vec::new();
+    loop {
+        let path = out_for(pages.len());
+        match scan(device, mode, dpi, &path, source) {
+            Ok(()) => pages.push(path),
+            Err(e) if pages.is_empty() => return Err(e),
+            Err(_) => break,
+        }
+        if !stack {
+            break;
+        }
+    }
+    Ok(pages)
 }
 
 /// The fake scanner: the image as an A4 page at that resolution, after a pause like a real scan.
@@ -705,18 +800,64 @@ fn fake_scan(page: &str, mode: &str, dpi: u32, out: &str) -> Result<(), String> 
     save_png(&if mode == "Gray" { img.grayscale() } else { img }, out)
 }
 
-/// eSCL (AirScan): POST the settings to ScanJobs, then download the page from the job's NextDocument.
-fn escl_scan(url: &str, mode: &str, dpi: u32, out: &str, source: &str) -> Result<(), String> {
+/// Simulated scanner page for `--dummy` mode: asymmetric header and text blocks so rotation and filters show clearly.
+fn dummy_scan(page_no: usize, mode: &str, dpi: u32, out: &str) -> Result<(), String> {
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    let (w, h) = ((827 * dpi / 100).max(200), (1169 * dpi / 100).max(280));
+    let mut img = image::RgbImage::from_pixel(w, h, image::Rgb([248, 247, 243]));
+    let mx = w / 10;
+    // colored banner at top-left (width varies slightly with page_no)
+    let banner_w = (w * 6 / 10).saturating_sub((page_no as u32 % 3) * (w / 14));
+    for y in h / 14..h / 9 {
+        for x in mx..mx + banner_w {
+            img.put_pixel(x, y, image::Rgb([58, 108, 212]));
+        }
+    }
+    // simulated paragraph lines
+    for line in 0..18u32 {
+        if line % 5 == 4 {
+            continue;
+        }
+        let y0 = h / 6 + line * (h / 26);
+        let len = if line % 5 == 3 { w * 4 / 10 } else { w * 8 / 10 };
+        for y in y0..(y0 + (h / 90).max(2)).min(h) {
+            for x in mx..(mx + len).min(w) {
+                img.put_pixel(x, y, image::Rgb([40, 42, 46]));
+            }
+        }
+    }
+    let dyn_img = DynamicImage::ImageRgb8(img);
+    save_png(&if mode == "Gray" { dyn_img.grayscale() } else { dyn_img }, out)
+}
+
+/// Scan area in 1/300 inch (`ThreeHundredthsOfInches`) matching the selected paper.
+fn escl_size(paper: &str) -> (u32, u32) {
+    match paper {
+        "Letter" => (2550, 3300),
+        "Legal" => (2550, 4200),
+        "A5" => (1748, 2480),
+        "A3" => (3508, 4960),
+        _ => (2480, 3508),
+    }
+}
+
+/// eSCL (AirScan): POST the settings to ScanJobs, then download one page from NextDocument.
+fn escl_scan(url: &str, mode: &str, dpi: u32, paper: &str, out: &str, source: &str) -> Result<(), String> {
+    escl_scan_pages(url, mode, dpi, paper, source, false, |_| out.to_string()).map(drop)
+}
+
+/// eSCL single-page or multi-page feeder scan within one `ScanJob`.
+fn escl_scan_pages(url: &str, mode: &str, dpi: u32, paper: &str, source: &str, stack: bool, mut out_for: impl FnMut(usize) -> String) -> Result<Vec<String>, String> {
     let color = if mode == "Gray" { "Grayscale8" } else { "RGB24" };
     // eSCL's own name for the glass, ours for the feeder
     let source = if source == "Feeder" { "Feeder" } else { "Platen" };
-    // A4 in 1/300 inch
+    let (w, h) = escl_size(paper);
     let settings = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
 <pwg:Version>2.0</pwg:Version>
 <scan:Intent>Document</scan:Intent>
-<pwg:ScanRegions><pwg:ScanRegion><pwg:Height>3508</pwg:Height><pwg:Width>2480</pwg:Width><pwg:XOffset>0</pwg:XOffset><pwg:YOffset>0</pwg:YOffset><pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits></pwg:ScanRegion></pwg:ScanRegions>
+<pwg:ScanRegions><pwg:ScanRegion><pwg:Height>{h}</pwg:Height><pwg:Width>{w}</pwg:Width><pwg:XOffset>0</pwg:XOffset><pwg:YOffset>0</pwg:YOffset><pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits></pwg:ScanRegion></pwg:ScanRegions>
 <pwg:InputSource>{source}</pwg:InputSource>
 <scan:ColorMode>{color}</scan:ColorMode>
 <scan:XResolution>{dpi}</scan:XResolution>
@@ -731,11 +872,36 @@ fn escl_scan(url: &str, mode: &str, dpi: u32, out: &str, source: &str) -> Result
     // Location may be relative to the scanner ("/eSCL/ScanJobs/..."), keep scheme://host from the url
     let job = if job.starts_with('/') { format!("{}{job}", url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/")) } else { job.to_string() };
     JOBS.lock().unwrap().push(job.clone());
-    // the scanner answers 503 until the page is ready
-    let res = retry_busy(30, || minreq::get(format!("{job}/NextDocument")).with_timeout(600).send())
-        .and_then(|page| std::fs::write(out, page.as_bytes()).map_err(|e| e.to_string()));
+    let mut pages = Vec::new();
+    let mut first_err = None;
+    loop {
+        // the scanner answers 503 until the page is ready; 404 means the feeder stack is finished
+        match retry_busy(30, || minreq::get(format!("{job}/NextDocument")).with_timeout(600).send()) {
+            Ok(page) => {
+                let path = out_for(pages.len());
+                if let Err(e) = std::fs::write(&path, page.as_bytes()) {
+                    first_err = Some(e.to_string());
+                    break;
+                }
+                pages.push(path);
+                if !stack {
+                    let _ = minreq::delete(&job).with_timeout(2).send();
+                    break;
+                }
+            }
+            Err(e) => {
+                if pages.is_empty() {
+                    first_err = Some(format!("Could not download the scanned page: {e}"));
+                }
+                break;
+            }
+        }
+    }
     JOBS.lock().unwrap().retain(|j| *j != job);
-    res.map_err(|e| format!("Could not download the scanned page: {e}"))
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(pages),
+    }
 }
 
 /// Sends a request until it gets a 2xx answer, waiting 2 s after each 503 (busy), `tries` times at most.
@@ -781,7 +947,7 @@ fn save_png(img: &DynamicImage, path: &str) -> Result<(), String> {
 
 /// Grayscale thumbnail of an image as (width, height, pixels), plus `<image>.preview.png`
 /// in full quality for terminals with the kitty graphics protocol.
-pub fn thumbnail(image: &str) -> Result<(usize, usize, Vec<u8>), String> {
+pub fn thumbnail(image: &str) -> Result<Thumb, String> {
     let img = open(image)?;
     save_png(&img.resize(1200, u32::MAX, FilterType::Triangle), &format!("{image}.preview.png"))?;
     // thicken text before shrinking, or it fades to near-white at terminal resolution
@@ -854,27 +1020,63 @@ pub struct Word {
     pub h: f32,
 }
 
-/// Text in the PDF's WinAnsi encoding (Latin-1 letters and accents); other characters become '?'.
+/// Single byte in PDF's WinAnsiEncoding (Windows-1252), None for characters outside it.
+fn win_ansi_byte(c: char) -> Option<u8> {
+    Some(match c {
+        '\u{0020}'..='\u{007E}' | '\u{00A0}'..='\u{00FF}' => c as u8,
+        '€' => 0x80, '‚' => 0x82, 'ƒ' => 0x83, '„' => 0x84, '…' => 0x85,
+        '†' => 0x86, '‡' => 0x87, 'ˆ' => 0x88, '‰' => 0x89, 'Š' => 0x8A,
+        '‹' => 0x8B, 'Œ' => 0x8C, 'Ž' => 0x8E, '‘' => 0x91, '’' => 0x92,
+        '“' => 0x93, '”' => 0x94, '•' => 0x95, '–' => 0x96, '—' => 0x97,
+        '˜' => 0x98, '™' => 0x99, 'š' => 0x9A, '›' => 0x9B, 'œ' => 0x9C,
+        'ž' => 0x9E, 'Ÿ' => 0x9F,
+        _ => return None,
+    })
+}
+
+/// Text in the PDF's WinAnsi encoding (Windows-1252); other characters become '?'.
 fn win_ansi(text: &str) -> Vec<u8> {
-    text.chars().map(|c| if (c as u32) < 256 { c as u8 } else { b'?' }).collect()
+    text.chars().map(|c| win_ansi_byte(c).unwrap_or(b'?')).collect()
 }
 
 /// One PDF page per image; `dpi` sets the page size (pixels / dpi). `words[i]`, when given, is laid
-/// invisibly over page i so the PDF can be searched and copied from.
+/// invisibly over page i with a Unicode CID font (`Identity-H` + `/ToUnicode`) so any script can be searched and copied.
 pub fn images_to_pdf(pages: &[String], dpi: u32, words: &[Vec<Word>]) -> Result<Vec<u8>, String> {
     let mut pdf = Pdf::new();
-    let (catalog, tree, font) = (Ref::new(1), Ref::new(2), Ref::new(3));
+    let mut next_id = 1i32;
+    let mut alloc = || {
+        let r = Ref::new(next_id);
+        next_id += 1;
+        r
+    };
+    let (catalog, tree) = (alloc(), alloc());
+    let mut cids: std::collections::HashMap<char, u16> = std::collections::HashMap::new();
+    let mut ordered: Vec<char> = Vec::new();
+    for page_words in words {
+        for word in page_words {
+            for ch in word.text.chars() {
+                if !cids.contains_key(&ch) && ordered.len() < 65_534 {
+                    let cid = (ordered.len() + 1) as u16;
+                    cids.insert(ch, cid);
+                    ordered.push(ch);
+                }
+            }
+        }
+    }
+    let font_ids = (!ordered.is_empty()).then(|| (alloc(), alloc(), alloc(), alloc()));
     let mut kids = Vec::new();
     let pt = 72.0 / dpi as f32;
     for (i, path) in pages.iter().enumerate() {
-        let (page_id, image_id, content_id) = (Ref::new(3 * i as i32 + 4), Ref::new(3 * i as i32 + 5), Ref::new(3 * i as i32 + 6));
+        let (page_id, image_id, content_id) = (alloc(), alloc(), alloc());
         let (w, h, gray, data) = jpeg(path)?;
         let (pw, ph) = (w as f32 * pt, h as f32 * pt);
         let mut page = pdf.page(page_id);
         page.media_box(Rect::new(0.0, 0.0, pw, ph)).parent(tree).contents(content_id);
         let mut res = page.resources();
         res.x_objects().pair(Name(b"Im0"), image_id);
-        res.fonts().pair(Name(b"F0"), font);
+        if let Some((font, ..)) = font_ids {
+            res.fonts().pair(Name(b"F0"), font);
+        }
         res.finish();
         page.finish();
         let mut image = pdf.image_xobject(image_id, &data);
@@ -884,24 +1086,56 @@ pub fn images_to_pdf(pages: &[String], dpi: u32, words: &[Vec<Word>]) -> Result<
         image.finish();
         let mut content = Content::new();
         content.save_state().transform([pw, 0.0, 0.0, ph, 0.0, 0.0]).x_object(Name(b"Im0")).restore_state();
-        if let Some(words) = words.get(i).filter(|w| !w.is_empty()) {
+        if let (Some(_), Some(words)) = (font_ids, words.get(i).filter(|w| !w.is_empty())) {
             content.begin_text().set_text_rendering_mode(TextRenderingMode::Invisible);
             for word in words {
-                // Helvetica's average glyph is about half the font size wide; stretch it to the box
+                // default glyph width is 500/1000 (half the font size); stretch it to the word's box
                 let size = word.h * pt;
-                let text = win_ansi(&word.text);
-                let natural = 0.5 * size * text.len() as f32;
+                let encoded: Vec<u16> = word.text.chars().filter_map(|c| cids.get(&c).copied()).collect();
+                if encoded.is_empty() {
+                    continue;
+                }
+                let bytes: Vec<u8> = encoded.iter().flat_map(|c| c.to_be_bytes()).collect();
+                let natural = 0.5 * size * encoded.len() as f32;
                 content.set_font(Name(b"F0"), size).set_horizontal_scaling(100.0 * word.w * pt / natural.max(0.01));
                 // baseline a fifth of the box above its bottom edge
                 content.set_text_matrix([1.0, 0.0, 0.0, 1.0, word.x * pt, ph - (word.y + 0.8 * word.h) * pt]);
-                content.show(Str(&text));
+                content.show(Str(&bytes));
             }
             content.end_text();
         }
         pdf.stream(content_id, &content.finish());
         kids.push(page_id);
     }
-    pdf.type1_font(font).base_font(Name(b"Helvetica")).encoding_predefined(Name(b"WinAnsiEncoding"));
+    if let Some((font, cid_font, desc, cmap_id)) = font_ids {
+        let sys = SystemInfo { registry: Str(b"Adobe"), ordering: Str(b"Identity"), supplement: 0 };
+        let mut cmap = UnicodeCmap::new(Name(b"Custom"), sys);
+        for (idx, &ch) in ordered.iter().enumerate() {
+            cmap.pair((idx + 1) as u16, ch);
+        }
+        pdf.cmap(cmap_id, &cmap.finish());
+        pdf.font_descriptor(desc)
+            .name(Name(b"GlyphlessFont"))
+            .flags(FontFlags::SYMBOLIC)
+            .bbox(Rect::new(0.0, -200.0, 1000.0, 800.0))
+            .italic_angle(0.0)
+            .ascent(800.0)
+            .descent(-200.0)
+            .cap_height(700.0)
+            .stem_v(80.0);
+        pdf.cid_font(cid_font)
+            .subtype(CidFontType::Type2)
+            .base_font(Name(b"GlyphlessFont"))
+            .system_info(sys)
+            .font_descriptor(desc)
+            .default_width(500.0)
+            .cid_to_gid_map_predefined(Name(b"Identity"));
+        pdf.type0_font(font)
+            .base_font(Name(b"GlyphlessFont"))
+            .encoding_predefined(Name(b"Identity-H"))
+            .descendant_font(cid_font)
+            .to_unicode(cmap_id);
+    }
     pdf.catalog(catalog).pages(tree);
     pdf.pages(tree).count(kids.len() as i32).kids(kids);
     Ok(pdf.finish())
@@ -940,6 +1174,9 @@ fn free_name(out: &str, format: &str, pages: usize) -> String {
 /// Saves scanned pages as one PDF, one searchable PDF (the text read in `lang`), or as
 /// `out.png` / `out-1.png`, `out-2.png`... Returns the written paths.
 pub fn save_scans(pages: &[String], out: &str, format: &str, dpi: u32, lang: &str) -> Result<Vec<String>, String> {
+    if let Some(parent) = std::path::Path::new(out).parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
     // saving again with the same name numbers the new file (out-2, out-3...) instead of overwriting the old one
     let out = free_name(out, format, pages.len());
     if format == "OCR" {
@@ -1049,7 +1286,7 @@ pub const FILTERS: [&str; 3] = ["Original", "Gray", "B&W"];
 
 /// Rotates (degrees clockwise) and filters a scanned page, always starting from the original scan.
 /// Returns the edited file (the original itself when there is nothing to do) and its thumbnail.
-pub fn edit_page(orig: &str, rot: u16, filter: usize) -> Result<(String, (usize, usize, Vec<u8>)), String> {
+pub fn edit_page(orig: &str, rot: u16, filter: usize) -> Result<(String, Thumb), String> {
     let out = if rot == 0 && filter == 0 {
         orig.to_string()
     } else {
@@ -1254,14 +1491,42 @@ fn searchable_pdf_text_layer() {
     std::fs::create_dir_all(&dir).unwrap();
     let img = dir.join("p").to_string_lossy().into_owned();
     DynamicImage::ImageLuma8(GrayImage::from_pixel(1200, 300, Luma([255]))).save_with_format(&img, ImageFormat::Png).unwrap();
-    let words = vec![Word { text: "Hola".into(), x: 50.0, y: 100.0, w: 200.0, h: 60.0 }, Word { text: "cañón".into(), x: 300.0, y: 100.0, w: 250.0, h: 60.0 }];
+    let words = vec![
+        Word { text: "Hola".into(), x: 50.0, y: 100.0, w: 140.0, h: 60.0 },
+        Word { text: "cañón€".into(), x: 210.0, y: 100.0, w: 200.0, h: 60.0 },
+        Word { text: "Привет".into(), x: 430.0, y: 100.0, w: 200.0, h: 60.0 },
+        Word { text: "你好".into(), x: 650.0, y: 100.0, w: 120.0, h: 60.0 },
+        Word { text: "नमस्ते".into(), x: 790.0, y: 100.0, w: 160.0, h: 60.0 },
+        Word { text: "বাংলা".into(), x: 970.0, y: 100.0, w: 160.0, h: 60.0 },
+    ];
     let pdf = dir.join("out.pdf");
     std::fs::write(&pdf, images_to_pdf(&[img], 150, &[words]).unwrap()).unwrap();
     assert_eq!(page_count(&pdf.to_string_lossy()), Some(1));
-    // pdftotext (poppler) reads the text back, when installed
+    // pdftotext (poppler) reads every script back, when installed
     if let Ok(text) = run("pdftotext", &["-enc", "UTF-8", &pdf.to_string_lossy(), "-"]) {
-        assert!(text.contains("Hola") && text.contains("cañón"), "{text}");
+        for expected in ["Hola", "cañón€", "Привет", "你好", "नमस्ते", "বাংলা"] {
+            assert!(text.contains(expected), "missing {expected} in {text}");
+        }
     }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn ipv6_hosts_and_nested_save_folders() {
+    assert_eq!(uri_host("ipp://[fe80::1]:631/ipp/print"), Some(("ipp", "[fe80::1]")));
+    assert_eq!(uri_host("ipps://[2001:db8::42]/ipp/print"), Some(("ipps", "[2001:db8::42]")));
+    assert_eq!(queue_name("[fe80::1]"), "printer_fe80__1");
+
+    let dir = std::env::temp_dir().join(format!("printertui-nested-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pages = scan_pages("dummy", "Color", 150, "A4", "Feeder", true, |i| dir.join(format!("s-{i}")).to_string_lossy().into_owned()).unwrap();
+    assert_eq!(pages.len(), 3);
+    let nested_out = dir.join("sub/folder/scan").to_string_lossy().into_owned();
+    let saved = save_scans(&pages, &nested_out, "PDF", 150, "en").unwrap();
+    assert_eq!(page_count(&saved[0]), Some(3));
+    clean_scan_files(&pages);
+    assert!(pages.iter().all(|p| !std::path::Path::new(p).exists()));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

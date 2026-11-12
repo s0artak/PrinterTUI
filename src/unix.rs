@@ -19,15 +19,55 @@ pub fn printers() -> Vec<String> {
         .lines()
         .map(str::to_string)
         .collect();
-    if let Some(def) = run("lpstat", &["-d"])
-        .ok()
-        .and_then(|s| s.rsplit(": ").next().map(str::to_string))
+    if let Some(def) = run("lpstat", &["-d"]).ok().and_then(|s| s.rsplit([':', '：']).next().map(|d| d.trim().to_string()))
+        && let Some(i) = list.iter().position(|p| *p == def)
     {
-        if let Some(i) = list.iter().position(|p| *p == def) {
-            list.swap(0, i);
-        }
+        list.swap(0, i);
     }
     list
+}
+
+/// Checks whether CUPS itself is missing or stopped ("cups-missing", "cups-stopped").
+pub fn backend_problem() -> Option<&'static str> {
+    match Command::new("lpstat").arg("-r").env_remove("LC_ALL").env("LC_MESSAGES", "C").output() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some("cups-missing"),
+        Err(_) => Some("cups-stopped"),
+        Ok(o) if !o.status.success() || String::from_utf8_lossy(&o.stdout).contains("not running") => Some("cups-stopped"),
+        Ok(_) => None,
+    }
+}
+
+/// Inspects local CUPS devices (`lpinfo -v` and `lpstat -v`) for the Printer Doctor popup:
+/// returns `(service_problem, usb_devices, net_ipp, net_legacy)`.
+pub fn doctor_scan() -> crate::DoctorScan {
+    let prob = backend_problem();
+    if prob.is_some() {
+        return (prob, Vec::new(), Vec::new(), Vec::new());
+    }
+    let configured = run("lpstat", &["-v"]).unwrap_or_default();
+    let raw = run("lpinfo", &["-v"]).unwrap_or_default();
+    let (mut usb, mut net_ipp, mut net_legacy) = (Vec::new(), Vec::new(), Vec::new());
+    for uri in raw.lines().filter_map(|l| l.split_whitespace().nth(1)) {
+        if !uri.contains("://") || configured.contains(uri) {
+            continue;
+        }
+        if uri.starts_with("usb://") {
+            usb.push(uri.trim_start_matches("usb://").replace("%20", " "));
+        } else if matches!(uri_host(uri), Some(("ipp" | "ipps" | "dnssd", _))) {
+            if let Some(pair) = to_ipp(uri) {
+                net_ipp.push(pair);
+            }
+        } else if let Some((scheme, host)) = uri_host(uri)
+            && matches!(scheme, "socket" | "lpd" | "smb")
+        {
+            net_legacy.push(format!("{scheme}://{host}"));
+        }
+    }
+    net_ipp.sort();
+    net_ipp.dedup_by(|a, b| a.0 == b.0);
+    net_legacy.sort();
+    net_legacy.dedup();
+    (None, usb, net_ipp, net_legacy)
 }
 
 /// Display name for a queue from its `lpoptions -p` output: the description if the user set one
@@ -141,18 +181,34 @@ pub fn job_progress(id: &str) -> (i32, u32) {
 }
 
 /// Unfinished jobs on all printers as (job number, "file  size  position") for the queue popup.
+/// Falls back to `lpstat` on systems where `lpq` (`cups-bsd`) is not installed.
 pub fn queue() -> Vec<(String, String)> {
-    parse_lpq(&run("lpq", &["-a"]).unwrap_or_default())
+    if let Ok(out) = run("lpq", &["-a"]) {
+        return parse_lpq(&out);
+    }
+    run("lpstat", &["-W", "not-completed", "-o"])
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            let id = w.next()?;
+            let owner = w.next()?;
+            let size: u64 = w.next()?.parse().ok()?;
+            Some((id.to_string(), format!("{id}  ({owner}, {} KB)", size.div_ceil(1024))))
+        })
+        .collect()
 }
 
-/// `lpq -a` rows: "1st  spartak  8  my file.txt  1024 bytes" (the header and "no entries" are skipped).
+/// `lpq -a` rows: "1st  spartak  8  my file.txt  1024 bytes" (the header and "no entries" are skipped,
+/// and localized unit words like "octets", "Bytes" or "字节" are accepted).
 pub fn parse_lpq(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|l| {
             let w: Vec<&str> = l.split_whitespace().collect();
-            let [rank, owner, job, ref file @ .., size, "bytes"] = w[..] else { return None };
+            let [rank, owner, job, ref file @ .., size, _unit] = w[..] else { return None };
             job.parse::<u32>().ok()?;
-            Some((job.to_string(), format!("{}  ({owner}, {} KB, {rank})", file.join(" "), size.parse::<u64>().unwrap_or(0).div_ceil(1024))))
+            let bytes: u64 = size.parse().ok()?;
+            Some((job.to_string(), format!("{}  ({owner}, {} KB, {rank})", file.join(" "), bytes.div_ceil(1024))))
         })
         .collect()
 }
@@ -677,8 +733,15 @@ fn bonjour_printers() {
 fn lpq_rows() {
     let out = "Rank    Owner   Job     File(s)                         Total Size\n\
                active  ana     12      my report.pdf                   20480 bytes\n\
+               1er     jean    13      facture.pdf                     4096 octets\n\
                no entries";
-    assert_eq!(parse_lpq(out), [("12".to_string(), "my report.pdf  (ana, 20 KB, active)".to_string())]);
+    assert_eq!(
+        parse_lpq(out),
+        [
+            ("12".to_string(), "my report.pdf  (ana, 20 KB, active)".to_string()),
+            ("13".to_string(), "facture.pdf  (jean, 4 KB, 1er)".to_string()),
+        ]
+    );
 }
 
 /// Tests that spawn tools run one at a time, since `stop_all` kills every running tool.
