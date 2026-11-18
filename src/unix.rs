@@ -690,7 +690,7 @@ fn macos_draws_and_reads_pages() {
     let (w, h) = image_size(&png).unwrap();
     // A4 at 100 dpi
     assert!((820..=830).contains(&w) && (1165..=1175).contains(&h), "{w}x{h}");
-    let words = vision_words(&[png.clone()]).unwrap();
+    let words = vision_words(std::slice::from_ref(&png)).unwrap();
     let text: Vec<&str> = words[0].iter().map(|w| w.text.as_str()).collect();
     assert!(text.iter().any(|t| t.contains("HELLO PRINTER")), "{text:?}");
     // the box is near the top left of the page, where the text is
