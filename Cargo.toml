@@ -1,6 +1,6 @@
 [package]
 name = "printertui"
-version = "0.3.0"
+version = "0.4.0"
 license = "MIT"
 edition = "2024"
 
@@ -9,6 +9,8 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 lopdf = { version = "0.45.0", default-features = false }
 minreq = { version = "3.0.0", features = ["https-rustls-probe"] }
 pdf-writer = "0.15.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 ratatui = "0.30.2"
 unicode-width = "0.2.2"
 
@@ -17,6 +19,10 @@ mdns-sd = "0.21.4"
 pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_7881", "thread_safe"] }
 rfd = "0.17.2"
 windows = { version = "0.62", features = ["Win32_Graphics_Printing", "Win32_Graphics_Gdi", "Win32_Foundation", "Win32_Storage_Xps", "Win32_System_Threading", "Devices_Scanners", "Devices_Enumeration", "Storage", "Storage_Streams", "Foundation", "Foundation_Collections", "Media_Ocr", "Graphics_Imaging", "Globalization", "Win32_System_SystemInformation", "Win32_Security", "Security_Cryptography", "Storage_Search", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Devices_Properties", "Win32_Media_Audio"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu"] }
+rfd = "0.17.2"
 
 [build-dependencies]
 embed-resource = "3.0.11"

@@ -1,10 +1,25 @@
+#[cfg(target_os = "linux")]
 mod i18n;
+#[cfg(target_os = "linux")]
 mod pet;
+#[cfg(target_os = "linux")]
 mod sound;
 
-use i18n::{extra, fill, t};
-use pet::{theme, Act, Mood, Work, ACCENT, RED, WHITE, YELLOW};
-use sound::Sound;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+mod gui;
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn main() -> eframe::Result {
+    gui::run()
+}
+
+#[cfg(target_os = "linux")]
+mod tui {
+
+use crate::i18n::{extra, fill, t};
+use crate::pet::{theme, Act, Mood, Work, ACCENT, RED, WHITE, YELLOW};
+use crate::sound::Sound;
+use crate::{i18n, pet, sound};
 use printertui::*;
 use ratatui::{
     crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
@@ -226,7 +241,7 @@ struct App {
     mode: Mode,
 }
 
-fn main() -> std::io::Result<()> {
+pub fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
@@ -2887,4 +2902,11 @@ fn popup(f: &mut Frame, width: u16, height: u16) -> ratatui::layout::Rect {
     }
     POPUP.set(area);
     area
+}
+
+}
+
+#[cfg(target_os = "linux")]
+fn main() -> std::io::Result<()> {
+    tui::main()
 }

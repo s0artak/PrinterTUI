@@ -1,6 +1,6 @@
 # PrinterTUI
 
-Terminal app to print and scan on Linux, macOS and Windows.
+PrinterTUI prints and scans on Linux, macOS and Windows. Linux keeps the terminal interface; macOS and Windows open a desktop GUI.
 
 [![PrinterTUI demo](docs/demo.gif)](docs/demo.mp4)
 
@@ -10,6 +10,7 @@ Terminal app to print and scan on Linux, macOS and Windows.
 - Scans from network printers (eSCL) or SANE, from the glass or the document feeder; saves PDF, searchable PDF (read in the app's language) or PNG; copies (scan and print).
 - Shows the printer's ink levels and problems (out of paper, jam, offline), plus Printer Doctor (`?`) to diagnose CUPS / Spooler, USB and Wi-Fi printers.
 - 10 languages. Settings in `~/.config/printertui/config` (`%APPDATA%\printertui\config` on Windows).
+- The desktop GUI offers printer and document selection, common print options, queue controls, scanner selection, page rotation and filters, and PDF/OCR/PNG output.
 
 ## Install
 
