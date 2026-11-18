@@ -1,8 +1,7 @@
-#[cfg(target_os = "linux")]
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod i18n;
-#[cfg(target_os = "linux")]
 mod pet;
-#[cfg(target_os = "linux")]
 mod sound;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -10,7 +9,7 @@ mod gui;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn main() -> eframe::Result {
-    gui::run()
+    gui::main()
 }
 
 #[cfg(target_os = "linux")]

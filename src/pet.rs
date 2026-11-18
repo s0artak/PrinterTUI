@@ -1,17 +1,29 @@
 //! The mascot: the installer's pixel-art printer (the same art and colors as install.sh), drawn
-//! with half blocks, reacting to what the app does.
+//! with half blocks in the terminal or crisp pixel rects in the desktop GUI, reacting to what the app does.
 
+#[cfg(target_os = "linux")]
 use ratatui::style::{Color, Style};
+#[cfg(target_os = "linux")]
 use ratatui::text::{Line, Span};
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+/// Auto, Dark, Light; the names the settings file uses.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub const THEME_NAMES: [&str; 3] = ["auto", "dark", "light"];
+
+#[cfg(target_os = "linux")]
 pub const ACCENT: Color = Color::Indexed(69);
+#[cfg(target_os = "linux")]
 pub const RED: Color = Color::Indexed(203);
+#[cfg(target_os = "linux")]
 pub const YELLOW: Color = Color::Indexed(221);
+#[cfg(target_os = "linux")]
 pub const WHITE: Color = Color::Indexed(231);
 
 /// The app's colors: Auto keeps the terminal's own background and text, Dark and Light paint theirs.
+#[cfg(target_os = "linux")]
 pub struct Theme {
     pub bg: Option<Color>,
     pub fg: Option<Color>,
@@ -24,23 +36,28 @@ pub struct Theme {
 }
 
 /// Auto, Dark, Light; the names the settings file uses.
+#[cfg(target_os = "linux")]
 pub const THEMES: [(&str, Theme); 3] = [
     ("auto", Theme { bg: None, fg: None, dim: Color::Indexed(245), chip: (WHITE, Color::Indexed(238)), hop: YELLOW }),
     ("dark", Theme { bg: Some(Color::Indexed(235)), fg: Some(Color::Indexed(252)), dim: Color::Indexed(245), chip: (WHITE, Color::Indexed(238)), hop: YELLOW }),
     ("light", Theme { bg: Some(Color::Indexed(255)), fg: Some(Color::Indexed(236)), dim: Color::Indexed(242), chip: (Color::Indexed(236), Color::Indexed(252)), hop: Color::Indexed(166) }),
 ];
 
+#[cfg(target_os = "linux")]
 static THEME: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(target_os = "linux")]
 pub fn set_theme(i: usize) {
     THEME.store(i.min(THEMES.len() - 1), Ordering::Relaxed);
 }
 
+#[cfg(target_os = "linux")]
 pub fn theme() -> &'static Theme {
     &THEMES[THEME.load(Ordering::Relaxed)].1
 }
 
 /// A 24-bit color, or the nearest of the 256 in terminals without 24-bit color (macOS Terminal).
+#[cfg(target_os = "linux")]
 pub fn rgb(r: u8, g: u8, b: u8) -> Color {
     static TRUECOLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let truecolor = *TRUECOLOR.get_or_init(|| {
@@ -51,6 +68,7 @@ pub fn rgb(r: u8, g: u8, b: u8) -> Color {
 }
 
 /// The nearest xterm-256 color: a gray from the ramp, or one of the 6x6x6 cube.
+#[cfg(target_os = "linux")]
 fn to_256(r: u8, g: u8, b: u8) -> u8 {
     if r == g && g == b {
         return match r {
@@ -103,6 +121,7 @@ const FRAME: u128 = 90;
 /// Frames for one page to come out of the slot.
 const PAGE: u128 = 11;
 
+#[cfg(target_os = "linux")]
 fn palette(c: char) -> Option<Color> {
     let i = match c {
         'w' => 231,
@@ -120,7 +139,53 @@ fn palette(c: char) -> Option<Color> {
     Some(Color::Indexed(i))
 }
 
+/// Exact sRGB palette matching the installer / xterm-256 mascot colors, for the desktop GUI.
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
+pub fn palette_rgb(c: char) -> Option<(u8, u8, u8)> {
+    Some(match c {
+        'w' => (255, 255, 255),
+        'o' => (168, 168, 168),
+        'k' => (148, 148, 148),
+        'b' => (95, 135, 255),
+        'd' => (88, 88, 88),
+        'g' => (208, 208, 208),
+        's' => (28, 28, 28),
+        'G' => (135, 215, 135),
+        'r' => (255, 95, 95),
+        'c' => (95, 255, 255),
+        _ => return None,
+    })
+}
+
+/// Crisp 64x64 RGBA window/taskbar icon derived directly from the mascot sprite.
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
+pub fn icon_rgba() -> (u32, u32, Vec<u8>) {
+    const SIZE: usize = 64;
+    const SCALE: usize = 3;
+    let mut rgba = vec![0u8; SIZE * SIZE * 4];
+    let ox = (SIZE - 20 * SCALE) / 2;
+    let oy = (SIZE - 10 * SCALE) / 2;
+    for (y, row) in PRINTER.iter().enumerate() {
+        for (x, ch) in row.chars().enumerate() {
+            let c = match ch {
+                'L' => 'G',
+                'M' => 'g',
+                other => other,
+            };
+            let Some((r, g, b)) = palette_rgb(c) else { continue };
+            for dy in 0..SCALE {
+                for dx in 0..SCALE {
+                    let i = ((oy + y * SCALE + dy) * SIZE + (ox + x * SCALE + dx)) * 4;
+                    rgba[i..i + 4].copy_from_slice(&[r, g, b, 255]);
+                }
+            }
+        }
+    }
+    (SIZE as u32, SIZE as u32, rgba)
+}
+
 /// Pixel rows to lines, two pixels per cell with half blocks, like install.sh's `render`.
+#[cfg(target_os = "linux")]
 pub fn pixels(rows: &[Vec<Option<Color>>], pad: usize) -> Vec<Line<'static>> {
     rows.chunks(2)
         .map(|pair| {
@@ -185,8 +250,8 @@ pub enum Mood {
     Trouble,
 }
 
-/// The printer at this moment; `ms` is the time since the app started, for the idle blinking.
-pub fn printer(act: Act, work: Work, mood: Mood, ms: u128) -> Vec<Line<'static>> {
+/// The printer pixel grid and horizontal offset (`pad`: 1, 2 or 3) at `ms` since start.
+pub fn printer_grid(act: Act, work: Work, mood: Mood, ms: u128) -> (Vec<Vec<char>>, usize) {
     let t = ms / FRAME;
     let mut lights = match mood {
         Mood::Fine if (t / 8).is_multiple_of(2) => ('G', 'g'),
@@ -249,6 +314,13 @@ pub fn printer(act: Act, work: Work, mood: Mood, ms: u128) -> Vec<Line<'static>>
         }
     }
     rows.extend(paper[paper.len() - out..].iter().map(|r| r.chars().collect()));
+    (rows, pad)
+}
+
+/// The printer at this moment; `ms` is the time since the app started, for the idle blinking.
+#[cfg(target_os = "linux")]
+pub fn printer(act: Act, work: Work, mood: Mood, ms: u128) -> Vec<Line<'static>> {
+    let (rows, pad) = printer_grid(act, work, mood, ms);
     let art: Vec<Vec<Option<Color>>> = rows.iter().map(|r| r.iter().map(|c| palette(*c)).collect()).collect();
     pixels(&art, pad)
 }
@@ -304,9 +376,8 @@ const FLIP: [(usize, usize, bool, usize); 15] = [
     (14, 12, false, 4),
 ];
 
-/// One frame of the manual duplex animation, and which of the five captions goes with it:
-/// printed side facing you, flip it, blank side facing you, into the tray, press Enter.
-pub fn flip(step: usize) -> (Vec<Line<'static>>, usize) {
+/// One frame of the manual duplex animation as a 22x20 pixel grid, plus which of the five captions goes with it.
+pub fn flip_grid(step: usize) -> (Vec<Vec<char>>, usize) {
     let (top, height, printed, caption) = FLIP[step % FLIP.len()];
     let sheet = if printed { &FRONT } else { &BACK };
     // 12 rows above the printer for the sheet, then the printer, which hides the sheet going in
@@ -330,12 +401,21 @@ pub fn flip(step: usize) -> (Vec<Line<'static>>, usize) {
             }
         }
     }
+    (canvas, caption)
+}
+
+/// One frame of the manual duplex animation, and which of the five captions goes with it:
+/// printed side facing you, flip it, blank side facing you, into the tray, press Enter.
+#[cfg(target_os = "linux")]
+pub fn flip(step: usize) -> (Vec<Line<'static>>, usize) {
+    let (canvas, caption) = flip_grid(step);
     let art: Vec<Vec<Option<Color>>> = canvas.iter().map(|r| r.iter().map(|c| palette(*c)).collect()).collect();
     (pixels(&art, 0), caption)
 }
 
 /// Ink tanks as (RGB color, percent or -1 when unknown, running low), each filled up to its
 /// level, with the percentages underneath (red when low). Four columns per tank.
+#[cfg(target_os = "linux")]
 pub fn tanks(inks: &[(u32, i32, bool)]) -> Vec<Line<'static>> {
     const H: i32 = 10;
     let dark = Some(Color::Indexed(240));
@@ -364,6 +444,21 @@ pub fn tanks(inks: &[(u32, i32, bool)]) -> Vec<Line<'static>> {
 }
 
 #[test]
+fn mascot_grids_and_icon() {
+    let (rows, pad) = printer_grid(Act::Idle, Work::None, Mood::Fine, 0);
+    assert_eq!((rows.len(), rows[0].len(), pad), (10, 20, 2));
+    let (scan_rows, _) = printer_grid(Act::Idle, Work::Scan, Mood::Fine, 0);
+    assert!(scan_rows[4..7].iter().any(|r| r.contains(&'c')));
+    let (flip_rows, caption) = flip_grid(0);
+    assert_eq!((flip_rows.len(), flip_rows[0].len(), caption), (22, 20, 0));
+    assert_eq!(flip_grid(14).1, 4);
+    assert_eq!(palette_rgb('b'), Some((95, 135, 255)));
+    let (w, h, rgba) = icon_rgba();
+    assert_eq!((w, h, rgba.len()), (64, 64, 64 * 64 * 4));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn colors_for_256_color_terminals() {
     assert_eq!(to_256(0, 0, 0), 16);
     assert_eq!(to_256(255, 255, 255), 231);
@@ -372,6 +467,7 @@ fn colors_for_256_color_terminals() {
     assert_eq!(to_256(255, 0, 255), 201);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn printer_frames() {
     let at = Instant::now() - Duration::from_secs(60);

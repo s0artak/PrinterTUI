@@ -2,7 +2,13 @@
 
 PrinterTUI prints and scans on Linux, macOS and Windows. Linux keeps the terminal interface; macOS and Windows open a desktop GUI.
 
+### Linux (TUI)
+
 [![PrinterTUI demo](docs/demo.gif)](docs/demo.mp4)
+
+### Windows & macOS (Desktop GUI)
+
+[![PrinterTUI desktop GUI demo](docs/demo-gui.gif)](docs/demo-gui.mp4)
 
 - Prints PDFs, photos (JPEG, PNG, WebP, BMP, GIF, TIFF; HEIC and other formats on macOS), text files, and other documents through LibreOffice.
 - Preview of the pages as they will print; scale 25-200%, pages per sheet, copies, paper, color, print quality (draft, normal, high).
@@ -10,7 +16,7 @@ PrinterTUI prints and scans on Linux, macOS and Windows. Linux keeps the termina
 - Scans from network printers (eSCL) or SANE, from the glass or the document feeder; saves PDF, searchable PDF (read in the app's language) or PNG; copies (scan and print).
 - Shows the printer's ink levels and problems (out of paper, jam, offline), plus Printer Doctor (`?`) to diagnose CUPS / Spooler, USB and Wi-Fi printers.
 - 10 languages. Settings in `~/.config/printertui/config` (`%APPDATA%\printertui\config` on Windows).
-- The desktop GUI offers printer and document selection, common print options, queue controls, scanner selection, page rotation and filters, and PDF/OCR/PNG output.
+- The desktop GUI shares the same layout, pixel-art printer mascot, live document and scan previews, CMYK ink tanks, animated manual duplex guide, print queue, Printer Doctor, synthesized sounds, native Dark/Light/Auto themes, and keyboard shortcuts as the terminal version.
 
 ## Install
 

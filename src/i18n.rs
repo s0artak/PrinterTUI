@@ -4,6 +4,7 @@
 use std::fmt::Display;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[allow(dead_code)]
 pub struct Texts {
     pub code: &'static str,
     pub tab_print: &'static str,
@@ -2440,6 +2441,7 @@ fn every_language_fits_the_form() {
         // the printer's name and the hints are filled in, not translated
         assert!(fill(t.at_service, &[("name", &"X")]).contains('X'), "{}", t.code);
         assert!(fill(EXTRA[i].cups_stopped, &[("cmd", &"cups")]).contains("cups"), "{}", t.code);
+        #[cfg(target_os = "linux")]
         // labels short enough to leave room for the values next to them
         for label in t.labels.iter().chain(&t.scan_labels) {
             assert!(unicode_width::UnicodeWidthStr::width(*label) <= 16, "{}: {label}", t.code);
