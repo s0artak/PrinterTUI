@@ -675,7 +675,7 @@ function Install-PrinterTUI([bool]$libreoffice, [bool]$onDesktop) {
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
     # $env:PRINTERTUI_DOWNLOAD points at another folder of release files, for testing a build
     $from = if ($env:PRINTERTUI_DOWNLOAD) { $env:PRINTERTUI_DOWNLOAD } else { "https://github.com/$repo/releases/latest/download" }
-    $url = "$from/printertui-windows-$arch.exe"
+    $url = "$from/printegui-windows-$arch.exe"
     $tmp = Join-Path ([IO.Path]::GetTempPath()) "printertui-$PID.exe"
     Say "$($T.download) (windows $arch)"
     if ($preview) {

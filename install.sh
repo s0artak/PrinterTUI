@@ -869,7 +869,9 @@ do_install() {
     esac
 
     tmp=$(mktemp)
-    url="https://github.com/$REPO/releases/latest/download/printertui-$os-$arch"
+    asset=printertui
+    [ "$os" != macos ] || asset=printegui
+    url="https://github.com/$REPO/releases/latest/download/$asset-$os-$arch"
     say "$T_download ($os $arch)"
     [ -z "$preview" ] || printf '    \033[2m%s curl %s %s.sha256\033[0m\n' "$T_skip" "$url" "$url"
     status=0
